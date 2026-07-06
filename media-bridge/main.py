@@ -7,6 +7,7 @@ one container (all off-VPN, on the default bridge network):
   * seedr    -- Seedr <-> Sonarr/Radarr blackhole bridge   (30s poll)
   * reaper   -- Jellyfin "watched movie" -> Radarr reaper   (6h)
   * movierulz-- 5movierulz crawler + Torznab feed for Prowlarr (crawl ~1h, HTTP server)
+  * daddylive-- DaddyLive resolver: M3U/EPG + on-demand stream resolve for Jellyfin (HTTP server)
 
 Each unit runs in its own thread wrapped so a crash logs + ntfy-alerts + restarts
 without taking down the others (threads are I/O-bound; requests releases the GIL,
@@ -18,6 +19,7 @@ import time
 import seedr
 import reaper
 import movierulz
+import daddylive
 from common import clog, ntfy
 
 
@@ -39,11 +41,14 @@ def supervise(name, target):
 
 
 def main():
-    clog("main", "media-bridge starting: seedr + reaper + movierulz")
+    clog("main", "media-bridge starting: seedr + reaper + movierulz + daddylive")
     supervise("seedr", seedr.run_forever)
     supervise("reaper", reaper.run_forever)
     supervise("movierulz-crawler", movierulz.run_crawler)
     supervise("movierulz-torznab", movierulz.serve_torznab)
+    supervise("daddylive-refresher", daddylive.run_refresher)
+    supervise("daddylive-precheck", daddylive.run_precheck)
+    supervise("daddylive-server", daddylive.serve)
     while True:
         time.sleep(3600)
 

@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on a
 **Jetson Nano Super (aarch64)**. Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
-`media-bridge/` (three responsibilities in one container: seedr bridge + jellyfin-reaper + movierulz
-scraper/Torznab feed); everything else is an off-the-shelf image. Service config/state directories
+`media-bridge/` (four responsibilities in one container: seedr bridge + jellyfin-reaper + movierulz
+scraper/Torznab feed + daddylive live-TV resolver); everything else is an off-the-shelf image. Service config/state directories
 (`prowlarr/`, `radarr/`, `sonarr/`, `bazarr/`, `jellyfin/`, `data/`, `media-bridge/config/`) are
 runtime data and are gitignored — only the compose file and the custom service code are version-controlled.
 
@@ -39,8 +39,9 @@ Consequences that drive most edits here:
   `depends_on: gluetun (service_healthy)`, and publish its ports on the gluetun service block.
 - **Restart gotcha**: restarting gluetun recreates its netns and silently breaks every dependent
   container. After any gluetun restart you MUST `docker restart prowlarr flaresolverr sonarr radarr`
-  (or `docker compose down && up -d`). `media-bridge` and `jellyfin` are unaffected — and the movierulz
-  Torznab feed (host port 8002) keeps serving, since it is published on the host, not on gluetun.
+  (or `docker compose down && up -d`). `media-bridge` and `jellyfin` are unaffected — and the
+  `media-bridge` host-published feeds (movierulz Torznab `8002`, daddylive live-TV `8004`) keep serving,
+  since they are published on the host, not on gluetun.
 - **Cross-service URLs inside the netns**: containers sharing gluetun's namespace talk to the *arr
   apps via the hostname **`gluetun`** (e.g. `http://gluetun:7878`), NOT `radarr`/`sonarr` (which don't
   resolve). `media-bridge` (on the default bridge net) reaches the *arr apps AND FlareSolverr the same
@@ -68,11 +69,11 @@ hardlink-friendly and paths map 1:1 across services. Layout:
 
 ## media-bridge (`media-bridge/`)
 
-One container running three components as supervised daemon threads (`main.py` → each in a try/except
+One container running four components as supervised daemon threads (`main.py` → each in a try/except
 wrapper that logs + ntfy-alerts + restarts, so one crash can't take the others down). It is **off the
 VPN** on the default bridge net; it reaches the *arr apps and FlareSolverr via `http://gluetun:<port>`
 and host-net Jellyfin via `host.docker.internal`. Shared helpers live in `common.py` (`clog`, `norm`,
-`ntfy`). Logs are tagged `[seedr]` / `[reaper]` / `[movierulz]`. Rebuilding/restarting this container to
+`ntfy`). Logs are tagged `[seedr]` / `[reaper]` / `[movierulz]` / `[daddylive]`. Rebuilding/restarting this container to
 ship a movierulz change also restarts the seedr loop mid-download — safe, since seedr resumes from its
 `.bridge-state` JSON.
 
@@ -142,3 +143,69 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 - **Prowlarr wiring**: add as a generic Torznab indexer, `apiPath=/api`, apiKey `= MOVIERULZ_APIKEY`,
   baseUrl `http://media-bridge:8002/torznab` (Prowlarr is in gluetun's netns, which is on the default
   bridge, so it resolves the container name; fall back to the host LAN IP `:8002` if not).
+
+### daddylive component (`media-bridge/daddylive.py`)
+
+A refresher thread + a stdlib HTTP server (`:8004`, host-published) that turns DaddyLive (DLHD) into a
+Jellyfin **Live TV** source (M3U tuner + XMLTV EPG). Built because nothing off-the-shelf works on this
+box: MediaFusion's Rust build never ported its live scrapers, and Cabernet's DaddyLive plugin was taken
+down. **Why a custom resolver and not a community M3U feed:** those publish bare `*.newkso.ru` URLs that
+are **Cloudflare-walled** (403 even with the right headers, even via FlareSolverr). DaddyLive's *own*
+player flow instead resolves to a different, **token-authed CDN (`phantemlis.top`, segments on Cloudflare
+R2) that needs NO request headers and IS reachable server-side** — so we resolve each channel the way the
+site's player does, on demand.
+
+- **Resolution chain** (`resolve`, per channel id, plain server-side HTTP — not CF-walled):
+  `{DLHD_BASE}/{folder}/stream-<id>.php` → iframe → `{embed_host}/premiumtv/daddy3.php?id=<id>` → page JS
+  `source: window.atob('<base64>')` → decode → `https://…phantemlis…/premium<id>/index.m3u8?md5v1=…&md5v2=…&expires=…`.
+  The embed host **rotates** (discovered dynamically per request); `DADDYLIVE_FOLDERS`
+  (`stream,cast,watch,plus,casting,player`, per `dlhd.st/api.php`) are tried in order so one down folder
+  doesn't kill a channel. The `md5/expires` tokens are **self-authorizing (no Referer/UA) and minted fresh
+  per fetch (~74min TTL)** → resolved on demand. The site's `watch.php?id=<id>` shows **6 players = the 6
+  `DADDYLIVE_FOLDERS`** (Player 1=stream, 2=cast, 3=watch, 4=plus, 5=casting, 6=player); each folder's
+  `stream-<id>.php` embeds a **different provider** — Player 1/3 → `daddy3`→phantemlis, 2/4 →
+  `welovetocare.shop`, **5 → `cdnlivetv.tv`/`tezgoal.com` (oplayer)**, 6 → `popcdn.day`. `_extract_source`
+  understands three provider formats: phantemlis' `atob(...)`; the cdnlivetv **oplayer**
+  (`_extract_oplayer_source`: `source:{src:VAR}` where `VAR = atob(a)+atob(b)+…`, reassembled from base64
+  parts → `api.cdnlivetv.tv/secure/api/v1/<id>/playlist.m3u8?token=…`); and **lovetier** (Player 6, reached
+  via popcdn's iframe → `lovetier.bz/player/<slug>`), whose playlist is a plain `streamUrl:"…index.m3u8?token=…"`
+  JSON literal (`STREAMURL_RE`, unescape `\/`) → `deviantart.lovetier.bz`. **welovetocare** (P2/4) is a JS SPA
+  that reads `location.hash` (nothing server-side) and **tezgoal** (P5 alt) is unreachable server-side — both
+  unparsed. So e.g. Willow Cricket (346) plays via cdnlivetv, Willow XTRA (598) via lovetier.
+  `_resolve_from_page` walks folders in order and returns the first source that passes **segment-level
+  validation** — `_validate_source` descends master→variant→media playlist and requires a real segment to
+  return bytes, so a player whose playlists load but whose `.ts` segments are dead (a common failure, e.g.
+  phantemlis returning `500` on the child playlist — currently site-wide) is **rejected** (logged
+  `rejecting unplayable source`) and the next player is tried. So a channel with only phantemlis + no
+  alternate (some feeds) can 502 while phantemlis is down; one with a live Player 5 (e.g. Willow Cricket 346)
+  resolves via cdnlivetv.
+- **Favorites precheck** (`run_precheck`, `DADDYLIVE_FAVORITES` = comma-sep ids, every `DADDYLIVE_PRECHECK`s,
+  default 240): re-resolves+validates favorite channels in the background and keeps a **warm cache**
+  (`_warm`, TTL `max(PRECHECK*3, 300)`) that `resolve()` checks before the 60s `_resolve_cache`, so a
+  favorite opens instantly from a known-live player. Logs only online/offline **transitions** per channel.
+- **HLS rewriting proxy (required, NOT a 302 redirect):** DaddyLive serves HLS segments with **disguised
+  extensions** (`.js`/`.zst`/`.jpg` on Cloudflare R2) that ffmpeg's HLS demuxer **rejects** (`not in
+  allowed_segment_extensions`), and Jellyfin gives no way to pass `-allowed_extensions ALL`. So `/live/<id>`
+  fetches the resolved playlist and **rewrites every sub-playlist/segment/key URI** to route back through
+  `/hls/<b64-upstream-url>.<m3u8|ts|key>` (`rewrite_playlist`), relaying the bytes with clean
+  `.ts`/`vnd.apple.mpegurl` types so ffmpeg accepts them. The M3U points at `/live/<id>.m3u8` (extension
+  hint so Jellyfin picks the HLS demuxer). Verified: ffprobe sees h264+aac and a transcode runs clean.
+- **Channel list + EPG come from the public nightah/daddylive feed** (`DADDYLIVE_M3U_URL`/`_EPG_URL`): its
+  `premium<N>` == our channel id, so we keep its names/logos/tvg-id/group + EPG and just swap the dead
+  newkso URL for our `/live/<id>`. Channels upserted into `media-bridge/config/daddylive.db` (sqlite). Feed
+  uses `tvg-id="test"` as a placeholder for ~136 channels lacking EPG mapping — expected, not a bug.
+- **HTTP server** (`serve`): `GET /daddylive.m3u` (channel table; URLs = `/live/<id>.m3u8`),
+  `GET /epg.xml` (cached pass-through XMLTV), `GET /live/<id>[.m3u8]` (resolve → rewritten master playlist),
+  `GET /hls/<b64>.<m3u8|ts|key>` (proxy/relay). Some ids 502/offline at any moment — expected.
+- **Jellyfin wiring**: Live TV → M3U Tuner `http://127.0.0.1:8004/daddylive.m3u`, XMLTV guide
+  `http://127.0.0.1:8004/epg.xml` (Jellyfin is host-net → reaches the host-published port; the feed
+  survives gluetun restarts since it's published on the host, not gluetun). **`DADDYLIVE_PUBLIC_URL`
+  must be the Jetson LAN IP (`http://10.0.0.179:8004`), not 127.0.0.1** — it's baked into the rewritten
+  `/hls` URLs, which a TV client fetches (127.0.0.1 would resolve to the TV itself).
+- **Playback notes**: `resolve()` caches the master URL per channel for `DADDYLIVE_RESOLVE_TTL` (60s) so
+  Jellyfin's repeated opens (probe + transcode + retry) don't each re-resolve — fixes "player error then
+  plays in secs". Jellyfin's **Direct Stream (`-c copy`) remux is flaky on some live streams** (FFmpeg
+  code 8) while transcode is reliable → on the Jetson cap the client's quality to ~720p to force
+  (software) transcode. Offline channels legitimately 502.
+- **Rotation maintenance**: only a change to the dlhd *domain* needs a one-line `DLHD_BASE` update in
+  `.env`; embed/CDN host rotations are handled automatically. Watch for `atob(…)`/iframe-pattern changes.

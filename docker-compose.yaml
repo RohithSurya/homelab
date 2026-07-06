@@ -105,6 +105,7 @@ services:
     user: "1000:1000"                            # write files as the *arr user for clean imports
     ports:
       - 8002:8002                                # movierulz Torznab feed (host-published)
+      - 8004:8004                                # daddylive resolver M3U/EPG for Jellyfin (host-published)
     environment:
       - TZ=America/New_York
       # --- seedr blackhole bridge ---
@@ -139,6 +140,13 @@ services:
       - MAX_PAGES=1000                             # safety cap; real stop is the last/empty page (~407)
       - FAKE_SEEDERS=50                            # movierulz exposes no seeders; satisfy *arr minimums
       - REQUEST_DELAY=3
+      # --- daddylive resolver -> Jellyfin Live TV (M3U/EPG on host:8004) ---
+      - DLHD_BASE=${DLHD_BASE}                     # real dlhd site URL kept in .env, out of source
+      - DADDYLIVE_PUBLIC_URL=http://10.0.0.179:8004 # LAN IP so rewritten /hls URLs are reachable by any client (not just the host)
+      - DADDYLIVE_PORT=8004
+      - DADDYLIVE_REFRESH=3600                      # re-pull the channel list hourly
+      - DADDYLIVE_FAVORITES=54,51,60                # channel ids kept pre-resolved+validated (54 FOX, 51 ABC, 60 Sky F1); edit to taste
+      - DADDYLIVE_PRECHECK=240                      # re-test favorites (all players) every N seconds
     volumes:
       - ./data:/data
       - ./media-bridge/config:/config             # sqlite DB of scraped releases
