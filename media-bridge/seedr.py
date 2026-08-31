@@ -241,15 +241,20 @@ def delete_transfer(tid):
 def _name_matches(seedr_name, title):
     # True when seedr_name and title are (almost certainly) the SAME release.
     # norm() drops punctuation, so Seedr's sanitization (dashes/spaces/appended group
-    # tags) mostly reduces to one name being a prefix of the other. We compare the FULL
-    # shorter string -- NOT a fixed-length prefix -- so two DIFFERENT releases of the
-    # same movie (which share only the 'title+year' head, e.g. ...DTS vs ...BRRip) do
-    # NOT match. This distinction is what the supersede reaper's safety guard relies on.
+    # tags) mostly reduces to the shorter name appearing verbatim inside the longer.
+    # It must be a SUBSTRING, not a prefix: Seedr names the result after the torrent's
+    # internal name, which for scraped sites carries a leading site tag the magnet's
+    # `dn=` (and hence our stored title) lacks -- e.g. Seedr's
+    # 'www.8MovieRulz.com - Mental Madhilo (2017) 1080p ... ESub.mkv' vs our
+    # 'Mental Madhilo (2017) 1080p ...'. We compare the FULL shorter string -- NOT a
+    # fixed-length prefix -- so two DIFFERENT releases of the same movie (which share
+    # only the 'title+year' head, e.g. ...DTS vs ...BRRip) do NOT match. This
+    # distinction is what the supersede reaper's safety guard relies on.
     a, b = norm(seedr_name), norm(title)
     if not a or not b:
         return False
     shorter, longer = sorted((a, b), key=len)
-    return len(shorter) >= 18 and longer.startswith(shorter)
+    return len(shorter) >= 18 and shorter in longer
 
 
 def cleanup_local_partial(cat, old_title, new_title=None):
@@ -559,12 +564,11 @@ def check_completions():
                 handle_stalled(cat, rec, sp, prog)
             continue  # still in progress -> do NOT fetch yet
         # torrent finished (gone from in-progress) -> locate its result.
-        ntitle = norm(title)
         # (a) multi-file / wrapped torrents land as a top-level FOLDER
         folder_id = folders.get(title)
-        if folder_id is None:  # tolerate Seedr sanitizing the name
+        if folder_id is None:  # tolerate Seedr sanitizing / site-prefixing the name
             for name, fid in folders.items():
-                if norm(name)[:20] == ntitle[:20]:
+                if _name_matches(name, title):
                     folder_id, title = fid, name
                     break
         if folder_id is not None:
@@ -583,12 +587,7 @@ def check_completions():
         # (b) bare single-file torrents land as a ROOT FILE (no folder)
         match = None
         for f in root.get("files", []):
-            stem = norm(os.path.splitext(f.get("name", ""))[0])
-            if stem and (
-                stem[:18] == ntitle[:18]
-                or stem.startswith(ntitle[:16])
-                or ntitle.startswith(stem[:16])
-            ):
+            if _name_matches(os.path.splitext(f.get("name", ""))[0], title):
                 match = f
                 break
         if match is not None:

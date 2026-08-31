@@ -27,6 +27,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
@@ -52,7 +53,17 @@ MAX_PAGES = int(os.environ.get("MAX_PAGES", "1000"))  # safety cap; real stop is
 FAKE_SEEDERS = int(os.environ.get("FAKE_SEEDERS", "50"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "3"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "0"))   # 0 = keep forever
+# The site often publishes a movie's post page hours before adding its magnet links, so a first scrape
+# can find zero magnets. Re-fetch such magnet-less posts for this many days after they were first seen
+# (anchored to first-seen, not last attempt) so late-added magnets are still picked up; 0 disables it.
+EMPTY_RETRY_DAYS = float(os.environ.get("MOVIERULZ_EMPTY_RETRY_DAYS", "3"))
 DB_PATH = os.environ.get("MOVIERULZ_DB", "/config/movierulz.db")
+# Radarr is the source of alternate titles (see search_terms): a Tamil/Telugu film is listed on
+# these sites under its dub title (Karuppu -> "Veerabhadrudu"), and Radarr searches the NATIVE-script
+# alt title, which no release name carries. Reuses the seedr component's Radarr credentials.
+RADARR_URL = os.environ.get("RADARR_URL", "").rstrip("/")
+RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
+ALIAS_REFRESH = int(os.environ.get("ALIAS_REFRESH", "900"))   # re-pull the Radarr movie list this often
 
 # Best-effort language label parsed from the post slug (e.g. '...-telugu-7008.html' or
 # '...-telugu-dubbed-7112.html'). Functionally optional -- the feed matches by title, not language.
@@ -93,21 +104,33 @@ SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB)\b', re.I)
 
 # ---- sqlite ----
 DB_LOCK = threading.Lock()
+_ALIAS = {}            # unorm(title) -> [latin titles]; see _radarr_aliases()
+_ALIAS_TS = 0.0
+_ALIAS_LOCK = threading.Lock()
+# Separate lock for lazy init only: the crawler and torznab threads both call db() at startup, so the
+# init (incl. the one-shot ALTER migration below) must run exactly once. Not DB_LOCK -- callers like
+# get_meta() hold DB_LOCK across their db() call, and threading.Lock isn't reentrant.
+_INIT_LOCK = threading.Lock()
 _conn = None
 
 
 def db():
     global _conn
-    if _conn is None:
+    if _conn is not None:
+        return _conn
+    with _INIT_LOCK:
+        if _conn is not None:   # another thread finished init while we waited
+            return _conn
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.executescript(
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS posts (
                 post_id INTEGER PRIMARY KEY,
                 url TEXT,
-                scraped_at REAL
+                scraped_at REAL,
+                magnets INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS releases (
                 btih TEXT PRIMARY KEY,
@@ -126,7 +149,16 @@ def db():
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             """
         )
-        _conn.commit()
+        # migrate: older DBs lack posts.magnets (raw magnet count seen on the page). Backfill any post
+        # that already produced a release as "had magnets" so only genuinely magnet-less pages get
+        # retried -- a post with skipped-only magnets (single episodes/Parts) must NOT be retried.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        if "magnets" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN magnets INTEGER DEFAULT 0")
+            conn.execute("UPDATE posts SET magnets=1 "
+                         "WHERE post_id IN (SELECT DISTINCT post_id FROM releases)")
+        conn.commit()
+        _conn = conn   # publish only after schema+migration are fully applied
     return _conn
 
 
@@ -142,16 +174,31 @@ def set_meta(key, value):
         db().commit()
 
 
-def post_seen(post_id):
+def post_needs_fetch(post_id):
+    """Whether crawl_once should (re)fetch this post. New posts: yes. Posts already scraped WITH
+    magnets on the page: no (fully populated -- even if every magnet was a skipped episode/Part).
+    Posts scraped with ZERO magnets (page published before its magnets were added): retry until
+    EMPTY_RETRY_DAYS after first-seen, so late-added magnets are still indexed."""
     with DB_LOCK:
-        cur = db().execute("SELECT 1 FROM posts WHERE post_id=?", (post_id,))
-        return cur.fetchone() is not None
+        row = db().execute("SELECT scraped_at, magnets FROM posts WHERE post_id=?",
+                           (post_id,)).fetchone()
+    if row is None:
+        return True
+    if row["magnets"] > 0 or EMPTY_RETRY_DAYS <= 0:
+        return False
+    return (time.time() - (row["scraped_at"] or 0)) < EMPTY_RETRY_DAYS * 86400
 
 
-def mark_post(post_id, url):
+def mark_post(post_id, url, magnets):
+    """Record the post as seen. INSERT OR IGNORE keeps scraped_at as the stable FIRST-seen time (so the
+    empty-post retry window is anchored to discovery, not the last attempt); `magnets` is the raw magnet
+    count on the page and, once >0, sticks (never downgraded) -- a page stops being retried the moment
+    it is populated."""
     with DB_LOCK:
-        db().execute("INSERT OR REPLACE INTO posts(post_id, url, scraped_at) VALUES (?,?,?)",
-                     (post_id, url, time.time()))
+        db().execute("INSERT OR IGNORE INTO posts(post_id, url, scraped_at, magnets) VALUES (?,?,?,?)",
+                     (post_id, url, time.time(), magnets))
+        db().execute("UPDATE posts SET magnets=? WHERE post_id=? AND magnets<?",
+                     (magnets, post_id, magnets))
         db().commit()
 
 
@@ -244,13 +291,14 @@ def process_post(post_id, url, language):
     time.sleep(REQUEST_DELAY)
     if status != 200 or not html:
         return 0
+    magnets = MAGNET_RE.findall(html)
     n = 0
-    for m in MAGNET_RE.findall(html):
+    for m in magnets:
         rec = parse_magnet(m, post_id, language)
         if rec:
             upsert_release(rec)
             n += 1
-    mark_post(post_id, url)   # mark seen even if 0 magnets, to avoid re-fetching
+    mark_post(post_id, url, len(magnets))   # store raw magnet count -> drives empty-post retry
     return n
 
 
@@ -284,7 +332,7 @@ def crawl_once():
             reached_end = True   # past the last real page
             break
         for pid, purl in page_ids:
-            if not post_seen(pid):
+            if post_needs_fetch(pid):
                 total_releases += process_post(pid, purl, lang_from_slug(purl))
                 total_posts += 1
         # incremental mode only: once a whole page is posts we already had before this pass, the rest
@@ -300,7 +348,7 @@ def crawl_once():
         with DB_LOCK:
             db().execute("DELETE FROM releases WHERE added_at < ?", (cutoff,))
             db().commit()
-    log(f"crawl done: scanned {page} page(s), {total_posts} new posts, {total_releases} releases indexed")
+    log(f"crawl done: scanned {page} page(s), {total_posts} posts fetched, {total_releases} releases indexed")
 
 
 def run_crawler():
@@ -370,12 +418,93 @@ def title_matches(q, title):
     return all(w in ct for w in toks)
 
 
+def unorm(s):
+    """Unicode-aware norm(): casefold, drop combining marks and every non-alphanumeric.
+    norm() keeps only [a-z0-9], so a native-script title collapses to '' -- useless as a key.
+    Radarr strips the vowel signs when it builds its query ('கருப்பு' -> 'கர பப'), so dropping
+    marks on both sides is what makes the two compare equal."""
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "").casefold() if c.isalnum())
+
+
+def _radarr_aliases():
+    """{unorm(any known title): [latin titles of that movie]} from Radarr, refreshed every
+    ALIAS_REFRESH. Best-effort: on failure the map is left as-is and search falls back to the
+    raw query. The timestamp is stamped BEFORE the fetch so a failing Radarr can't make every
+    search pay the timeout."""
+    global _ALIAS, _ALIAS_TS
+    if not (RADARR_URL and RADARR_API_KEY):
+        return _ALIAS
+    with _ALIAS_LOCK:
+        if time.time() - _ALIAS_TS < ALIAS_REFRESH:
+            return _ALIAS
+        _ALIAS_TS = time.time()
+    try:
+        r = requests.get(f"{RADARR_URL}/api/v3/movie",
+                         headers={"X-Api-Key": RADARR_API_KEY}, timeout=20)
+        r.raise_for_status()
+        movies = r.json()
+    except Exception as e:
+        log(f"alias refresh failed: {e}")
+        return _ALIAS
+    alias = {}
+    for m in movies:
+        titles = [m.get("title"), m.get("originalTitle")]
+        titles += [a.get("title") for a in (m.get("alternateTitles") or [])]
+        titles = [t for t in titles if t]
+        # only latin-script titles are usable as search terms -- our releases are named in latin
+        latin = [t for t in titles if norm(t)]
+        if not latin:
+            continue
+        for t in titles:
+            k = unorm(t)
+            if not k:
+                continue
+            bucket = alias.setdefault(k, [])
+            bucket += [lt for lt in latin if lt not in bucket]
+    with _ALIAS_LOCK:
+        _ALIAS = alias
+    log(f"alias map refreshed: {len(alias)} title keys from {len(movies)} radarr movies")
+    return alias
+
+
+def search_terms(q):
+    """Resolve an incoming Torznab query into the titles to match releases against.
+
+    None  -> no text filter (empty q / RSS).
+    []    -> match NOTHING. Critical: Radarr searches a movie's alternate titles, which for Indian
+             films are native-script ('கருப்பு'). norm() reduces those to '', title_matches() then
+             sees zero tokens, and `all([])` is True -> the query matched the WHOLE catalogue and
+             the *arr got 100 unrelated releases per search.
+    else  -> the query itself (when latin) plus every latin title Radarr knows for that movie, so
+             the native-script query Radarr already sends finds the dub-titled release
+             ('கருப்பு' -> Karuppu + Veerabhadrudu). A trailing year in the query is carried onto
+             the alias terms so precision isn't lost."""
+    q = (q or "").strip()
+    if not q:
+        return None
+    ym = re.search(r"\b(?:19|20)\d{2}$", q)
+    base, year = (q[:ym.start()].strip(), ym.group(0)) if ym else (q, "")
+    aliases = _radarr_aliases().get(unorm(base)) or []
+    terms = [f"{t} {year}".strip() for t in aliases]
+    if norm(base):          # latin query: keep it, so unknown-to-Radarr searches still work
+        terms.append(q)
+    return list(dict.fromkeys(terms))
+
+
+def query_matches(terms, title):
+    """True if the release title matches any resolved search term (None = no text filter)."""
+    if terms is None:
+        return True
+    return any(title_matches(t, title) for t in terms)
+
+
 def query_releases(t, q, season, cats):
     """Select releases matching the search. Returns list of sqlite rows."""
     with DB_LOCK:
         # scan the whole catalogue (no LIMIT) so old back-catalog stays searchable; the token
         # matcher below is cheap and results are capped to 100.
         rows = db().execute("SELECT * FROM releases ORDER BY added_at DESC").fetchall()
+    terms = search_terms(q)
     out = []
     for r in rows:
         # kind filter by search type
@@ -389,8 +518,9 @@ def query_releases(t, q, season, cats):
             sub = torznab_category(r)
             if not any(c == fam or c == sub for c in cats):
                 continue
-        # text filter (dup-collapsing, token-based -> matches transliteration variants)
-        if q and not title_matches(q, r["title"]):
+        # text filter (dup-collapsing, token-based -> matches transliteration variants),
+        # widened to the movie's Radarr alternate titles
+        if not query_matches(terms, r["title"]):
             continue
         if season and r["kind"] == "series" and r["season"] and int(season) != r["season"]:
             continue

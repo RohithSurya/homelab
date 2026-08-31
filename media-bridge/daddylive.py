@@ -51,6 +51,10 @@ M3U_URL = os.environ.get(
 EPG_URL = os.environ.get(
     "DADDYLIVE_EPG_URL",
     "https://raw.githubusercontent.com/nightah/daddylive/main/epgs/daddylive-channels-epg.xml")
+# Fallback base only. Both the M3U and the /hls rewrites now derive their base from the
+# request's own Host header (Handler._request_base_url()), so a client reaching the box on
+# either NIC gets URLs back on that same NIC. This is used only where there is no request
+# to read: the precheck thread, and requests that arrive without a Host header.
 PUBLIC_URL = os.environ.get("DADDYLIVE_PUBLIC_URL", "http://127.0.0.1:8004").rstrip("/")
 PORT = int(os.environ.get("DADDYLIVE_PORT", "8004"))
 REFRESH = int(os.environ.get("DADDYLIVE_REFRESH", "3600"))
@@ -64,7 +68,7 @@ PRECHECK = int(os.environ.get("DADDYLIVE_PRECHECK", "240"))  # re-test favorites
 # Public player-page folders that all serve stream-{id}.php (per dlhd.st/api.php). Tried in order
 # so a single down/blocked folder doesn't kill a channel.
 FOLDERS = [f.strip() for f in os.environ.get(
-    "DADDYLIVE_FOLDERS", "stream,cast,watch,plus,casting,player").split(",") if f.strip()]
+    "DADDYLIVE_FOLDERS", "cast,stream,watch,plus,casting,player").split(",") if f.strip()]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36")
@@ -98,6 +102,12 @@ OPLAYER_CALLARG_RE = re.compile(r'\w+\(\s*(\w+)\s*\)')
 # lovetier.bz players (DaddyLive Player 6, reached via popcdn.day) embed the playlist as a plain
 # JSON literal: streamUrl: "https:\/\/…\/index.m3u8?token=…". Just unescape and take it.
 STREAMURL_RE = re.compile(r'streamUrl\s*:\s*"(?P<url>https?:[^"]+\.m3u8[^"]*)"')
+# Clappr embed players (DaddyLive Player 2, the `cast` folder → rotating *.pages.dev/embed/<slug>) build
+# the URL by string concatenation with no literal .m3u8 in the HTML:
+#   var CDN_BASE = 'https://<host>/';  ...  launchPlayer(CDN_BASE + id + '.m3u8')
+# where id = ?id= query, else the path segment after /embed/, else the last path segment. We read
+# CDN_BASE from the page and the slug from the embed URL, then assemble CDN_BASE + slug + '.m3u8'.
+CDNBASE_RE = re.compile(r'''CDN_BASE\s*=\s*['"]([^'"]+)['"]''')
 
 
 def log(msg):
@@ -225,7 +235,7 @@ def run_refresher():
 def _extract_embed(html, base):
     """Pick the iframe that points at the daddy3 player embed; absolutize it."""
     for src in IFRAME_RE.findall(html):
-        if re.search(r'(daddy|premiumtv|\.php\?id=)', src, re.I):
+        if re.search(r'(daddy|premiumtv|\.php\?id=|/embed/)', src, re.I):
             return urllib.parse.urljoin(base, src)
     # fall back to the first iframe if none matched the heuristic
     m = IFRAME_RE.search(html)
@@ -240,6 +250,13 @@ def _request_headers(referer=None):
         if parts.scheme and parts.netloc:
             headers["Origin"] = f"{parts.scheme}://{parts.netloc}"
     return headers
+
+
+def _drop_referer(headers):
+    """Strip Referer/Origin — segment CDNs are self-authorizing and some reject a Referer."""
+    if not headers:
+        return headers
+    return {k: v for k, v in headers.items() if k not in ("Referer", "Origin")}
 
 
 def _normalize_candidate_url(candidate, base_url):
@@ -301,10 +318,32 @@ def _extract_source(html, base_url):
     m = STREAMURL_RE.search(html)
     if m:
         return m.group("url").replace("\\/", "/")
+    m = CDNBASE_RE.search(html)
+    if m:
+        slug = _embed_slug(base_url)
+        if slug:
+            return _normalize_candidate_url(m.group(1).rstrip("/") + "/" + slug + ".m3u8", base_url)
     m = HLS_URL_RE.search(html)
     if m:
         return m.group(0)
     return None
+
+
+def _embed_slug(embed_url):
+    """The stream slug a Clappr embed (Player 2) uses to build its m3u8, mirroring the page's
+    getStreamId(): ?id= query, else the path segment after /embed/, else the last path segment."""
+    parts = urllib.parse.urlsplit(embed_url)
+    qid = urllib.parse.parse_qs(parts.query).get("id")
+    if qid and qid[0]:
+        return qid[0]
+    segs = [s for s in parts.path.split("/") if s]
+    if not segs:
+        return None
+    if "embed" in segs:
+        i = segs.index("embed")
+        if i + 1 < len(segs):
+            return segs[i + 1]
+    return segs[-1]
 
 
 def _extract_wiki_embed(html, base_url):
@@ -345,7 +384,10 @@ def _validate_source(url, headers):
             return r.text, (r.headers.get("Content-Type") or "").lower()
 
     def has_bytes(candidate):
-        with SESSION.get(candidate, headers=headers or None, stream=True, timeout=HTTP_TIMEOUT) as r:
+        # Segments live on self-authorizing CDNs; some (Player 2's picsart) 403 if a Referer is sent,
+        # even though the playlist above them requires one -> fetch segments without the Referer.
+        with SESSION.get(candidate, headers=_drop_referer(headers) or None,
+                         stream=True, timeout=HTTP_TIMEOUT) as r:
             r.raise_for_status()
             return bool(next(r.iter_content(chunk_size=512), b""))
 
@@ -527,14 +569,38 @@ def _headers_for_upstream(url):
     return hit[0]
 
 
-def _proxy_uri(abs_url, force=None, headers=None):
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _strip_png_decoy(data):
+    """Some providers (Player 2's picsart CDN) disguise TS segments with a small real PNG header
+    before the first MPEG-TS sync byte, which desyncs ffmpeg's demuxer at each segment boundary.
+    If the payload starts with the PNG magic, trim to the first 0x47 that looks like a TS sync
+    (0x47 also present at +188 and +376). Non-PNG segments are returned untouched."""
+    if not data.startswith(_PNG_MAGIC):
+        return data
+    i = data.find(b"\x47")
+    while i != -1 and i + 376 < len(data):
+        if data[i + 188] == 0x47 and data[i + 376] == 0x47:
+            return data[i:]
+        i = data.find(b"\x47", i + 1)
+    return data
+
+
+def _proxy_uri(abs_url, force=None, headers=None, public=None):
     _remember_hls_headers(abs_url, headers)
     ext = force or ("m3u8" if ".m3u8" in abs_url.split("?", 1)[0].lower() else "ts")
-    return f"{PUBLIC_URL}/hls/{_b64e(abs_url)}.{ext}"
+    return f"{public or PUBLIC_URL}/hls/{_b64e(abs_url)}.{ext}"
 
 
-def rewrite_playlist(text, base_url, headers=None):
-    """Rewrite every URI in an HLS playlist to route back through /hls/<b64>.<ext>."""
+def rewrite_playlist(text, base_url, headers=None, public=None):
+    """Rewrite every URI in an HLS playlist to route back through /hls/<b64>.<ext>.
+
+    `public` is the base the client itself dialled (Handler._request_base_url()), so the
+    rewritten URLs come back on the same interface the request arrived on. The box is
+    dual-homed; hardcoding one NIC's IP here made every segment URL unreachable whenever
+    that NIC was down. Falls back to PUBLIC_URL when there is no request context.
+    """
     out = []
     for line in text.splitlines():
         s = line.strip()
@@ -545,12 +611,12 @@ def rewrite_playlist(text, base_url, headers=None):
                 def repl(m):
                     au = urllib.parse.urljoin(base_url, m.group(1))
                     force = "key" if "EXT-X-KEY" in s else None
-                    return f'URI="{_proxy_uri(au, force, headers=headers)}"'
+                    return f'URI="{_proxy_uri(au, force, headers=headers, public=public)}"'
                 out.append(URI_ATTR_RE.sub(repl, s))
             else:
                 out.append(line)
         else:  # a URI line (variant playlist or media segment)
-            out.append(_proxy_uri(urllib.parse.urljoin(base_url, s), headers=headers))
+            out.append(_proxy_uri(urllib.parse.urljoin(base_url, s), headers=headers, public=public))
     return "\n".join(out) + "\n"
 
 
@@ -634,7 +700,8 @@ class Handler(BaseHTTPRequestHandler):
                 r = SESSION.get(master, headers=headers or None, timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
                 self._send(
-                    rewrite_playlist(r.text, master, headers=headers),
+                    rewrite_playlist(r.text, master, headers=headers,
+                                     public=self._request_base_url()),
                     ctype=HLS_CT,
                     head_only=head_only,
                 )
@@ -666,15 +733,18 @@ class Handler(BaseHTTPRequestHandler):
                 r = SESSION.get(upstream, headers=headers or None, timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
                 self._send(
-                    rewrite_playlist(r.text, upstream, headers=headers),
+                    rewrite_playlist(r.text, upstream, headers=headers,
+                                     public=self._request_base_url()),
                     ctype=HLS_CT,
                     head_only=head_only,
                 )
             else:              # segment (.ts) or key (.key) -> relay raw bytes
-                r = SESSION.get(upstream, headers=headers or None, timeout=HTTP_TIMEOUT)
+                seg_headers = headers if ext == "key" else _drop_referer(headers)
+                r = SESSION.get(upstream, headers=seg_headers or None, timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
                 ct = "application/octet-stream" if ext == "key" else "video/mp2t"
-                self._send(r.content, ctype=ct, head_only=head_only)
+                data = r.content if ext == "key" else _strip_png_decoy(r.content)
+                self._send(data, ctype=ct, head_only=head_only)
         except Exception as e:
             log(f"hls proxy fetch failed ({ext}): {e}")
             self._send("upstream error", 502, head_only=head_only)

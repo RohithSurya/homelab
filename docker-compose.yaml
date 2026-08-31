@@ -1,4 +1,12 @@
 ---
+# Per-service log rotation (mirrors the global default in /etc/docker/daemon.json,
+# but applies immediately to services that carry it, without a daemon restart).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   gluetun:
     image: qmcgaw/gluetun:latest
@@ -29,8 +37,6 @@ services:
       - 8191:8191                                # flaresolverr (moved here from flaresolverr)
       - 8989:8989                                # sonarr (moved here from sonarr)
       - 7878:7878                                # radarr (moved here from radarr)
-      - 8001:8001                                # mediafusion-api (torznab feed)
-      - 127.0.0.1:5432:5432                      # mediafusion-postgres (local DB tools only)
     restart: unless-stopped
 
   prowlarr:
@@ -104,8 +110,20 @@ services:
     container_name: media-bridge
     user: "1000:1000"                            # write files as the *arr user for clean imports
     ports:
-      - 8002:8002                                # movierulz Torznab feed (host-published)
-      - 8004:8004                                # daddylive resolver M3U/EPG for Jellyfin (host-published)
+      # All interfaces, deliberately — the Jetson is dual-homed (Ethernet + Wi-Fi, both on
+      # 10.0.0.0/24), so a literal LAN IP here (a) dies with its NIC, taking the seedr and
+      # reaper threads down with it, and (b) races the DHCP lease at boot: docker.service
+      # starts on network-online.target, which an interface can satisfy before its lease
+      # exists. That exact pattern took Immich down for 10h on 2026-08-09.
+      # The old "never 0.0.0.0" rationale did NOT hold: a router forward targets a LAN IP,
+      # and these were bound to precisely that LAN IP, so the forward would have reached
+      # them anyway. What keeps them off the internet is the router forwarding only 443.
+      # These remain unauthenticated LAN control endpoints (see the /hls relay caveat in
+      # CLAUDE.md) — do not forward any of them.
+      - "8002:8002"                              # movierulz Torznab feed
+      - "8003:8003"                              # youtube grabber web form
+      - "8004:8004"                              # daddylive resolver M3U/EPG for Jellyfin
+      - "8005:8005"                              # tamilmv/tamilblasters Torznab feed
     environment:
       - TZ=America/New_York
       # --- seedr blackhole bridge ---
@@ -127,7 +145,7 @@ services:
       - CHECK_INTERVAL=21600                       # 6 h between runs
       - MAX_DELETES_PER_RUN=5                      # blast-radius cap
       - DRY_RUN=false                              # LIVE: reaper actually deletes watched movies
-      # - JELLYFIN_USERS=                          # optional: restrict quorum to these user names
+      - JELLYFIN_USERS=rosurya                     # quorum excludes the passwordless guest user
       # --- movierulz scraper -> Torznab feed ---
       - MOVIERULZ_BASE=${MOVIERULZ_BASE}          # real site URL kept in .env, out of source
       - FLARESOLVERR_URL=http://gluetun:8191       # crawl CF-protected site via FlareSolverr
@@ -140,18 +158,50 @@ services:
       - MAX_PAGES=1000                             # safety cap; real stop is the last/empty page (~407)
       - FAKE_SEEDERS=50                            # movierulz exposes no seeders; satisfy *arr minimums
       - REQUEST_DELAY=3
+      # --- tamilmv/tamilblasters scraper -> Torznab feed :8005 (replaces MediaFusion) ---
+      # Seeds + per-language forum maps come from MediaFusion's upstream GitHub config (auto-tracks
+      # domain rotation); live domain resolved by following the seed's 301 redirect. Content pages
+      # fetched via the same FLARESOLVERR_URL as movierulz. Reuses FAKE_SEEDERS/REQUEST_DELAY above.
+      - TAMILMV_CONFIG_URL=https://raw.githubusercontent.com/mhdzumair/MediaFusion/main/resources/json/scraper_config.json
+      - TAMILMV_APIKEY=${TAMILMV_APIKEY}           # also the Torznab apikey entered in Prowlarr
+      - TAMILMV_PORT=8005
+      - TAMILMV_CONFIG_REFRESH=86400               # re-pull GitHub config daily
+      - TAMILMV_CRAWL_INTERVAL=3600
+      - TAMILMV_MAX_PAGES=5                         # per-forum page cap (bounds each crawl pass)
+      # Emergency overrides if a GitHub seed itself dies before upstream updates it:
+      # - TAMILMV_SEED_OVERRIDE=https://www.1tamilmv.<tld>
+      # - TAMILBLASTERS_SEED_OVERRIDE=https://1tamilblasters.<tld>
       # --- daddylive resolver -> Jellyfin Live TV (M3U/EPG on host:8004) ---
       - DLHD_BASE=${DLHD_BASE}                     # real dlhd site URL kept in .env, out of source
-      - DADDYLIVE_PUBLIC_URL=http://10.0.0.179:8004 # LAN IP so rewritten /hls URLs are reachable by any client (not just the host)
+      - DADDYLIVE_PUBLIC_URL=http://10.0.0.179:8004 # fallback only: /hls + M3U URLs now derive from the request Host, so this is used just by the precheck thread (no request context). 10.0.0.179 = reserved Ethernet IP.
       - DADDYLIVE_PORT=8004
       - DADDYLIVE_REFRESH=3600                      # re-pull the channel list hourly
       - DADDYLIVE_FAVORITES=54,51,60                # channel ids kept pre-resolved+validated (54 FOX, 51 ABC, 60 Sky F1); edit to taste
       - DADDYLIVE_PRECHECK=240                      # re-test favorites (all players) every N seconds
+      # --- youtube grabber (no-torrent fallback: pull a full-movie YouTube upload) ---
+      - YOUTUBE_PORT=8003
+      - DATA_HOST_PATH=/home/rosurya/media-server/data  # HOST path of ./data; sibling yt-dlp containers bind-mount by host path
+      # yt-dlp :latest is NOT self-updating (docker only fetches an absent image), and a stale
+      # yt-dlp = every YouTube download dying with HTTP 403 partway in. Re-pull this often.
+      - YTDLP_PULL_INTERVAL=21600
     volumes:
       - ./data:/data
       - ./media-bridge/config:/config             # sqlite DB of scraped releases
+      - /var/run/docker.sock:/var/run/docker.sock # spawn+remove disposable yt-dlp containers
+    group_add:
+      - "994"                                     # host 'docker' group gid -> uid 1000 can use the socket
     extra_hosts:
       - "host.docker.internal:host-gateway"       # reach host-network Jellyfin (8096)
+    labels:
+      - "autoheal=true"                           # restart if the daddylive HTTP server hangs
+      - "diun.enable=false"                        # locally-built image (no registry) -> skip update checks
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/daddylive.m3u', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
     restart: unless-stopped
 
   bazarr:
@@ -167,94 +217,91 @@ services:
       - ./data:/data                             # same root as sonarr/radarr -> 1:1 path mapping
     restart: unless-stopped
 
+  # Official image (this install ran lscr.io/linuxserver/jellyfin until 2026-08-27).
+  # The two images lay /config out differently, and 10.12+ hard-aborts on the
+  # mismatch ("Expected to find only .jellyfin-data but found marker for
+  # /config/.jellyfin-config"). The four JELLYFIN_*_DIR vars pin the official image
+  # to the LinuxServer layout the existing data is already in — do NOT drop them.
+  # Moving the data instead would mean relocating data/, metadata/, root/, plugins/
+  # and every config XML, all of which are also referenced by absolute path in the DB.
   jellyfin:
-    image: lscr.io/linuxserver/jellyfin:latest
+    image: jellyfin/jellyfin:preview
     container_name: jellyfin
     network_mode: host                           # LAN/DLNA discovery + reachable on Tailscale IP
+    user: "1000:1000"                            # official image ignores PUID/PGID; keeps files owned by the *arr user
+    labels:
+      - "autoheal=true"                           # restart if the /health check fails
     environment:
-      - PUID=1000
-      - PGID=1000
       - TZ=America/New_York
+      - JELLYFIN_CONFIG_DIR=/config              # config XMLs sit at the root of /config
+      - JELLYFIN_DATA_DIR=/config/data           # dbs, metadata, plugins, library root
+      - JELLYFIN_CACHE_DIR=/config/cache         # official default is /cache, which is not mounted here
+      - JELLYFIN_LOG_DIR=/config/log             # exposer's fail2ban tails this by absolute path
     volumes:
       - ./jellyfin/config:/config
       - ./data/media:/data/media:ro
-    restart: unless-stopped
-
-  # ── MediaFusion (Torznab indexer source for Prowlarr) ─────────────────────────
-  # All four share gluetun's network namespace -> reach each other via localhost,
-  # scrape via the VPN, and the API is published on the host through gluetun (8001).
-  mediafusion-postgres:
-    image: postgres:18-alpine
-    container_name: mediafusion-postgres
-    network_mode: "service:gluetun"              # localhost:5432 inside the VPN ns
-    shm_size: 256mb
-    environment:
-      - POSTGRES_USER=mediafusion
-      - POSTGRES_PASSWORD=mediafusion
-      - POSTGRES_DB=mediafusion
-    volumes:
-      - ./mediafusion/postgres:/var/lib/postgresql
-    depends_on:
-      gluetun:
-        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mediafusion -d mediafusion"]
-      interval: 10s
+      test: ["CMD", "curl", "-fsS", "http://localhost:8096/health"]
+      interval: 30s
       timeout: 5s
-      retries: 5
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
     restart: unless-stopped
 
-  mediafusion-redis:
-    image: redis:latest
-    container_name: mediafusion-redis
-    network_mode: "service:gluetun"              # localhost:6379 inside the VPN ns
-    command: redis-server --appendonly yes --save 60 1 --maxmemory-policy allkeys-lru
+  # ── Public exposure lives in ../exposer ──────────────────────────────────────
+  # Caddy (TLS + reverse proxy), DuckDNS and fail2ban were moved into their own
+  # compose project at /home/rosurya/exposer so that this stack, ../immich and
+  # ../next-cloud are independently restartable — `docker compose down` here no
+  # longer takes TLS and the other services offline with it.
+  #
+  # Jellyfin needs no config here to be exposed: exposer's Caddy reaches it on
+  # 127.0.0.1:8096 (it is network_mode: host), and exposer's fail2ban tails
+  # ./jellyfin/config/log by absolute path. To change how Jellyfin is exposed,
+  # edit ../exposer/caddy/sites.d/jellyfin.caddy.
+
+  # DIUN — Docker Image Update Notifier (notify-only; replaces the archived Watchtower).
+  # Watches EVERY container (safe: it never touches them) and pings the existing ntfy
+  # topic when a new image is published. You then update deliberately, so the gluetun-netns
+  # restart dance (see CLAUDE.md) is never triggered unattended.
+  diun:
+    image: crazymax/diun:latest
+    container_name: diun
+    command: serve
+    group_add:
+      - "994"                                     # host 'docker' gid -> read /var/run/docker.sock
     volumes:
-      - ./mediafusion/redis:/data
-    depends_on:
-      gluetun:
-        condition: service_healthy
-    restart: unless-stopped
-
-  mediafusion-api:
-    image: mhdzumair/mediafusion:6.0.0-beta.25
-    container_name: mediafusion-api
-    network_mode: "service:gluetun"              # torznab feed -> gluetun publishes 8001
-    env_file: ./mediafusion.env
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./diun/data:/data                          # bolt db of seen image digests
     environment:
-      # This binary is locally built (HEAD > beta.25) and has a migrate.rs
-      # regression; the DB is already migrated by the worker, so skip it here.
-      - MEDIAFUSION_AUTO_MIGRATE=false
-    volumes:
-      # Locally-built mediafusion-api with the Torznab <pubDate> fix (Prowlarr
-      # rejects feed items without pubDate). Remove once a fixed image ships.
-      - ./mediafusion/bin/mediafusion-api:/usr/local/bin/mediafusion-api:ro
-    depends_on:
-      gluetun:
-        condition: service_healthy
-      mediafusion-postgres:
-        condition: service_healthy
-      mediafusion-redis:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 1m
-      timeout: 10s
-      retries: 5
-      start_period: 20m
+      - TZ=America/New_York
+      - LOG_LEVEL=info
+      - DIUN_WATCH_SCHEDULE=0 8 * * *              # check daily at 08:00
+      - DIUN_WATCH_JITTER=30s
+      - DIUN_WATCH_FIRSTCHECKNOTIF=false           # don't alert on the initial inventory
+      - DIUN_PROVIDERS_DOCKER=true
+      - DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true  # watch all containers, not just labelled ones
+      - DIUN_NOTIF_NTFY_ENDPOINT=https://ntfy.sh
+      - DIUN_NOTIF_NTFY_TOPIC=${NTFY_TOPIC}
+      - DIUN_NOTIF_NTFY_PRIORITY=3                 # ntfy priority: 1=min .. 3=default .. 5=max
+    logging: *default-logging
     restart: unless-stopped
 
-  mediafusion-worker:
-    image: mhdzumair/mediafusion:6.0.0-beta.25
-    container_name: mediafusion-worker
-    command: ["/usr/local/bin/mediafusion-worker"]
-    network_mode: "service:gluetun"              # spiders exit via the VPN, like *arr
-    env_file: ./mediafusion.env
-    depends_on:
-      gluetun:
-        condition: service_healthy
-      mediafusion-postgres:
-        condition: service_healthy
-      mediafusion-redis:
-        condition: service_started
+  # autoheal — restarts any container that reports "unhealthy" (a hung-but-Up app that
+  # `restart: unless-stopped` can't catch). SCOPED via label: only containers carrying
+  # autoheal=true are watched. It matches by label ACROSS compose projects, so the set
+  # spans stacks: jellyfin/media-bridge here, caddy in ../exposer, immich_server in
+  # ../immich, app in ../next-cloud. The gluetun-netns stack is deliberately NOT
+  # labelled — blind restarts there break the shared namespace.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    environment:
+      - TZ=America/New_York
+      - AUTOHEAL_CONTAINER_LABEL=autoheal          # only watch containers labelled autoheal=true
+      - AUTOHEAL_INTERVAL=15                        # check health every 15s
+      - AUTOHEAL_START_PERIOD=60                    # give a fresh container 60s before acting
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging: *default-logging
     restart: unless-stopped

@@ -21,7 +21,8 @@ Safety guards:
   * MAX_DELETES_PER_RUN          -> caps blast radius if something mis-flags many movies
   * hasFile gate                 -> ignore file-less / unmonitored Radarr entries
 
-Jellyfin auth: header  X-Emby-Token: <JELLYFIN_API_KEY>
+Jellyfin auth: header  Authorization: MediaBrowser Token="<JELLYFIN_API_KEY>"
+               (Jellyfin 12 disabled legacy auth -- X-Emby-Token and ?api_key= now 401)
 Radarr auth:   header  X-Api-Key: <RADARR_API_KEY>
 """
 import os
@@ -44,7 +45,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() not in ("false", "0", "no")
 # optional comma-sep list of user NAMES to form the "all users" quorum; default = all enabled users
 USER_FILTER = [u.strip() for u in os.environ.get("JELLYFIN_USERS", "").split(",") if u.strip()]
 
-JF = {"X-Emby-Token": JELLYFIN_API_KEY}
+JF = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'}
 RA = {"X-Api-Key": RADARR_API_KEY}
 
 
