@@ -21,12 +21,14 @@ survive Docker/shell '$' interpolation; plain SEEDR_PASSWORD also accepted.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
 import shutil
 import time
 import pathlib
+import urllib.parse
 import requests
 
 from common import clog, norm, ntfy
@@ -77,6 +79,12 @@ STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "2700"))  # 45 min
 FETCH_SKIP_MAX = int(
     os.environ.get("FETCH_SKIP_MAX", str(1 << 20))
 )  # <1 MB: skip an unfetchable junk sidecar instead of failing the whole folder
+# Fetch-failure handling: a transfer Seedr reports complete but whose media bytes its CDN
+# won't serve (a persistent 404 from a storage node) would otherwise retry-fetch forever,
+# hogging Seedr space and never failing in the *arr. After this long failing to fetch, give
+# up: purge it from Seedr, fail it in Radarr/Sonarr (-> blocklist + re-grab a different
+# release) and notify. The post-completion analogue of STALL_TIMEOUT.
+FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "5400"))  # 90 min
 ARR = {
     "radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
     "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY")),
@@ -99,6 +107,70 @@ def list_folder(folder_id=""):
 
 def add_magnet(magnet):
     return api("POST", "/transfer/magnet", data={"magnet": magnet}).json()
+
+
+def _bdecode(data, i):
+    """Minimal bencode decoder -> (value, next_index). Bytes stay bytes."""
+    c = data[i : i + 1]
+    if c == b"i":
+        e = data.index(b"e", i)
+        return int(data[i + 1 : e]), e + 1
+    if c == b"l":
+        i += 1
+        lst = []
+        while data[i : i + 1] != b"e":
+            v, i = _bdecode(data, i)
+            lst.append(v)
+        return lst, i + 1
+    if c == b"d":
+        i += 1
+        d = {}
+        while data[i : i + 1] != b"e":
+            k, i = _bdecode(data, i)
+            v, i = _bdecode(data, i)
+            d[k] = v
+        return d, i + 1
+    if c.isdigit():
+        colon = data.index(b":", i)
+        ln = int(data[i:colon])
+        start = colon + 1
+        return data[start : start + ln], start + ln
+    raise ValueError(f"bad bencode byte {c!r} at offset {i}")
+
+
+def magnet_from_torrent(path):
+    """Build a magnet URI from a .torrent file. Some indexers (e.g. YTS) hand
+    Radarr/Sonarr a real .torrent rather than a magnet, which the blackhole saves
+    as <release>.torrent. Seedr's add endpoint is magnet-only, so we synthesize one:
+    btih = SHA1 of the *raw* bencoded info-dict bytes (re-encoding could reorder keys
+    and change the hash), name from info['name'], trackers from announce/announce-list."""
+    data = path.read_bytes()
+    if data[:1] != b"d":
+        raise ValueError("not a bencoded dict")
+    i = 1
+    info_raw = name = None
+    trackers = []
+    while data[i : i + 1] != b"e":
+        k, i = _bdecode(data, i)
+        if k == b"info":
+            start = i
+            v, i = _bdecode(data, i)
+            info_raw = data[start:i]
+            name = v.get(b"name")
+        else:
+            v, i = _bdecode(data, i)
+            if k == b"announce" and isinstance(v, bytes):
+                trackers.append(v)
+            elif k == b"announce-list" and isinstance(v, list):
+                trackers += [t for tier in v for t in tier if isinstance(t, bytes)]
+    if info_raw is None:
+        raise ValueError("no info dict")
+    btih = hashlib.sha1(info_raw).hexdigest()
+    dn = (name or path.stem.encode()).decode("utf-8", "replace")
+    q = urllib.parse.quote_plus
+    parts = [f"xt=urn:btih:{btih}", f"dn={q(dn)}"]  # xt urn must stay literal
+    parts += [f"tr={q(t.decode('utf-8', 'replace'))}" for t in trackers]
+    return "magnet:?" + "&".join(parts)
 
 
 def download_file(file_id, dest: pathlib.Path):
@@ -169,15 +241,20 @@ def delete_transfer(tid):
 def _name_matches(seedr_name, title):
     # True when seedr_name and title are (almost certainly) the SAME release.
     # norm() drops punctuation, so Seedr's sanitization (dashes/spaces/appended group
-    # tags) mostly reduces to one name being a prefix of the other. We compare the FULL
-    # shorter string -- NOT a fixed-length prefix -- so two DIFFERENT releases of the
-    # same movie (which share only the 'title+year' head, e.g. ...DTS vs ...BRRip) do
-    # NOT match. This distinction is what the supersede reaper's safety guard relies on.
+    # tags) mostly reduces to the shorter name appearing verbatim inside the longer.
+    # It must be a SUBSTRING, not a prefix: Seedr names the result after the torrent's
+    # internal name, which for scraped sites carries a leading site tag the magnet's
+    # `dn=` (and hence our stored title) lacks -- e.g. Seedr's
+    # 'www.8MovieRulz.com - Mental Madhilo (2017) 1080p ... ESub.mkv' vs our
+    # 'Mental Madhilo (2017) 1080p ...'. We compare the FULL shorter string -- NOT a
+    # fixed-length prefix -- so two DIFFERENT releases of the same movie (which share
+    # only the 'title+year' head, e.g. ...DTS vs ...BRRip) do NOT match. This
+    # distinction is what the supersede reaper's safety guard relies on.
     a, b = norm(seedr_name), norm(title)
     if not a or not b:
         return False
     shorter, longer = sorted((a, b), key=len)
-    return len(shorter) >= 18 and longer.startswith(shorter)
+    return len(shorter) >= 18 and shorter in longer
 
 
 def cleanup_local_partial(cat, old_title, new_title=None):
@@ -302,6 +379,45 @@ def handle_stalled(cat, rec, sp, prog):
     cleanup_local_partial(cat, title)
 
 
+def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
+    """A transfer Seedr marked complete but whose bytes its CDN keeps 404ing on fetch.
+    Start a deadline on first failure; once FETCH_TIMEOUT elapses, stop retrying forever:
+    purge the dead Seedr result, fail it in Radarr/Sonarr (-> blocklist + auto re-grab a
+    different release) and notify. Mirrors handle_stalled for the post-completion path. A
+    successful fetch unlinks the state file, so the deadline naturally resets on recovery."""
+    now = time.time()
+    since = rec.get("fetch_failing_since")
+    if since is None:
+        rec["fetch_failing_since"] = now
+        sp.write_text(json.dumps(rec))
+        return
+    if now - since < FETCH_TIMEOUT:
+        return
+    title = rec["title"]
+    release = rec.get("release_name", title)
+    log(
+        f"[{cat}] '{title}' UNFETCHABLE (Seedr CDN failing >{FETCH_TIMEOUT // 60}min: {err}) -> failing & retrying"
+    )
+    if folder_id is not None:
+        delete_folder(folder_id)
+    if file_id is not None:
+        delete_file(file_id)
+    retried = arr_mark_failed(cat, release)
+    notify(
+        f"Unfetchable: {release}",
+        f"Seedr reported it complete but its CDN kept 404ing for {FETCH_TIMEOUT // 60} min. "
+        + (
+            "Asked Radarr/Sonarr to grab a different release."
+            if retried
+            else "Could not reach Radarr/Sonarr -- override it manually."
+        ),
+    )
+    # tombstone -> reaper cleans any leftover Seedr footprint / local partial and we stop retrying
+    rec.update(superseded=True, new_title=None, superseded_at=now, unfetchable=True)
+    sp.write_text(json.dumps(rec))
+    cleanup_local_partial(cat, title)
+
+
 def state_file(category, title):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     safe = base64.urlsafe_b64encode(f"{category}|{title}".encode()).decode()
@@ -312,10 +428,24 @@ def process_new_magnets():
     for cat in CATEGORIES:
         bh = DATA / "blackhole" / cat
         bh.mkdir(parents=True, exist_ok=True)
-        for mfile in sorted(bh.glob("*.magnet")) + sorted(bh.glob("*.txt")):
-            magnet = mfile.read_text().strip()
-            if not magnet.startswith("magnet:"):
-                continue
+        drops = (
+            sorted(bh.glob("*.magnet"))
+            + sorted(bh.glob("*.txt"))
+            + sorted(bh.glob("*.torrent"))
+        )
+        for mfile in drops:
+            if mfile.suffix == ".torrent":
+                # Indexers that hand the *arr a real .torrent (YTS, etc.) land here;
+                # Seedr only takes magnets, so synthesize one from the file.
+                try:
+                    magnet = magnet_from_torrent(mfile)
+                except Exception as e:
+                    log(f"[{cat}] cannot parse {mfile.name} ({e}); skipping")
+                    continue
+            else:
+                magnet = mfile.read_text().strip()
+                if not magnet.startswith("magnet:"):
+                    continue
             # movie identity (Radarr only) -> lets a new release supersede an old
             # in-progress 'zombie' transfer of the SAME movie.
             nkey = movie_key(mfile.stem) if cat == "radarr" else None
@@ -434,12 +564,11 @@ def check_completions():
                 handle_stalled(cat, rec, sp, prog)
             continue  # still in progress -> do NOT fetch yet
         # torrent finished (gone from in-progress) -> locate its result.
-        ntitle = norm(title)
         # (a) multi-file / wrapped torrents land as a top-level FOLDER
         folder_id = folders.get(title)
-        if folder_id is None:  # tolerate Seedr sanitizing the name
+        if folder_id is None:  # tolerate Seedr sanitizing / site-prefixing the name
             for name, fid in folders.items():
-                if norm(name)[:20] == ntitle[:20]:
+                if _name_matches(name, title):
                     folder_id, title = fid, name
                     break
         if folder_id is not None:
@@ -453,16 +582,12 @@ def check_completions():
                 log(f"[{cat}] '{title}' downloaded to {dest}")
             except Exception as e:
                 log(f"    fetch failed for '{title}': {e}; will retry")
+                handle_fetch_failure(cat, rec, sp, str(e), folder_id=folder_id)
             continue
         # (b) bare single-file torrents land as a ROOT FILE (no folder)
         match = None
         for f in root.get("files", []):
-            stem = norm(os.path.splitext(f.get("name", ""))[0])
-            if stem and (
-                stem[:18] == ntitle[:18]
-                or stem.startswith(ntitle[:16])
-                or ntitle.startswith(stem[:16])
-            ):
+            if _name_matches(os.path.splitext(f.get("name", ""))[0], title):
                 match = f
                 break
         if match is not None:
@@ -476,6 +601,7 @@ def check_completions():
                 log(f"[{cat}] '{title}' downloaded to {dest}")
             except Exception as e:
                 log(f"    fetch failed for '{title}': {e}; will retry")
+                handle_fetch_failure(cat, rec, sp, str(e), file_id=match["id"])
             continue
         log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
 

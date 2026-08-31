@@ -2,11 +2,15 @@
 """
 media-bridge entrypoint.
 
-Runs three formerly-separate custom services as supervised daemon threads inside
+Runs six formerly-separate custom services as supervised daemon threads inside
 one container (all off-VPN, on the default bridge network):
   * seedr    -- Seedr <-> Sonarr/Radarr blackhole bridge   (30s poll)
   * reaper   -- Jellyfin "watched movie" -> Radarr reaper   (6h)
   * movierulz-- 5movierulz crawler + Torznab feed for Prowlarr (crawl ~1h, HTTP server)
+  * tamilmv  -- tamilmv/tamilblasters forum crawler + Torznab feed :8005 (replaces MediaFusion)
+  * daddylive-- DaddyLive resolver: M3U/EPG + on-demand stream resolve for Jellyfin (HTTP server)
+  * youtube  -- web form (:8003) + worker: pull a YouTube full-movie into a Radarr movie
+               folder via a disposable yt-dlp+ffmpeg container (no-torrent fallback)
 
 Each unit runs in its own thread wrapped so a crash logs + ntfy-alerts + restarts
 without taking down the others (threads are I/O-bound; requests releases the GIL,
@@ -18,6 +22,9 @@ import time
 import seedr
 import reaper
 import movierulz
+import tamilmv
+import daddylive
+import youtube
 from common import clog, ntfy
 
 
@@ -39,11 +46,18 @@ def supervise(name, target):
 
 
 def main():
-    clog("main", "media-bridge starting: seedr + reaper + movierulz")
+    clog("main", "media-bridge starting: seedr + reaper + movierulz + tamilmv + daddylive + youtube")
     supervise("seedr", seedr.run_forever)
     supervise("reaper", reaper.run_forever)
     supervise("movierulz-crawler", movierulz.run_crawler)
     supervise("movierulz-torznab", movierulz.serve_torznab)
+    supervise("tamilmv-crawler", tamilmv.run_crawler)
+    supervise("tamilmv-torznab", tamilmv.serve_torznab)
+    supervise("daddylive-refresher", daddylive.run_refresher)
+    supervise("daddylive-precheck", daddylive.run_precheck)
+    supervise("daddylive-server", daddylive.serve)
+    supervise("youtube-worker", youtube.run_worker)
+    supervise("youtube-server", youtube.serve)
     while True:
         time.sleep(3600)
 

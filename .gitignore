@@ -1,5 +1,6 @@
 # Secrets
 .env
+mediafusion.env
 
 # Service runtime state / config (not code)
 bazarr/
@@ -9,6 +10,7 @@ prowlarr/
 radarr/
 sonarr/
 media-bridge/config/
+mediafusion/
 
 # Compose backups
 docker-compose.yaml.bak.*
@@ -16,3 +18,11 @@ docker-compose.yaml.bak.*
 # Python
 __pycache__/
 *.pyc
+
+# Editor / scratch / local inspection artifacts
+.vscode/
+.codex
+tmp_node/
+tmp_inspect/
+*.session.sql
+mediafusion-queries.sql
