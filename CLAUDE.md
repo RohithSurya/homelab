@@ -120,8 +120,10 @@ ship a movierulz change also restarts the seedr loop mid-download — safe, sinc
 **Port bindings: all interfaces, never a literal LAN IP** (changed 2026-08-30, when the Jetson gained a
 wired link and became dual-homed — Ethernet `enP8p1s0` and Wi-Fi `wlP1p1s0`, both on `10.0.0.0/24`;
 Ethernet holds the long-standing `10.0.0.179` reservation so existing clients and the router's 443 forward
-moved to the wire untouched; Wi-Fi now takes whatever DHCP offers. Nothing depends on the Wi-Fi address
-any more, which is the point — do not re-pin it anywhere).
+moved to the wire untouched; Wi-Fi is statically pinned to `10.0.0.180` (NetworkManager profile `SRP`,
+`ipv4.method=manual`), with a matching router DHCP reservation on `f8:3d:c6:57:20:87` holding that address
+out of the pool. Nothing in this stack depends on the Wi-Fi address any more, which is the point — do not
+re-pin it anywhere).
 The four feeds (`8002`–`8005`) publish as plain `"800x:800x"`. Binding a literal address here has two
 failure modes, both hit in practice: it (1) **dies with its NIC** — and since all four binds live in one
 container, a Wi-Fi blip stopped Docker from starting `media-bridge` *at all*, taking `[seedr]` and
