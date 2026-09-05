@@ -426,6 +426,16 @@ def unorm(s):
     return "".join(c for c in unicodedata.normalize("NFKD", s or "").casefold() if c.isalnum())
 
 
+def _latin_term(t):
+    """True if a Radarr title is usable as a search term against our latin-named releases.
+    norm() alone is NOT the test: it keeps [a-z0-9], so a native-script title carrying a digit
+    ('3 பி.ஹெச்.கே' for 3BHK) passes it with just '3' left. As a term its only token is
+    '3', which substring-matches almost every release title (sizes, years, bitrates) -- the same
+    match-the-whole-catalogue bug search_terms() guards against, arriving through the alias map
+    instead of the query. Titles that are legitimately all-digits ('1917') stay usable."""
+    return bool(norm(t)) and not any(c.isalpha() and ord(c) > 127 for c in t)
+
+
 def _radarr_aliases():
     """{unorm(any known title): [latin titles of that movie]} from Radarr, refreshed every
     ALIAS_REFRESH. Best-effort: on failure the map is left as-is and search falls back to the
@@ -452,7 +462,7 @@ def _radarr_aliases():
         titles += [a.get("title") for a in (m.get("alternateTitles") or [])]
         titles = [t for t in titles if t]
         # only latin-script titles are usable as search terms -- our releases are named in latin
-        latin = [t for t in titles if norm(t)]
+        latin = [t for t in titles if _latin_term(t)]
         if not latin:
             continue
         for t in titles:

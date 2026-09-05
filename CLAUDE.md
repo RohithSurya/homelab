@@ -205,6 +205,16 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   replaces the old per-language category walk, because it covers **every language and type including
   `*-dubbed`** — nothing is left out. `MOVIERULZ_BASE` is required and lives in `.env`, out of source;
   unset, the crawler disables itself but the Torznab feed still serves.
+  **The domain rotates, and a dead one looks like a FlareSolverr fault, not a DNS one:** every page
+  fetch fails with `500 Server Error ... /v1` from FlareSolverr, which reads as Cloudflare trouble.
+  Check `docker compose logs flaresolverr` for the real cause — `ERR_NAME_NOT_RESOLVED` means the
+  domain is simply gone (`www.5movierulz.watch` went NXDOMAIN 2026-08-24 and the crawler indexed
+  nothing for 11 days while FlareSolverr itself was healthy, still serving tamilmv fine). Fix is a
+  one-line `MOVIERULZ_BASE` update in `.env`. After changing it, mind the **backfill floor**: an
+  incremental pass stops at the first fully-known page (floor `MIN_PAGES`), so if a catch-up walk is
+  interrupted partway the still-unseen posts sit *below* that floor and no later pass ever reaches
+  them. Either let the first post-fix crawl run to completion undisturbed, or reset
+  `meta.backfill_done=0` to force a full resumable re-walk.
   Fetches every page **through FlareSolverr** (`FLARESOLVERR_URL`, CF-protected site), never directly.
   Post discovery keys on the trailing numeric id, covering both URL schemes (`…-<id>.html` and the legacy
   `…/movie-watch-online-free-<id>.html`). Metadata is parsed from the magnet **`dn=` name** (authoritative,
