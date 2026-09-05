@@ -424,6 +424,75 @@ def state_file(category, title):
     return STATE_DIR / f"{safe}.json"
 
 
+def _magnet_btih(magnet):
+    """Infohash from a magnet's xt=urn:btih: (hex, lowercased). Base32 form is converted."""
+    m = re.search(r"xt=urn:btih:([0-9a-zA-Z]+)", magnet or "")
+    if not m:
+        return ""
+    h = m.group(1)
+    if len(h) == 32:
+        try:
+            h = base64.b32decode(h.upper()).hex()
+        except Exception:
+            return ""
+    return h.lower()
+
+
+def adopt_existing(cat, mfile, magnet, nkey):
+    """Seedr answered 409 Conflict: it ALREADY holds this torrent -- an out-of-band add
+    (adding the magnet by hand on seedr.cc is a normal thing to do) or an earlier loop
+    whose response we lost. A 409 has no state file behind it, and check_completions()
+    only ever looks at state files, so the result would never be fetched while the magnet
+    409s again on every single poll -- forever. Adopt the transfer instead: write exactly
+    the record a successful add would have.
+
+    Matched by infohash against the in-progress list (exact, unlike the name matcher);
+    if it already finished it is no longer a torrent, so fall back to _name_matches over
+    the folders and bare root files -- the same two shapes check_completions() handles.
+    Returns True if the drop was adopted (and the magnet consumed)."""
+    btih = _magnet_btih(magnet)
+    try:
+        root = list_folder()
+    except Exception as e:
+        log(f"    409 but listing Seedr failed ({e}); will retry next loop")
+        return False
+    title, where = mfile.stem, ""
+    tid = thash = None
+    for t in root.get("torrents", []):
+        if btih and (t.get("hash") or "").lower() == btih:
+            tid, thash = t.get("id"), t.get("hash")
+            where = f"in progress {t.get('progress', 0):.0f}%"
+            break
+    if not where:
+        # already complete -> a top-level folder, or a bare root file for single-file torrents
+        for f in root.get("folders", []):
+            if _name_matches(f.get("path", ""), title):
+                where = "already complete (folder)"
+                break
+        if not where:
+            for f in root.get("files", []):
+                if _name_matches(f.get("name", ""), title):
+                    where = "already complete (root file)"
+                    break
+    if not where:
+        log("    409 but no matching Seedr transfer found; will retry next loop")
+        return False
+    if nkey:
+        purge_superseded(cat, nkey, mfile.stem, root)
+    rec = {
+        "category": cat,
+        "title": title,
+        "release_name": mfile.stem,
+        "user_torrent_id": tid,
+        "torrent_hash": thash or btih or None,
+        "added": time.time(),
+    }
+    state_file(cat, title).write_text(json.dumps(rec))
+    mfile.unlink()
+    log(f"    already on Seedr ({where}) -> adopted as '{title}'")
+    return True
+
+
 def process_new_magnets():
     for cat in CATEGORIES:
         bh = DATA / "blackhole" / cat
@@ -484,6 +553,12 @@ def process_new_magnets():
                         log(
                             f"    add 413 (Seedr full, {free / 1e9:.0f}GB free); attempt {n}/5, will retry"
                         )
+                    continue
+                if (
+                    getattr(e, "response", None) is not None
+                    and e.response.status_code == 409
+                    and adopt_existing(cat, mfile, magnet, nkey)
+                ):
                     continue
                 log(f"    add failed ({e}); will retry next loop")
                 continue

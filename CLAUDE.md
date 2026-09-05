@@ -176,6 +176,13 @@ Non-obvious invariants — preserve these when editing:
   retry; if lots of space free yet still 413 (or after 5 tries), the release can't fit the account and
   the magnet is dropped. Seedr account is only ~34 GB — Quality Definition max sizes are capped at
   130 MB/min in both Sonarr and Radarr to keep grabs within budget.
+- **409 on add** = Seedr ALREADY holds this torrent — normally because the magnet was added by hand on
+  seedr.cc, which is a reasonable thing to do. `adopt_existing` takes it over instead of retrying:
+  a 409 leaves no state file behind, and `check_completions` only ever reads state files, so the
+  finished movie would sit in Seedr undelivered while the magnet 409'd on every 30s poll forever.
+  The live transfer is matched **by infohash** (exact — the name matcher is not needed here); if it
+  already finished it is no longer in `root["torrents"]`, so it falls back to `_name_matches` over
+  folders and bare root files, the same two result shapes `check_completions` handles.
 
 ### reaper component (`media-bridge/reaper.py`)
 
