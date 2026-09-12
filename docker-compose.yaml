@@ -51,7 +51,7 @@ services:
   # Keeps rosurya.duckdns.org pointed at the current (dynamic) Comcast WAN IP.
   # Every vhost is a subdomain of it, so this is edge infrastructure, not app config.
   duckdns:
-    image: lscr.io/linuxserver/duckdns:678b96cb-ls88   # pinned (lsio uses git-sha versions, not semver)
+    image: lscr.io/linuxserver/duckdns:b9e2cafd-ls153   # pinned (lsio uses git-sha versions, not semver)
     labels:
       - 'wud.tag.include=^[0-9a-f]{8}-ls\d+$$'
       - 'wud.tag.transform=^[0-9a-f]{8}-ls(\d+)$$ => 0.0.$$1'
