@@ -28,6 +28,8 @@ services:
     container_name: caddy
     network_mode: host                           # reach every backend on 127.0.0.1; own host :80/:443
     labels:
+      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
+      - 'updater.policy=approve'
       # autoheal lives in the media-server stack but matches by LABEL across all
       # compose projects, so it still restarts this container when it goes unhealthy.
       - "autoheal=true"
@@ -50,6 +52,10 @@ services:
   # Every vhost is a subdomain of it, so this is edge infrastructure, not app config.
   duckdns:
     image: lscr.io/linuxserver/duckdns:678b96cb-ls88   # pinned (lsio uses git-sha versions, not semver)
+    labels:
+      - 'wud.tag.include=^[0-9a-f]{8}-ls\d+$$'
+      - 'wud.tag.transform=^[0-9a-f]{8}-ls(\d+)$$ => 0.0.$$1'
+      - 'updater.policy=auto'
     container_name: duckdns
     environment:
       - PUID=1000
@@ -72,6 +78,9 @@ services:
   fail2ban:
     container_name: fail2ban
     image: crazymax/fail2ban:1.1.0                # pinned
+    labels:
+      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
+      - 'updater.policy=approve'
     network_mode: host
     cap_add:
       - NET_ADMIN
