@@ -24,7 +24,7 @@ services:
   # TLS: automatic Let's Encrypt. Port 80 is blocked by Comcast, so issuance
   # happens over TLS-ALPN-01 on :443 (Caddy falls back to it automatically).
   caddy:
-    image: caddy:latest
+    image: caddy:2.11.4                           # pinned: step versions deliberately (see ~/updater)
     container_name: caddy
     network_mode: host                           # reach every backend on 127.0.0.1; own host :80/:443
     labels:
@@ -49,7 +49,7 @@ services:
   # Keeps rosurya.duckdns.org pointed at the current (dynamic) Comcast WAN IP.
   # Every vhost is a subdomain of it, so this is edge infrastructure, not app config.
   duckdns:
-    image: lscr.io/linuxserver/duckdns:latest
+    image: lscr.io/linuxserver/duckdns:678b96cb-ls88   # pinned (lsio uses git-sha versions, not semver)
     container_name: duckdns
     environment:
       - PUID=1000
@@ -71,7 +71,7 @@ services:
   # remaining coupling to the application stacks, and it is inherent to the job.
   fail2ban:
     container_name: fail2ban
-    image: crazymax/fail2ban:latest
+    image: crazymax/fail2ban:1.1.0                # pinned
     network_mode: host
     cap_add:
       - NET_ADMIN
