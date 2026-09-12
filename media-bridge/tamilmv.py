@@ -58,6 +58,11 @@ MIN_PAGES = int(os.environ.get("TAMILMV_MIN_PAGES", "1"))   # scan at least this
 FAKE_SEEDERS = int(os.environ.get("FAKE_SEEDERS", "50"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "3"))
 EMPTY_RETRY_DAYS = float(os.environ.get("TAMILMV_EMPTY_RETRY_DAYS", "3"))
+# Cooldown between "domain dead" ntfy pushes for the SAME site. A dead seed fails on every crawl
+# pass, so an ungated alert fires ~24x/day forever and drowns the topic (it buried DIUN's daily
+# image-update batch until DIUN was moved to its own topic). Logs stay per-pass; only ntfy is
+# throttled. 0 disables the cooldown (alert every pass).
+DEAD_ALERT_INTERVAL = float(os.environ.get("TAMILMV_DEAD_ALERT_INTERVAL", "86400"))
 DB_PATH = os.environ.get("TAMILMV_DB", "/config/tamilmv.db")
 
 # The two sites we handle, mapped to their key in the upstream config. Per-site seed overrides
@@ -161,19 +166,32 @@ def resolve_base(seed):
 
 def site_base(site):
     """Live base URL for a site, with recovery: override/seed -> redirect; if dead, force a GitHub
-    config refresh for a newer seed and retry; still dead -> ntfy + None (skip this site)."""
+    config refresh for a newer seed and retry; still dead -> ntfy + None (skip this site).
+
+    The dead-site ntfy is rate-limited to one push per DEAD_ALERT_INTERVAL per site, and the
+    timer is RESET to 0 on every successful resolve. That gives transition semantics like
+    daddylive's precheck: a site that recovers and then dies again alerts immediately instead
+    of waiting out a window opened by the previous outage."""
+    key = f"dead_alert:{site}"
     seed = SITES.get(site) or CONFIG.get(site, {}).get("homepage")
     base = resolve_base(seed)
     if base:
+        set_meta(key, 0)
         return base
     log(f"  {site}: seed {seed!r} not resolving; refreshing config")
     load_config(force=True)
     seed2 = SITES.get(site) or CONFIG.get(site, {}).get("homepage")
     base = resolve_base(seed2)
-    if not base:
+    if base:
+        set_meta(key, 0)
+        return base
+    log(f"  {site}: seed {seed2!r} still dead after config refresh")
+    last = float(get_meta(key) or 0)
+    if time.time() - last >= DEAD_ALERT_INTERVAL:
         ntfy(f"tamilmv: {site} domain dead",
              f"seed {seed2!r} no longer redirects; update *_SEED_OVERRIDE or wait for upstream config",
              priority="high", tags="warning")
+        set_meta(key, time.time())
     return base
 
 
@@ -224,6 +242,18 @@ def db():
         conn.commit()
         _conn = conn
     return _conn
+
+
+def get_meta(key):
+    with DB_LOCK:
+        row = db().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+
+def set_meta(key, value):
+    with DB_LOCK:
+        db().execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", (key, str(value)))
+        db().commit()
 
 
 def post_needs_fetch(site, post_id):

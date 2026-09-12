@@ -75,6 +75,23 @@ hardlink-friendly and paths map 1:1 across services. Layout:
 - `data/media/{tv,movies}` — the Jellyfin library, mounted read-only into jellyfin.
 - `data/blackhole/.bridge-state/` — media-bridge seedr per-transfer state JSON (one file per transfer).
 
+## ntfy: two topics, deliberately separate
+
+Push alerts go to ntfy.sh on **two** topics, and they must stay split:
+- **`NTFY_TOPIC`** — media-bridge's operational alerts (seedr stalls, dead scraper domains, youtube
+  job results). Event-driven, can repeat, sometimes urgent.
+- **`NTFY_TOPIC_DIUN`** — DIUN image-update notices only. One batch a day at 08:00.
+
+Both live in `.env`. They were one topic until 2026-09-11, which **silently hid DIUN entirely**: the
+phone app collapses a topic's messages into one notification group, so media-bridge's recurring
+alerts (a dead tamilblasters seed re-alerting every crawl pass, ~24/day at priority 4) buried DIUN's
+4-8 once-daily messages at priority 3. DIUN was never broken — `docker logs diun` showed "Image update
+found" on every run and no send errors; the messages were arriving and being drowned. If DIUN ever
+seems silent again, check the topic *before* suspecting the notifier: `docker exec diun diun notif test`
+publishes a test message, and `curl -s "https://ntfy.sh/<topic>/json?poll=1&since=12h"` shows what the
+topic actually received (ntfy.sh caches 12h, so a message older than that is simply gone, not lost).
+A new ntfy topic also needs subscribing to in the phone app — nothing on the box can do that for you.
+
 ## Jellyfin: official image on a LinuxServer directory layout
 
 Jellyfin ran `lscr.io/linuxserver/jellyfin` until 2026-08-27, when it moved to the **official**
@@ -303,6 +320,12 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   **content pages** are CF-walled and go through the same `FLARESOLVERR_URL` as movierulz. Recovery
   ladder when a base dies: re-resolve → force a GitHub config refresh for a newer `homepage` → still
   dead → ntfy (then set `TAMILMV_SEED_OVERRIDE`/`TAMILBLASTERS_SEED_OVERRIDE` as an emergency manual pin).
+  **The dead-site ntfy is rate-limited** to one push per `TAMILMV_DEAD_ALERT_INTERVAL` (default 86400s)
+  per site, tracked in `dead_alert:<site>` in tamilmv.db's `meta` table. Ungated, it fired on *every*
+  crawl pass — ~24/day forever, which drowned the shared ntfy topic (see "ntfy: two topics" above). A
+  successful resolve resets the timer to 0, so a site that recovers and dies again alerts immediately
+  rather than waiting out the previous outage's window. The per-pass `log()` line is NOT throttled —
+  `docker compose logs media-bridge` still shows the true state hourly.
 - **Config shapes differ**: tamilmv uses `supported_search_forums` (33 forums), tamil_blasters uses
   `catalogs` (28) — `_parse_site_cfg` normalizes both to `[(forum_path, language)]`.
 - **Crawl**: per site → `resolve_base` → for each forum `…/index.php?/forums/forum/<id>/page/<n>/` via
