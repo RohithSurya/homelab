@@ -77,7 +77,7 @@ services:
   # remaining coupling to the application stacks, and it is inherent to the job.
   fail2ban:
     container_name: fail2ban
-    image: crazymax/fail2ban:1.1.0                # pinned
+    image: crazymax/fail2ban:1.1.1                # pinned
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+$$'
       - 'updater.policy=approve'
