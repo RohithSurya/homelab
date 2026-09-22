@@ -170,6 +170,11 @@ Non-obvious invariants — preserve these when editing:
   grabs a half-finished download.
 - Results land two ways: multi-file torrents as a top-level **folder**, single-file torrents as a bare
   **root file** — both are handled, matched by normalized name prefix.
+- **Delivered under the *arr's release name, not Seedr's**: the local dir is
+  `downloads/<cat>/<release_name>` (the `.magnet` stem = the title the *arr grabbed). The *arr maps a
+  watch-folder item to its series/movie by parsing the folder name, and Seedr's name is the torrent's raw
+  internal one (`www.1TamilMV.promo - Heart Beat (2026) S03 EP (01-04) …`), which can map to nothing or
+  to the wrong show. `cleanup_local_partial` matches either name, for dirs written before this.
 - **Override/supersede (Radarr only)**: a new release whose `movie_key` (normalized "title+year")
   matches an in-progress *different* release of the same movie triggers `purge_superseded`, which
   deletes the old Seedr transfer immediately and writes a **tombstone** state file; `check_completions`
@@ -189,6 +194,11 @@ Non-obvious invariants — preserve these when editing:
   `sourceTitle` == stored `release_name`, then `POST /history/failed/{id}` → blocklist + auto re-grab)
   and an ntfy notification is sent. `arr_mark_failed` uses plain `requests`, NOT the module-level
   `SESSION` (which carries Seedr Basic-auth that must not leak to the *arr).
+- **Missing-result handling**: a transfer that left `root["torrents"]` but whose folder/file never
+  appears (Seedr dropped/deduped it — hit 2026-09-22 when a single-episode torrent finished alongside a
+  pack holding the same file) used to log `finished but result not visible yet` every poll forever.
+  After `RESULT_TIMEOUT` (default 1800s) `handle_missing_result` fails it via `arr_mark_failed`, ntfys,
+  and tombstones it (so a late-appearing result is still reaped).
 - **413 on add** = Seedr full or release too big. If a same-movie zombie is hogging space, free it and
   retry; if lots of space free yet still 413 (or after 5 tries), the release can't fit the account and
   the magnet is dropped. Seedr account is only ~34 GB — Quality Definition max sizes are capped at
@@ -259,10 +269,20 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   closes). Keying retry on magnet count, not release count, is deliberate: skip-only pages (single
   episodes/Parts) DO have magnets, so they must not be retried. Without this, a movie whose magnets
   landed after we scraped it was indexed **never**.
-- **Scope = movies + full-season packs only.** `S0X EP (a-b)` → `kind=series` with the title normalized
-  to a Sonarr season-pack (`… S0X …`, EP-range dropped). Single episodes (`S04 EP09`) and "Part" forms
+- **Scope = movies + episode-range packs only.** `S0X EP (a-b)` → `kind=series` with the title
+  normalized to a Sonarr **multi-episode** release `… S0XEa-Eb …` — NOT a bare `S0X` season pack: sites
+  post running seasons in chunks (Heart Beat S03 is 32 episodes, posted 4 at a time), and a bare `S0X`
+  told Sonarr each chunk was the whole season. Single episodes (`S04 EP09`) and "Part" forms
   (`S1P2`, `S1P-1-2`) are **skipped** — the season/part regexes also guard against mis-filing them as
   movies.
+- **Series year pinned to Sonarr's (`series_title`, applied when serving, not stored):** release names
+  carry the *season's* year (`Heart Beat (2026) S03…` for a 2024 show), and Sonarr maps a
+  titled-with-year release only to a series of that year → `[Permanent] Unknown Series`. Stripping the
+  year is **not** a fix: a bare name can hit a global scene alias (`Heart Beat` → TVDB 74684, the 1992 UK
+  *Heartbeat*). So for shows in the Sonarr library the served title gets the show's own year
+  (rewritten or inserted), from a `SONARR_URL` series map refreshed every `ALIAS_REFRESH`. Shows not in
+  Sonarr are served unchanged. Test a title with `GET /api/v3/parse?title=…` on Sonarr — it shows the
+  mapped series (or none).
 - **Torznab server** (`serve_torznab`): `t=caps` advertises movie + tv search; `t=search/movie/tvsearch`
   validate `MOVIERULZ_APIKEY` (Torznab error 100 on mismatch) and substring-match stored titles. Every
   `<item>` MUST carry a `<pubDate>` (Prowlarr drops items without it — the same bug the custom
@@ -303,7 +323,7 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 ### tamilmv component (`media-bridge/tamilmv.py`)
 
 A crawler thread + a stdlib Torznab HTTP server (`:8005`, host-published) that scrapes **tamilmv +
-tamilblasters** (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + full-season packs) into a
+tamilblasters** (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + episode-range packs) into a
 Torznab feed for Prowlarr. **This replaced the retired MediaFusion 4-container stack** (postgres + redis
 + Rust api/worker), whose compiled tamil spiders were the only part worth keeping — and whose ext.to
 scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSolverr continuously.

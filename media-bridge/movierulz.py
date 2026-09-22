@@ -64,6 +64,9 @@ DB_PATH = os.environ.get("MOVIERULZ_DB", "/config/movierulz.db")
 RADARR_URL = os.environ.get("RADARR_URL", "").rstrip("/")
 RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
 ALIAS_REFRESH = int(os.environ.get("ALIAS_REFRESH", "900"))   # re-pull the Radarr movie list this often
+# Sonarr is the source of each show's year (see series_title). Reuses seedr's Sonarr credentials.
+SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")
+SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
 
 # Best-effort language label parsed from the post slug (e.g. '...-telugu-7008.html' or
 # '...-telugu-dubbed-7112.html'). Functionally optional -- the feed matches by title, not language.
@@ -88,8 +91,14 @@ _host = re.escape(urllib.parse.urlparse(BASE).netloc)
 POST_RE = re.compile(r'https?://' + _host + r'/[A-Za-z0-9/_-]+?-(\d+)\.html')
 MAGNET_RE = re.compile(r'magnet:\?[^"\'<>\s]+')
 
-# Full-season pack, e.g. "S02 EP (01-08)" -> indexed as a season pack.
-SEASON_PACK = re.compile(r'\bS(\d{1,2})\s*EP\s*\(\s*\d+\s*-\s*\d+\s*\)', re.I)
+# Episode-range pack, e.g. "S02 EP (01-08)" -> indexed as multi-episode "S02E01-E08".
+# NOT as a bare "S02" season pack: sites post running seasons in chunks (Heart Beat S03 is
+# 32 episodes, posted 4 at a time), and a bare "S02" tells Sonarr the chunk is the whole season.
+SEASON_PACK = re.compile(r'\bS(\d{1,2})\s*EP\s*\(\s*(\d+)\s*-\s*(\d+)\s*\)', re.I)
+# Split a normalized series title into show name / optional year / the rest (from an optional
+# resolution + the SxxE marker on), e.g. 'Heart Beat (2026) 1080p S03E01-E04 ...'. See series_title().
+SERIES_HEAD_RE = re.compile(
+    r'^(?P<base>.+?)(?:\s*[(\[]?\b(?:19|20)\d{2}\b[)\]]?)?(?P<rest>(?:\s+\d{3,4}p)?\s+S\d{1,2}E\d.*)$', re.I)
 # Other series markers (single ep "S04 EP09"/"S04E09", "S1P2"/"S1P-1-2", spelled-out
 # "Season 3") -> NOT mappable to Sonarr cleanly, so these releases are skipped.
 SERIES_ANY = re.compile(r'\bS\d{1,2}\s*(?:EP?\s*\d+|E\d+|P[\s\-\d])', re.I)
@@ -107,6 +116,8 @@ DB_LOCK = threading.Lock()
 _ALIAS = {}            # unorm(title) -> [latin titles]; see _radarr_aliases()
 _ALIAS_TS = 0.0
 _ALIAS_LOCK = threading.Lock()
+_SERIES_YEAR = {}      # unorm(show title) -> Sonarr year (None if ambiguous); see _sonarr_years()
+_SERIES_YEAR_TS = 0.0
 # Separate lock for lazy init only: the crawler and torznab threads both call db() at startup, so the
 # init (incl. the one-shot ALTER migration below) must run exactly once. Not DB_LOCK -- callers like
 # get_meta() hold DB_LOCK across their db() call, and threading.Lock isn't reentrant.
@@ -249,11 +260,14 @@ def classify(name):
 
 def normalize_title(name, kind):
     """Clean the dn= name into a release title Sonarr/Radarr can parse.
-    For season packs, collapse 'S02 EP (01-08)' -> 'S02' so Sonarr sees a season pack."""
+    For episode-range packs, 'Show (2026) S02 EP (01-08)' -> 'Show S02E01-E08'."""
     title = SITE_PREFIX_RE.sub("", name)
     title = EXT_RE.sub("", title)
     if kind == "series":
-        title = SEASON_PACK.sub(lambda m: f"S{int(m.group(1)):02d}", title)
+        title = SEASON_PACK.sub(
+            lambda m: f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}-E{int(m.group(3)):02d}",
+            title,
+        )
     return title.strip()
 
 
@@ -477,6 +491,52 @@ def _radarr_aliases():
     return alias
 
 
+def _sonarr_years():
+    """{unorm(show title): year} from Sonarr, refreshed every ALIAS_REFRESH. Best-effort, same
+    contract as _radarr_aliases(): stale map on failure, timestamp stamped before the fetch.
+    A title two library shows share maps to None (no rewrite -- we can't tell which one)."""
+    global _SERIES_YEAR, _SERIES_YEAR_TS
+    if not (SONARR_URL and SONARR_API_KEY):
+        return _SERIES_YEAR
+    with _ALIAS_LOCK:
+        if time.time() - _SERIES_YEAR_TS < ALIAS_REFRESH:
+            return _SERIES_YEAR
+        _SERIES_YEAR_TS = time.time()
+    try:
+        r = requests.get(f"{SONARR_URL}/api/v3/series",
+                         headers={"X-Api-Key": SONARR_API_KEY}, timeout=20)
+        r.raise_for_status()
+        shows = r.json()
+    except Exception as e:
+        log(f"sonarr year refresh failed: {e}")
+        return _SERIES_YEAR
+    years = {}
+    for sh in shows:
+        if not sh.get("year"):
+            continue
+        # Sonarr disambiguates as 'Dark Matter (2024)'; key on the bare name
+        k = unorm(re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", sh.get("title") or ""))
+        if k:
+            years[k] = None if k in years and years[k] != sh["year"] else sh["year"]
+    with _ALIAS_LOCK:
+        _SERIES_YEAR = years
+    return years
+
+
+def series_title(title):
+    """Pin a series release's year to the one Sonarr has for that show.
+    Release names carry the SEASON's year ('Heart Beat (2026) S03 ...' for a 2024 show), and
+    Sonarr only maps a titled-with-year release to a series of that year -> "Unknown Series".
+    Dropping the year is no fix either: a bare name can collide with a global scene alias
+    ('Heart Beat' is TVDB 74684, the 1992 UK 'Heartbeat'). Only show-name + the show's own year
+    maps reliably, so rewrite (or insert) it for shows in the Sonarr library; leave others be."""
+    m = SERIES_HEAD_RE.match(title)
+    if not m:
+        return title
+    year = _sonarr_years().get(unorm(m["base"]))
+    return f"{m['base']} ({year}){m['rest']}" if year else title
+
+
 def search_terms(q):
     """Resolve an incoming Torznab query into the titles to match releases against.
 
@@ -547,7 +607,7 @@ def results_xml(rows):
         pub = email.utils.formatdate(r["added_at"], usegmt=True)
         items.append(
             "    <item>\n"
-            f"      <title>{escape(r['title'])}</title>\n"
+            f"      <title>{escape(series_title(r['title']) if r['kind'] == 'series' else r['title'])}</title>\n"
             f'      <guid isPermaLink="false">{r["btih"]}</guid>\n'
             f"      <pubDate>{pub}</pubDate>\n"
             f"      <size>{size}</size>\n"

@@ -39,7 +39,8 @@ from common import clog, ntfy
 # Reuse movierulz's stateless helpers (importing movierulz only builds its regexes; its threads
 # are started separately by main.py, so the import has no side effects beyond that).
 from movierulz import (
-    fetch, parse_magnet, search_terms, query_matches, torznab_category, error_xml, MAGNET_RE,
+    fetch, parse_magnet, search_terms, query_matches, series_title, torznab_category, error_xml,
+    MAGNET_RE,
 )
 
 # ---- config ----
@@ -432,7 +433,7 @@ def results_xml(rows):
         pub = email.utils.formatdate(r["added_at"], usegmt=True)
         items.append(
             "    <item>\n"
-            f"      <title>{escape(r['title'])}</title>\n"
+            f"      <title>{escape(series_title(r['title']) if r['kind'] == 'series' else r['title'])}</title>\n"
             f'      <guid isPermaLink="false">{r["btih"]}</guid>\n'
             f"      <pubDate>{pub}</pubDate>\n"
             f"      <size>{size}</size>\n"

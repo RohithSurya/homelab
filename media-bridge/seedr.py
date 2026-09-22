@@ -85,6 +85,11 @@ FETCH_SKIP_MAX = int(
 # up: purge it from Seedr, fail it in Radarr/Sonarr (-> blocklist + re-grab a different
 # release) and notify. The post-completion analogue of STALL_TIMEOUT.
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "5400"))  # 90 min
+# Missing-result handling: a transfer that left root["torrents"] (= finished) but whose
+# folder/file never shows up (Seedr deduped or dropped it -- seen when a single-episode
+# torrent finished alongside a pack holding the same file) would otherwise log "result not
+# visible yet" every poll forever. After this long, tombstone it and fail it in the *arr.
+RESULT_TIMEOUT = int(os.environ.get("RESULT_TIMEOUT", "1800"))  # 30 min
 ARR = {
     "radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
     "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY")),
@@ -257,9 +262,10 @@ def _name_matches(seedr_name, title):
     return len(shorter) >= 18 and shorter in longer
 
 
-def cleanup_local_partial(cat, old_title, new_title=None):
-    # remove a superseded release's partially-fetched download dir. The dir is named
-    # after the Seedr folder (often sanitized), not the state title, so match fuzzily.
+def cleanup_local_partial(cat, old_title, new_title=None, old_release=None):
+    # remove a superseded release's partially-fetched download dir. The dir is named after
+    # the *arr release (see check_completions) -- or, for dirs written before that, after the
+    # Seedr folder (often sanitized) -- so match either name fuzzily.
     base = DATA / "downloads" / cat
     if not base.exists():
         return
@@ -270,7 +276,9 @@ def cleanup_local_partial(cat, old_title, new_title=None):
             d.name, new_title
         ):  # never the replacement's dir
             continue
-        if _name_matches(d.name, old_title):
+        if _name_matches(d.name, old_title) or (
+            old_release and _name_matches(d.name, old_release)
+        ):
             shutil.rmtree(d, ignore_errors=True)
             log(f"    [override] removed local partial '{d.name}'")
 
@@ -298,7 +306,7 @@ def purge_superseded(cat, new_key, new_name, root):
         tid = rec.get("user_torrent_id")
         if tid is not None:
             delete_transfer(tid)
-        cleanup_local_partial(cat, rec["title"], new_name)
+        cleanup_local_partial(cat, rec["title"], new_name, rec.get("release_name"))
         rec.update(superseded=True, new_title=new_name, superseded_at=time.time())
         sp.write_text(json.dumps(rec))  # tombstone -> reaped by check_completions
         n += 1
@@ -376,7 +384,40 @@ def handle_stalled(cat, rec, sp, prog):
     # tombstone -> existing reaper cleans any partial folder/local dir and we stop re-failing
     rec.update(superseded=True, new_title=None, superseded_at=time.time(), stalled=True)
     sp.write_text(json.dumps(rec))
-    cleanup_local_partial(cat, title)
+    cleanup_local_partial(cat, title, old_release=release)
+
+
+def handle_missing_result(cat, rec, sp):
+    """A finished transfer whose result never appeared in Seedr. Start a deadline on the
+    first miss; once RESULT_TIMEOUT elapses, fail it in Radarr/Sonarr and tombstone it, so
+    a late-appearing result is reaped instead of looping forever. A successful match
+    unlinks the state file, so the deadline never outlives a delivery."""
+    now = time.time()
+    since = rec.get("result_missing_since")
+    if since is None:
+        rec["result_missing_since"] = now
+        sp.write_text(json.dumps(rec))
+        return
+    if now - since < RESULT_TIMEOUT:
+        return
+    title = rec["title"]
+    release = rec.get("release_name", title)
+    log(
+        f"[{cat}] '{title}' finished but result MISSING from Seedr for >{RESULT_TIMEOUT // 60}min -> failing"
+    )
+    retried = arr_mark_failed(cat, release)
+    notify(
+        f"Missing result: {release}",
+        f"Seedr finished it but never produced a file for {RESULT_TIMEOUT // 60} min. "
+        + (
+            "Marked failed in Radarr/Sonarr (it re-grabs if still wanted)."
+            if retried
+            else "Could not reach Radarr/Sonarr -- check it manually."
+        ),
+    )
+    rec.update(superseded=True, new_title=None, superseded_at=now, missing_result=True)
+    sp.write_text(json.dumps(rec))
+    cleanup_local_partial(cat, title, old_release=release)
 
 
 def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
@@ -415,7 +456,7 @@ def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
     # tombstone -> reaper cleans any leftover Seedr footprint / local partial and we stop retrying
     rec.update(superseded=True, new_title=None, superseded_at=now, unfetchable=True)
     sp.write_text(json.dumps(rec))
-    cleanup_local_partial(cat, title)
+    cleanup_local_partial(cat, title, old_release=release)
 
 
 def state_file(category, title):
@@ -618,7 +659,7 @@ def check_completions():
                     new_title and _name_matches(nm, new_title)
                 ):
                     delete_file(f["id"])
-            cleanup_local_partial(cat, title, new_title)
+            cleanup_local_partial(cat, title, new_title, rec.get("release_name"))
             if time.time() - rec.get("superseded_at", 0) > TOMBSTONE_GRACE:
                 sp.unlink()
                 log(f"    [override] cleanup window closed for '{title}'")
@@ -646,8 +687,13 @@ def check_completions():
                 if _name_matches(name, title):
                     folder_id, title = fid, name
                     break
+        # Deliver under the release name the *arr GRABBED, not Seedr's name for the result: the
+        # *arr maps a watch-folder item to its series/movie by parsing the folder name, and
+        # Seedr's name is the torrent's raw internal one ('www.1TamilMV.promo - Heart Beat
+        # (2026) S03 EP (01-04) ...'), which can map to nothing -- or to the wrong show.
+        local = rec.get("release_name") or title
         if folder_id is not None:
-            dest = DATA / "downloads" / cat / title
+            dest = DATA / "downloads" / cat / local
             log(f"[{cat}] '{title}' complete -> fetching folder to {dest}")
             try:
                 fetch_folder_recursive(folder_id, dest)
@@ -666,7 +712,7 @@ def check_completions():
                 match = f
                 break
         if match is not None:
-            dest = DATA / "downloads" / cat / title / match["name"]
+            dest = DATA / "downloads" / cat / local / match["name"]
             log(f"[{cat}] '{title}' complete (single file) -> fetching {match['name']}")
             try:
                 download_file(match["id"], dest)
@@ -679,6 +725,7 @@ def check_completions():
                 handle_fetch_failure(cat, rec, sp, str(e), file_id=match["id"])
             continue
         log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
+        handle_missing_result(cat, rec, sp)
 
 
 def run_forever():
