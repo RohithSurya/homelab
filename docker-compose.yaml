@@ -161,6 +161,8 @@ services:
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
       - POLL_INTERVAL=30
       - STALL_TIMEOUT=2700                          # 45 min, in seconds
+      - SEEDR_FTP_HOST=ftps.seedr.cc                # FTP fallback for CDN-404'd files + byte resume; empty = off
+      - SEEDR_FTP_PASSWORD_B64=${SEEDR_FTP_PASSWORD_B64:-}  # optional; unset = account password
       # --- shared *arr / jellyfin / ntfy ---
       - RADARR_URL=http://gluetun:7878
       - RADARR_API_KEY=${RADARR_API_KEY}

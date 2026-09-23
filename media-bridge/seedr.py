@@ -31,6 +31,7 @@ import pathlib
 import urllib.parse
 import requests
 
+import seedr_ftp
 from common import clog, norm, ntfy
 
 FAIL_COUNTS = {}  # magnet filename -> consecutive 413 attempts (in-memory)
@@ -178,23 +179,48 @@ def magnet_from_torrent(path):
     return "magnet:?" + "&".join(parts)
 
 
-def download_file(file_id, dest: pathlib.Path):
+def download_file(file_id, dest: pathlib.Path, remote=None, size=None):
+    """HTTPS (CDN) first; on any failure fall back to FTP for the same file (seedr_ftp:
+    serves files the CDN 404s on, and resumes at a byte offset). A .part left by an
+    earlier attempt goes straight to FTP so it is continued instead of truncated."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with SESSION.get(
-        f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
-    ) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    f.write(chunk)
+    ftp_ok = remote is not None and seedr_ftp.enabled()
+    if size and tmp.exists() and tmp.stat().st_size == size:
+        pass  # finished last time, died before the rename -> nothing left to fetch
+    elif ftp_ok and tmp.exists() and tmp.stat().st_size:
+        log(f"    resuming {dest.name} over FTP at {tmp.stat().st_size:,} B")
+        seedr_ftp.download(remote, tmp)
+    else:
+        try:
+            with SESSION.get(
+                f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
+            ) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+        except Exception as e:
+            if not ftp_ok:
+                raise
+            log(f"    HTTPS fetch of {dest.name} failed ({e}) -> FTP fallback")
+            seedr_ftp.download(remote, tmp)
+    got = tmp.stat().st_size
+    if size and got != size:
+        if got > size:  # corrupt, not merely short -> don't resume onto it
+            tmp.unlink()
+        raise RuntimeError(f"{dest.name}: got {got:,} B, expected {size:,} B")
     tmp.rename(dest)
     log(f"    downloaded {dest.name} ({dest.stat().st_size:,} bytes)")
 
 
-def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
+def fetch_folder_recursive(folder_id, dest_root: pathlib.Path, remote=None):
+    # remote = this folder's FTP path, for download_file's fallback; the top call takes
+    # it from the listing (a top-level folder's path is its name at the FTP root).
     listing = list_folder(folder_id)
+    if remote is None:
+        remote = "/" + listing.get("path", "")
     for f in listing.get("files", []):
         dest = dest_root / f["name"]
         # Resume support: if a previous pass already pulled this file in full,
@@ -204,7 +230,7 @@ def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
         if dest.exists() and size and dest.stat().st_size == size:
             continue
         try:
-            download_file(f["id"], dest)
+            download_file(f["id"], dest, f"{remote}/{f['name']}", size)
         except Exception as e:
             # Junk sidecars (YTSProxies.com.txt, "Torrent Downloaded From*.txt",
             # RARBG.nfo, ...) sometimes 404 on Seedr's CDN. They're not media and
@@ -217,7 +243,10 @@ def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
                 continue
             raise
     for sub in listing.get("folders", []):
-        fetch_folder_recursive(sub["id"], dest_root / sub["path"])
+        # a subfolder's "path" is its FULL path from the Seedr root ('Top/Sub/Deeper'),
+        # not its own name -- joining it whole nested the torrent's tree inside itself
+        name = sub["path"].rsplit("/", 1)[-1]
+        fetch_folder_recursive(sub["id"], dest_root / name, f"{remote}/{name}")
 
 
 def delete_folder(folder_id):
@@ -715,7 +744,7 @@ def check_completions():
             dest = DATA / "downloads" / cat / local / match["name"]
             log(f"[{cat}] '{title}' complete (single file) -> fetching {match['name']}")
             try:
-                download_file(match["id"], dest)
+                download_file(match["id"], dest, f"/{match['name']}", match.get("size"))
                 delete_file(match["id"])
                 sp.unlink()
                 log(f"[{cat}] '{title}' delivered.")

@@ -199,6 +199,22 @@ Non-obvious invariants — preserve these when editing:
   pack holding the same file) used to log `finished but result not visible yet` every poll forever.
   After `RESULT_TIMEOUT` (default 1800s) `handle_missing_result` fails it via `arr_mark_failed`, ntfys,
   and tombstones it (so a late-appearing result is still reaped).
+- **FTP fallback download (`seedr_ftp.py`)**: Seedr's HTTPS CDN (`rd*.seedr.cc/ff_get_premium/…`)
+  sometimes 404s persistently on a finished transfer's files while the bytes are intact in storage
+  (2026-09-23: a whole Heart Beat pack 404'd on `rd12` for 30+ min and would have been discarded by
+  `FETCH_TIMEOUT`). `download_file` tries HTTPS, and on any failure pulls the same file over **explicit
+  FTPS** (`SEEDR_FTP_HOST=ftps.seedr.cc`, account creds unless `SEEDR_FTP_PASSWORD_B64` is set), which
+  reads storage directly — same ~38 MB/s. FTP also resumes at a byte offset (`REST`), so a leftover
+  `.part` goes straight to FTP instead of being truncated by a fresh HTTPS GET; the result is checked
+  against Seedr's `size`. FTP paths mirror the folder tree (`/<top folder path>/<sub>/<file>`; bare
+  root files `/<name>`). FTP is **download-only here** — add/progress/completion/delete stay on REST
+  (Seedr documents no FTP watch folder). Empty `SEEDR_FTP_HOST` disables it. Two Seedr quirks the
+  code depends on: (1) a **dropped FTP transfer is reported as `550 Issue during transfer`** — the same
+  code as "no such file" — so a 5xx is treated as permanent only if no bytes moved on that attempt, and
+  connections are `close()`d, never `quit()` (QUIT reads that pending 550 and masks the real error);
+  (2) a **subfolder's REST `path` is its full path from the root** (`Top/Sub/Deeper`), not its own name —
+  `fetch_folder_recursive` uses the last component for both the local dir and the FTP path (joining it
+  whole used to nest the torrent's tree inside itself locally).
 - **413 on add** = Seedr full or release too big. If a same-movie zombie is hogging space, free it and
   retry; if lots of space free yet still 413 (or after 5 tries), the release can't fit the account and
   the magnet is dropped. Seedr account is only ~34 GB — Quality Definition max sizes are capped at
