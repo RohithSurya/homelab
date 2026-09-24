@@ -75,6 +75,23 @@ hardlink-friendly and paths map 1:1 across services. Layout:
 - `data/media/{tv,movies}` — the Jellyfin library, mounted read-only into jellyfin.
 - `data/blackhole/.bridge-state/` — media-bridge seedr per-transfer state JSON (one file per transfer).
 
+## ntfy: two topics, deliberately separate
+
+Push alerts go to ntfy.sh on **two** topics, and they must stay split:
+- **`NTFY_TOPIC`** — media-bridge's operational alerts (seedr stalls, dead scraper domains, youtube
+  job results). Event-driven, can repeat, sometimes urgent.
+- **`NTFY_TOPIC_DIUN`** — DIUN image-update notices only. One batch a day at 08:00.
+
+Both live in `.env`. They were one topic until 2026-09-11, which **silently hid DIUN entirely**: the
+phone app collapses a topic's messages into one notification group, so media-bridge's recurring
+alerts (a dead tamilblasters seed re-alerting every crawl pass, ~24/day at priority 4) buried DIUN's
+4-8 once-daily messages at priority 3. DIUN was never broken — `docker logs diun` showed "Image update
+found" on every run and no send errors; the messages were arriving and being drowned. If DIUN ever
+seems silent again, check the topic *before* suspecting the notifier: `docker exec diun diun notif test`
+publishes a test message, and `curl -s "https://ntfy.sh/<topic>/json?poll=1&since=12h"` shows what the
+topic actually received (ntfy.sh caches 12h, so a message older than that is simply gone, not lost).
+A new ntfy topic also needs subscribing to in the phone app — nothing on the box can do that for you.
+
 ## Jellyfin: official image on a LinuxServer directory layout
 
 Jellyfin ran `lscr.io/linuxserver/jellyfin` until 2026-08-27, when it moved to the **official**
@@ -153,6 +170,11 @@ Non-obvious invariants — preserve these when editing:
   grabs a half-finished download.
 - Results land two ways: multi-file torrents as a top-level **folder**, single-file torrents as a bare
   **root file** — both are handled, matched by normalized name prefix.
+- **Delivered under the *arr's release name, not Seedr's**: the local dir is
+  `downloads/<cat>/<release_name>` (the `.magnet` stem = the title the *arr grabbed). The *arr maps a
+  watch-folder item to its series/movie by parsing the folder name, and Seedr's name is the torrent's raw
+  internal one (`www.1TamilMV.promo - Heart Beat (2026) S03 EP (01-04) …`), which can map to nothing or
+  to the wrong show. `cleanup_local_partial` matches either name, for dirs written before this.
 - **Override/supersede (Radarr only)**: a new release whose `movie_key` (normalized "title+year")
   matches an in-progress *different* release of the same movie triggers `purge_superseded`, which
   deletes the old Seedr transfer immediately and writes a **tombstone** state file; `check_completions`
@@ -172,10 +194,38 @@ Non-obvious invariants — preserve these when editing:
   `sourceTitle` == stored `release_name`, then `POST /history/failed/{id}` → blocklist + auto re-grab)
   and an ntfy notification is sent. `arr_mark_failed` uses plain `requests`, NOT the module-level
   `SESSION` (which carries Seedr Basic-auth that must not leak to the *arr).
+- **Missing-result handling**: a transfer that left `root["torrents"]` but whose folder/file never
+  appears (Seedr dropped/deduped it — hit 2026-09-22 when a single-episode torrent finished alongside a
+  pack holding the same file) used to log `finished but result not visible yet` every poll forever.
+  After `RESULT_TIMEOUT` (default 1800s) `handle_missing_result` fails it via `arr_mark_failed`, ntfys,
+  and tombstones it (so a late-appearing result is still reaped).
+- **FTP fallback download (`seedr_ftp.py`)**: Seedr's HTTPS CDN (`rd*.seedr.cc/ff_get_premium/…`)
+  sometimes 404s persistently on a finished transfer's files while the bytes are intact in storage
+  (2026-09-23: a whole Heart Beat pack 404'd on `rd12` for 30+ min and would have been discarded by
+  `FETCH_TIMEOUT`). `download_file` tries HTTPS, and on any failure pulls the same file over **explicit
+  FTPS** (`SEEDR_FTP_HOST=ftps.seedr.cc`, account creds unless `SEEDR_FTP_PASSWORD_B64` is set), which
+  reads storage directly — same ~38 MB/s. FTP also resumes at a byte offset (`REST`), so a leftover
+  `.part` goes straight to FTP instead of being truncated by a fresh HTTPS GET; the result is checked
+  against Seedr's `size`. FTP paths mirror the folder tree (`/<top folder path>/<sub>/<file>`; bare
+  root files `/<name>`). FTP is **download-only here** — add/progress/completion/delete stay on REST
+  (Seedr documents no FTP watch folder). Empty `SEEDR_FTP_HOST` disables it. Two Seedr quirks the
+  code depends on: (1) a **dropped FTP transfer is reported as `550 Issue during transfer`** — the same
+  code as "no such file" — so a 5xx is treated as permanent only if no bytes moved on that attempt, and
+  connections are `close()`d, never `quit()` (QUIT reads that pending 550 and masks the real error);
+  (2) a **subfolder's REST `path` is its full path from the root** (`Top/Sub/Deeper`), not its own name —
+  `fetch_folder_recursive` uses the last component for both the local dir and the FTP path (joining it
+  whole used to nest the torrent's tree inside itself locally).
 - **413 on add** = Seedr full or release too big. If a same-movie zombie is hogging space, free it and
   retry; if lots of space free yet still 413 (or after 5 tries), the release can't fit the account and
   the magnet is dropped. Seedr account is only ~34 GB — Quality Definition max sizes are capped at
   130 MB/min in both Sonarr and Radarr to keep grabs within budget.
+- **409 on add** = Seedr ALREADY holds this torrent — normally because the magnet was added by hand on
+  seedr.cc, which is a reasonable thing to do. `adopt_existing` takes it over instead of retrying:
+  a 409 leaves no state file behind, and `check_completions` only ever reads state files, so the
+  finished movie would sit in Seedr undelivered while the magnet 409'd on every 30s poll forever.
+  The live transfer is matched **by infohash** (exact — the name matcher is not needed here); if it
+  already finished it is no longer in `root["torrents"]`, so it falls back to `_name_matches` over
+  folders and bare root files, the same two result shapes `check_completions` handles.
 
 ### reaper component (`media-bridge/reaper.py`)
 
@@ -205,6 +255,16 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   replaces the old per-language category walk, because it covers **every language and type including
   `*-dubbed`** — nothing is left out. `MOVIERULZ_BASE` is required and lives in `.env`, out of source;
   unset, the crawler disables itself but the Torznab feed still serves.
+  **The domain rotates, and a dead one looks like a FlareSolverr fault, not a DNS one:** every page
+  fetch fails with `500 Server Error ... /v1` from FlareSolverr, which reads as Cloudflare trouble.
+  Check `docker compose logs flaresolverr` for the real cause — `ERR_NAME_NOT_RESOLVED` means the
+  domain is simply gone (`www.5movierulz.watch` went NXDOMAIN 2026-08-24 and the crawler indexed
+  nothing for 11 days while FlareSolverr itself was healthy, still serving tamilmv fine). Fix is a
+  one-line `MOVIERULZ_BASE` update in `.env`. After changing it, mind the **backfill floor**: an
+  incremental pass stops at the first fully-known page (floor `MIN_PAGES`), so if a catch-up walk is
+  interrupted partway the still-unseen posts sit *below* that floor and no later pass ever reaches
+  them. Either let the first post-fix crawl run to completion undisturbed, or reset
+  `meta.backfill_done=0` to force a full resumable re-walk.
   Fetches every page **through FlareSolverr** (`FLARESOLVERR_URL`, CF-protected site), never directly.
   Post discovery keys on the trailing numeric id, covering both URL schemes (`…-<id>.html` and the legacy
   `…/movie-watch-online-free-<id>.html`). Metadata is parsed from the magnet **`dn=` name** (authoritative,
@@ -225,10 +285,20 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   closes). Keying retry on magnet count, not release count, is deliberate: skip-only pages (single
   episodes/Parts) DO have magnets, so they must not be retried. Without this, a movie whose magnets
   landed after we scraped it was indexed **never**.
-- **Scope = movies + full-season packs only.** `S0X EP (a-b)` → `kind=series` with the title normalized
-  to a Sonarr season-pack (`… S0X …`, EP-range dropped). Single episodes (`S04 EP09`) and "Part" forms
+- **Scope = movies + episode-range packs only.** `S0X EP (a-b)` → `kind=series` with the title
+  normalized to a Sonarr **multi-episode** release `… S0XEa-Eb …` — NOT a bare `S0X` season pack: sites
+  post running seasons in chunks (Heart Beat S03 is 32 episodes, posted 4 at a time), and a bare `S0X`
+  told Sonarr each chunk was the whole season. Single episodes (`S04 EP09`) and "Part" forms
   (`S1P2`, `S1P-1-2`) are **skipped** — the season/part regexes also guard against mis-filing them as
   movies.
+- **Series year pinned to Sonarr's (`series_title`, applied when serving, not stored):** release names
+  carry the *season's* year (`Heart Beat (2026) S03…` for a 2024 show), and Sonarr maps a
+  titled-with-year release only to a series of that year → `[Permanent] Unknown Series`. Stripping the
+  year is **not** a fix: a bare name can hit a global scene alias (`Heart Beat` → TVDB 74684, the 1992 UK
+  *Heartbeat*). So for shows in the Sonarr library the served title gets the show's own year
+  (rewritten or inserted), from a `SONARR_URL` series map refreshed every `ALIAS_REFRESH`. Shows not in
+  Sonarr are served unchanged. Test a title with `GET /api/v3/parse?title=…` on Sonarr — it shows the
+  mapped series (or none).
 - **Torznab server** (`serve_torznab`): `t=caps` advertises movie + tv search; `t=search/movie/tvsearch`
   validate `MOVIERULZ_APIKEY` (Torznab error 100 on mismatch) and substring-match stored titles. Every
   `<item>` MUST carry a `<pubDate>` (Prowlarr drops items without it — the same bug the custom
@@ -269,7 +339,7 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 ### tamilmv component (`media-bridge/tamilmv.py`)
 
 A crawler thread + a stdlib Torznab HTTP server (`:8005`, host-published) that scrapes **tamilmv +
-tamilblasters** (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + full-season packs) into a
+tamilblasters** (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + episode-range packs) into a
 Torznab feed for Prowlarr. **This replaced the retired MediaFusion 4-container stack** (postgres + redis
 + Rust api/worker), whose compiled tamil spiders were the only part worth keeping — and whose ext.to
 scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSolverr continuously.
@@ -286,6 +356,12 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   **content pages** are CF-walled and go through the same `FLARESOLVERR_URL` as movierulz. Recovery
   ladder when a base dies: re-resolve → force a GitHub config refresh for a newer `homepage` → still
   dead → ntfy (then set `TAMILMV_SEED_OVERRIDE`/`TAMILBLASTERS_SEED_OVERRIDE` as an emergency manual pin).
+  **The dead-site ntfy is rate-limited** to one push per `TAMILMV_DEAD_ALERT_INTERVAL` (default 86400s)
+  per site, tracked in `dead_alert:<site>` in tamilmv.db's `meta` table. Ungated, it fired on *every*
+  crawl pass — ~24/day forever, which drowned the shared ntfy topic (see "ntfy: two topics" above). A
+  successful resolve resets the timer to 0, so a site that recovers and dies again alerts immediately
+  rather than waiting out the previous outage's window. The per-pass `log()` line is NOT throttled —
+  `docker compose logs media-bridge` still shows the true state hourly.
 - **Config shapes differ**: tamilmv uses `supported_search_forums` (33 forums), tamil_blasters uses
   `catalogs` (28) — `_parse_site_cfg` normalizes both to `[(forum_path, language)]`.
 - **Crawl**: per site → `resolve_base` → for each forum `…/index.php?/forums/forum/<id>/page/<n>/` via

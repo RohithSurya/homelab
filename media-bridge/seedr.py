@@ -31,6 +31,7 @@ import pathlib
 import urllib.parse
 import requests
 
+import seedr_ftp
 from common import clog, norm, ntfy
 
 FAIL_COUNTS = {}  # magnet filename -> consecutive 413 attempts (in-memory)
@@ -85,6 +86,11 @@ FETCH_SKIP_MAX = int(
 # up: purge it from Seedr, fail it in Radarr/Sonarr (-> blocklist + re-grab a different
 # release) and notify. The post-completion analogue of STALL_TIMEOUT.
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "5400"))  # 90 min
+# Missing-result handling: a transfer that left root["torrents"] (= finished) but whose
+# folder/file never shows up (Seedr deduped or dropped it -- seen when a single-episode
+# torrent finished alongside a pack holding the same file) would otherwise log "result not
+# visible yet" every poll forever. After this long, tombstone it and fail it in the *arr.
+RESULT_TIMEOUT = int(os.environ.get("RESULT_TIMEOUT", "1800"))  # 30 min
 ARR = {
     "radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
     "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY")),
@@ -173,23 +179,48 @@ def magnet_from_torrent(path):
     return "magnet:?" + "&".join(parts)
 
 
-def download_file(file_id, dest: pathlib.Path):
+def download_file(file_id, dest: pathlib.Path, remote=None, size=None):
+    """HTTPS (CDN) first; on any failure fall back to FTP for the same file (seedr_ftp:
+    serves files the CDN 404s on, and resumes at a byte offset). A .part left by an
+    earlier attempt goes straight to FTP so it is continued instead of truncated."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with SESSION.get(
-        f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
-    ) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    f.write(chunk)
+    ftp_ok = remote is not None and seedr_ftp.enabled()
+    if size and tmp.exists() and tmp.stat().st_size == size:
+        pass  # finished last time, died before the rename -> nothing left to fetch
+    elif ftp_ok and tmp.exists() and tmp.stat().st_size:
+        log(f"    resuming {dest.name} over FTP at {tmp.stat().st_size:,} B")
+        seedr_ftp.download(remote, tmp)
+    else:
+        try:
+            with SESSION.get(
+                f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
+            ) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+        except Exception as e:
+            if not ftp_ok:
+                raise
+            log(f"    HTTPS fetch of {dest.name} failed ({e}) -> FTP fallback")
+            seedr_ftp.download(remote, tmp)
+    got = tmp.stat().st_size
+    if size and got != size:
+        if got > size:  # corrupt, not merely short -> don't resume onto it
+            tmp.unlink()
+        raise RuntimeError(f"{dest.name}: got {got:,} B, expected {size:,} B")
     tmp.rename(dest)
     log(f"    downloaded {dest.name} ({dest.stat().st_size:,} bytes)")
 
 
-def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
+def fetch_folder_recursive(folder_id, dest_root: pathlib.Path, remote=None):
+    # remote = this folder's FTP path, for download_file's fallback; the top call takes
+    # it from the listing (a top-level folder's path is its name at the FTP root).
     listing = list_folder(folder_id)
+    if remote is None:
+        remote = "/" + listing.get("path", "")
     for f in listing.get("files", []):
         dest = dest_root / f["name"]
         # Resume support: if a previous pass already pulled this file in full,
@@ -199,7 +230,7 @@ def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
         if dest.exists() and size and dest.stat().st_size == size:
             continue
         try:
-            download_file(f["id"], dest)
+            download_file(f["id"], dest, f"{remote}/{f['name']}", size)
         except Exception as e:
             # Junk sidecars (YTSProxies.com.txt, "Torrent Downloaded From*.txt",
             # RARBG.nfo, ...) sometimes 404 on Seedr's CDN. They're not media and
@@ -212,7 +243,10 @@ def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
                 continue
             raise
     for sub in listing.get("folders", []):
-        fetch_folder_recursive(sub["id"], dest_root / sub["path"])
+        # a subfolder's "path" is its FULL path from the Seedr root ('Top/Sub/Deeper'),
+        # not its own name -- joining it whole nested the torrent's tree inside itself
+        name = sub["path"].rsplit("/", 1)[-1]
+        fetch_folder_recursive(sub["id"], dest_root / name, f"{remote}/{name}")
 
 
 def delete_folder(folder_id):
@@ -257,9 +291,10 @@ def _name_matches(seedr_name, title):
     return len(shorter) >= 18 and shorter in longer
 
 
-def cleanup_local_partial(cat, old_title, new_title=None):
-    # remove a superseded release's partially-fetched download dir. The dir is named
-    # after the Seedr folder (often sanitized), not the state title, so match fuzzily.
+def cleanup_local_partial(cat, old_title, new_title=None, old_release=None):
+    # remove a superseded release's partially-fetched download dir. The dir is named after
+    # the *arr release (see check_completions) -- or, for dirs written before that, after the
+    # Seedr folder (often sanitized) -- so match either name fuzzily.
     base = DATA / "downloads" / cat
     if not base.exists():
         return
@@ -270,7 +305,9 @@ def cleanup_local_partial(cat, old_title, new_title=None):
             d.name, new_title
         ):  # never the replacement's dir
             continue
-        if _name_matches(d.name, old_title):
+        if _name_matches(d.name, old_title) or (
+            old_release and _name_matches(d.name, old_release)
+        ):
             shutil.rmtree(d, ignore_errors=True)
             log(f"    [override] removed local partial '{d.name}'")
 
@@ -298,7 +335,7 @@ def purge_superseded(cat, new_key, new_name, root):
         tid = rec.get("user_torrent_id")
         if tid is not None:
             delete_transfer(tid)
-        cleanup_local_partial(cat, rec["title"], new_name)
+        cleanup_local_partial(cat, rec["title"], new_name, rec.get("release_name"))
         rec.update(superseded=True, new_title=new_name, superseded_at=time.time())
         sp.write_text(json.dumps(rec))  # tombstone -> reaped by check_completions
         n += 1
@@ -376,7 +413,40 @@ def handle_stalled(cat, rec, sp, prog):
     # tombstone -> existing reaper cleans any partial folder/local dir and we stop re-failing
     rec.update(superseded=True, new_title=None, superseded_at=time.time(), stalled=True)
     sp.write_text(json.dumps(rec))
-    cleanup_local_partial(cat, title)
+    cleanup_local_partial(cat, title, old_release=release)
+
+
+def handle_missing_result(cat, rec, sp):
+    """A finished transfer whose result never appeared in Seedr. Start a deadline on the
+    first miss; once RESULT_TIMEOUT elapses, fail it in Radarr/Sonarr and tombstone it, so
+    a late-appearing result is reaped instead of looping forever. A successful match
+    unlinks the state file, so the deadline never outlives a delivery."""
+    now = time.time()
+    since = rec.get("result_missing_since")
+    if since is None:
+        rec["result_missing_since"] = now
+        sp.write_text(json.dumps(rec))
+        return
+    if now - since < RESULT_TIMEOUT:
+        return
+    title = rec["title"]
+    release = rec.get("release_name", title)
+    log(
+        f"[{cat}] '{title}' finished but result MISSING from Seedr for >{RESULT_TIMEOUT // 60}min -> failing"
+    )
+    retried = arr_mark_failed(cat, release)
+    notify(
+        f"Missing result: {release}",
+        f"Seedr finished it but never produced a file for {RESULT_TIMEOUT // 60} min. "
+        + (
+            "Marked failed in Radarr/Sonarr (it re-grabs if still wanted)."
+            if retried
+            else "Could not reach Radarr/Sonarr -- check it manually."
+        ),
+    )
+    rec.update(superseded=True, new_title=None, superseded_at=now, missing_result=True)
+    sp.write_text(json.dumps(rec))
+    cleanup_local_partial(cat, title, old_release=release)
 
 
 def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
@@ -415,13 +485,82 @@ def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
     # tombstone -> reaper cleans any leftover Seedr footprint / local partial and we stop retrying
     rec.update(superseded=True, new_title=None, superseded_at=now, unfetchable=True)
     sp.write_text(json.dumps(rec))
-    cleanup_local_partial(cat, title)
+    cleanup_local_partial(cat, title, old_release=release)
 
 
 def state_file(category, title):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     safe = base64.urlsafe_b64encode(f"{category}|{title}".encode()).decode()
     return STATE_DIR / f"{safe}.json"
+
+
+def _magnet_btih(magnet):
+    """Infohash from a magnet's xt=urn:btih: (hex, lowercased). Base32 form is converted."""
+    m = re.search(r"xt=urn:btih:([0-9a-zA-Z]+)", magnet or "")
+    if not m:
+        return ""
+    h = m.group(1)
+    if len(h) == 32:
+        try:
+            h = base64.b32decode(h.upper()).hex()
+        except Exception:
+            return ""
+    return h.lower()
+
+
+def adopt_existing(cat, mfile, magnet, nkey):
+    """Seedr answered 409 Conflict: it ALREADY holds this torrent -- an out-of-band add
+    (adding the magnet by hand on seedr.cc is a normal thing to do) or an earlier loop
+    whose response we lost. A 409 has no state file behind it, and check_completions()
+    only ever looks at state files, so the result would never be fetched while the magnet
+    409s again on every single poll -- forever. Adopt the transfer instead: write exactly
+    the record a successful add would have.
+
+    Matched by infohash against the in-progress list (exact, unlike the name matcher);
+    if it already finished it is no longer a torrent, so fall back to _name_matches over
+    the folders and bare root files -- the same two shapes check_completions() handles.
+    Returns True if the drop was adopted (and the magnet consumed)."""
+    btih = _magnet_btih(magnet)
+    try:
+        root = list_folder()
+    except Exception as e:
+        log(f"    409 but listing Seedr failed ({e}); will retry next loop")
+        return False
+    title, where = mfile.stem, ""
+    tid = thash = None
+    for t in root.get("torrents", []):
+        if btih and (t.get("hash") or "").lower() == btih:
+            tid, thash = t.get("id"), t.get("hash")
+            where = f"in progress {t.get('progress', 0):.0f}%"
+            break
+    if not where:
+        # already complete -> a top-level folder, or a bare root file for single-file torrents
+        for f in root.get("folders", []):
+            if _name_matches(f.get("path", ""), title):
+                where = "already complete (folder)"
+                break
+        if not where:
+            for f in root.get("files", []):
+                if _name_matches(f.get("name", ""), title):
+                    where = "already complete (root file)"
+                    break
+    if not where:
+        log("    409 but no matching Seedr transfer found; will retry next loop")
+        return False
+    if nkey:
+        purge_superseded(cat, nkey, mfile.stem, root)
+    rec = {
+        "category": cat,
+        "title": title,
+        "release_name": mfile.stem,
+        "user_torrent_id": tid,
+        "torrent_hash": thash or btih or None,
+        "added": time.time(),
+    }
+    state_file(cat, title).write_text(json.dumps(rec))
+    mfile.unlink()
+    log(f"    already on Seedr ({where}) -> adopted as '{title}'")
+    return True
 
 
 def process_new_magnets():
@@ -485,6 +624,12 @@ def process_new_magnets():
                             f"    add 413 (Seedr full, {free / 1e9:.0f}GB free); attempt {n}/5, will retry"
                         )
                     continue
+                if (
+                    getattr(e, "response", None) is not None
+                    and e.response.status_code == 409
+                    and adopt_existing(cat, mfile, magnet, nkey)
+                ):
+                    continue
                 log(f"    add failed ({e}); will retry next loop")
                 continue
             except Exception as e:
@@ -543,7 +688,7 @@ def check_completions():
                     new_title and _name_matches(nm, new_title)
                 ):
                     delete_file(f["id"])
-            cleanup_local_partial(cat, title, new_title)
+            cleanup_local_partial(cat, title, new_title, rec.get("release_name"))
             if time.time() - rec.get("superseded_at", 0) > TOMBSTONE_GRACE:
                 sp.unlink()
                 log(f"    [override] cleanup window closed for '{title}'")
@@ -571,8 +716,13 @@ def check_completions():
                 if _name_matches(name, title):
                     folder_id, title = fid, name
                     break
+        # Deliver under the release name the *arr GRABBED, not Seedr's name for the result: the
+        # *arr maps a watch-folder item to its series/movie by parsing the folder name, and
+        # Seedr's name is the torrent's raw internal one ('www.1TamilMV.promo - Heart Beat
+        # (2026) S03 EP (01-04) ...'), which can map to nothing -- or to the wrong show.
+        local = rec.get("release_name") or title
         if folder_id is not None:
-            dest = DATA / "downloads" / cat / title
+            dest = DATA / "downloads" / cat / local
             log(f"[{cat}] '{title}' complete -> fetching folder to {dest}")
             try:
                 fetch_folder_recursive(folder_id, dest)
@@ -591,10 +741,10 @@ def check_completions():
                 match = f
                 break
         if match is not None:
-            dest = DATA / "downloads" / cat / title / match["name"]
+            dest = DATA / "downloads" / cat / local / match["name"]
             log(f"[{cat}] '{title}' complete (single file) -> fetching {match['name']}")
             try:
-                download_file(match["id"], dest)
+                download_file(match["id"], dest, f"/{match['name']}", match.get("size"))
                 delete_file(match["id"])
                 sp.unlink()
                 log(f"[{cat}] '{title}' delivered.")
@@ -604,6 +754,7 @@ def check_completions():
                 handle_fetch_failure(cat, rec, sp, str(e), file_id=match["id"])
             continue
         log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
+        handle_missing_result(cat, rec, sp)
 
 
 def run_forever():
