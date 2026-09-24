@@ -59,6 +59,11 @@ MIN_PAGES = int(os.environ.get("TAMILMV_MIN_PAGES", "1"))   # scan at least this
 FAKE_SEEDERS = int(os.environ.get("FAKE_SEEDERS", "50"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "3"))
 EMPTY_RETRY_DAYS = float(os.environ.get("TAMILMV_EMPTY_RETRY_DAYS", "3"))
+# A running series is ONE topic that grows; the listing can't be relied on to show it (see
+# refresh_active_series). Re-read series topics that gained a release within ACTIVE_DAYS, each at
+# most once per ACTIVE_REREAD seconds. 0 days disables.
+ACTIVE_DAYS = float(os.environ.get("TAMILMV_ACTIVE_DAYS", "21"))
+ACTIVE_REREAD = float(os.environ.get("TAMILMV_ACTIVE_REREAD", "21600"))
 # Cooldown between "domain dead" ntfy pushes for the SAME site. A dead seed fails on every crawl
 # pass, so an ungated alert fires ~24x/day forever and drowns the topic (it buried DIUN's daily
 # image-update batch until DIUN was moved to its own topic). Logs stay per-pass; only ntfy is
@@ -311,11 +316,22 @@ def upsert_release(rec):
 
 
 # ---- crawl ----
+CANONICAL_RE = re.compile(
+    r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)'
+    r'|<link[^>]+href=["\']([^"\']+)["\'][^>]*rel=["\']canonical', re.I)
+
+
 def process_topic(site, post_id, url, language):
     status, html = fetch(url)
     time.sleep(REQUEST_DELAY)
     if status != 200 or not html:
         return 0
+    # The page names its current URL. Reached by an old slug (refresh_active_series), that is how
+    # posts.url learns the new one; from a listing it is the same URL.
+    m = CANONICAL_RE.search(html)
+    canon = m and (m.group(1) or m.group(2))
+    if canon and _slug(canon):
+        url = canon
     magnets = MAGNET_RE.findall(html)
     n = 0
     for m in magnets:
@@ -356,6 +372,51 @@ def crawl_forum(site, base, forum_path, language, known_before):
     return posts, releases
 
 
+def refresh_active_series(site, base):
+    """Re-read series topics that gained a release in the last ACTIVE_DAYS, wherever they are.
+
+    The slug check in post_needs_fetch only fires if the crawl SEES the topic, and it doesn't:
+    crawl_forum stops at the first page of already-known topics, and a season topic started
+    weeks ago sits on page 2+ even while it grows. Heart Beat S03 (topic 199088) went
+    ep-01-32 -> ep-01-36 on page 2 of the web-series forum and a full pass fetched 0 topics.
+    So this fetches the topic directly: the stored slug still resolves (the forum serves the
+    topic by id), and process_topic adopts the canonical URL the page reports. ~20 topics at
+    21 days, each at most every ACTIVE_REREAD s -- a few fetches per hourly pass."""
+    if ACTIVE_DAYS <= 0:
+        return 0, 0
+    now = time.time()
+    with DB_LOCK:
+        rows = db().execute(
+            """SELECT p.post_id, p.url, max(r.language) AS language FROM posts p
+               JOIN releases r ON r.site = p.site AND r.post_id = p.post_id
+               WHERE p.site = ? AND r.kind = 'series'
+               GROUP BY p.post_id HAVING max(r.added_at) > ?""",
+            (site, now - ACTIVE_DAYS * 86400)).fetchall()
+    posts = releases = 0
+    for r in rows:
+        key = f"reread:{site}:{r['post_id']}"
+        if now - float(get_meta(key) or 0) < ACTIVE_REREAD:
+            continue
+        slug = _slug(r["url"])
+        if not slug:
+            continue
+        # current domain + stored slug: the domain rotates, the topic id doesn't
+        url = f"{base}/index.php?/forums/topic/{r['post_id']}-{slug}/"
+        with DB_LOCK:
+            before = db().execute("SELECT count(*) FROM releases WHERE site=? AND post_id=?",
+                                  (site, str(r["post_id"]))).fetchone()[0]
+        process_topic(site, r["post_id"], url, r["language"])
+        with DB_LOCK:
+            after = db().execute("SELECT count(*) FROM releases WHERE site=? AND post_id=?",
+                                 (site, str(r["post_id"]))).fetchone()[0]
+        set_meta(key, now)
+        posts += 1
+        if after > before:
+            releases += after - before
+            log(f"  active series {r['post_id']}: +{after - before} new release(s)")
+    return posts, releases
+
+
 def crawl_site(site):
     if not load_config():
         return
@@ -374,7 +435,13 @@ def crawl_site(site):
             tr += r
         except Exception as e:
             log(f"  forum {forum_path} error: {e}")
-    log(f"{site}: done -- {tp} topics fetched, {tr} releases indexed")
+    try:
+        ap, ar = refresh_active_series(site, base)
+    except Exception as e:
+        ap = ar = 0
+        log(f"  active-series refresh error: {e}")
+    log(f"{site}: done -- {tp} topics fetched, {tr} releases indexed; "
+        f"active series: {ap} re-read, {ar} new")
 
 
 def run_crawler():

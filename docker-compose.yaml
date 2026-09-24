@@ -200,6 +200,10 @@ services:
       - TAMILMV_CONFIG_REFRESH=86400               # re-pull GitHub config daily
       - TAMILMV_CRAWL_INTERVAL=3600
       - TAMILMV_MAX_PAGES=5                         # per-forum page cap (bounds each crawl pass)
+      # Dead-site ntfy at most weekly (default daily). tamil_blasters has been a Cloudflare 522
+      # behind its seed's redirect since 2026-08-23; a daily high-priority alert was just noise.
+      # Recovery is still immediate: a successful resolve resets the timer.
+      - TAMILMV_DEAD_ALERT_INTERVAL=604800
       # Emergency overrides if a GitHub seed itself dies before upstream updates it:
       # - TAMILMV_SEED_OVERRIDE=https://www.1tamilmv.<tld>
       # - TAMILBLASTERS_SEED_OVERRIDE=https://1tamilblasters.<tld>

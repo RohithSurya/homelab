@@ -380,6 +380,24 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   again (Heart Beat S03 sat at episodes 1-4 in the feed for 8 weeks while the topic held 1-32). A topic
   whose listing slug differs from the stored `posts.url` slug is now re-read; the slug is compared
   host-agnostically so a domain rotation doesn't re-read everything, and `mark_post` always refreshes `url`.
+- **…but the listing can't be relied on to show the topic (`refresh_active_series`)**: `crawl_forum`
+  stops at the first page of already-known topics, and a season topic started weeks ago sits on page 2+
+  even while it grows — Heart Beat S03 went `ep-01-32 → ep-01-36` on page 2 of the web-series forum and
+  a full pass fetched 0 topics (2026-09-23). So every pass also fetches, **directly by id**, each series
+  topic that gained a release in the last `TAMILMV_ACTIVE_DAYS` (21), each at most every
+  `TAMILMV_ACTIVE_REREAD` s (21600). The stored slug still resolves on the current domain, and
+  `process_topic` adopts the page's `<link rel=canonical>` so `posts.url` learns the new name. ~19 topics;
+  adds ~2-3 min of FlareSolverr per pass. Log line: `active series: N re-read, M new`.
+- **New episodes can still stall at Sonarr, correctly**: Sonarr only grabs episodes its TVDB list has.
+  tamilmv often posts a batch before TVDB lists it (Heart Beat E33-36, TVDB stopped at E32), so the
+  release is indexed and rejected until TVDB catches up; then Sonarr's 12h refresh + a search grabs it.
+  Check `https://skyhook.sonarr.tv/v1/tvdb/shows/en/<tvdbId>` before debugging the indexer.
+  Once grabbed, it can stall **again at import**: TVDB lists new episodes as `TBA` for days, and Sonarr's
+  `Episode Title Required = Always` blocks importing a TBA episode for 48h after airing (queue shows
+  `importBlocked` / "Episode has a TBA title and recently aired" — E33-36 on 2026-09-24). It clears by
+  itself; to force it, manual-import the download folder (`GET /api/v3/manualimport?folder=…` — NOT
+  `?downloadId=…&seriesId=…`, which returns the series' already-imported library files). Files get
+  `TBA` names; Series → Rename Files fixes them once TVDB has titles.
 - **Prowlarr wiring**: generic Torznab indexer, `apiPath=/api`, apiKey `= TAMILMV_APIKEY`, baseUrl
   **`http://10.0.0.179:8005/torznab`** (LAN IP, not `media-bridge:8005` — container names don't resolve in
   gluetun's netns; see movierulz's Prowlarr wiring). Querying it hits the local sqlite only (no CF), so keeping RSS

@@ -521,6 +521,22 @@ def adopt_existing(cat, mfile, magnet, nkey):
     the folders and bare root files -- the same two shapes check_completions() handles.
     Returns True if the drop was adopted (and the magnet consumed)."""
     btih = _magnet_btih(magnet)
+    # The *arr grabbed the same release twice (2026-09-24: an add's automatic search and an
+    # interactive grab of the same guid seconds apart), so a second .magnet lands while the first
+    # is already tracked. Adopting it would write a SECOND state file for one torrent -- under
+    # the release name, not Seedr's title -- which, once the first delivers and Seedr drops the
+    # transfer, loops "finished but result not visible yet" and then handle_missing_result
+    # marks the already-imported grab failed. Already tracked -> just consume the duplicate.
+    if btih:
+        for sp in STATE_DIR.glob("*.json"):
+            try:
+                rec = json.loads(sp.read_text())
+            except (OSError, ValueError):
+                continue
+            if (rec.get("torrent_hash") or "").lower() == btih and not rec.get("superseded"):
+                mfile.unlink()
+                log(f"    409: already tracked as '{rec.get('title')}' -> dropped duplicate {mfile.name}")
+                return True
     try:
         root = list_folder()
     except Exception as e:
