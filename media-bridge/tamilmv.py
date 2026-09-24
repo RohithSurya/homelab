@@ -257,13 +257,28 @@ def set_meta(key, value):
         db().commit()
 
 
-def post_needs_fetch(site, post_id):
-    """New topic: yes. Already scraped WITH magnets: no. Scraped with ZERO magnets (page published
-    before its magnets landed): retry until EMPTY_RETRY_DAYS after first-seen."""
+def _slug(url):
+    """The topic slug ('heart-beat-2026-s03-ep-01-32-...'), host-agnostic so a domain rotation
+    doesn't read as a change; None if the URL isn't a topic URL."""
+    m = TOPIC_RE.search(url or "")
+    return m.group(2).rstrip("/").lower() if m else None
+
+
+def post_needs_fetch(site, post_id, url=None):
+    """New topic: yes. Slug changed since we last read it: yes. Already scraped WITH magnets: no.
+    Scraped with ZERO magnets (page published before its magnets landed): retry until
+    EMPTY_RETRY_DAYS after first-seen.
+
+    The slug check is what keeps a running series current: tamilmv posts a season as ONE topic and
+    appends each new episode batch to it, retitling it as it grows ('S03 EP (01-04)' -> '... (01-32)',
+    and the slug follows). Without it a topic was read once, at its first batch, and never again --
+    Heart Beat S03 sat at episodes 1-4 in the feed while the topic held 1-32."""
     with DB_LOCK:
-        row = db().execute("SELECT scraped_at, magnets FROM posts WHERE site=? AND post_id=?",
+        row = db().execute("SELECT scraped_at, magnets, url FROM posts WHERE site=? AND post_id=?",
                            (site, post_id)).fetchone()
     if row is None:
+        return True
+    if url and _slug(url) and _slug(url) != _slug(row["url"]):
         return True
     if row["magnets"] > 0 or EMPTY_RETRY_DAYS <= 0:
         return False
@@ -272,11 +287,13 @@ def post_needs_fetch(site, post_id):
 
 def mark_post(site, post_id, url, magnets):
     """INSERT OR IGNORE keeps scraped_at as the stable first-seen time (anchors the empty-post retry
-    window to discovery); magnets is the raw count on the page and only ratchets up (never down)."""
+    window to discovery); magnets is the raw count on the page and only ratchets up (never down).
+    url is always refreshed: it is what post_needs_fetch compares the next listing's slug against."""
     with DB_LOCK:
         db().execute(
             "INSERT OR IGNORE INTO posts(site, post_id, url, scraped_at, magnets) VALUES (?,?,?,?,?)",
             (site, post_id, url, time.time(), magnets))
+        db().execute("UPDATE posts SET url=? WHERE site=? AND post_id=?", (url, site, post_id))
         db().execute("UPDATE posts SET magnets=? WHERE site=? AND post_id=? AND magnets<?",
                      (magnets, site, post_id, magnets))
         db().commit()
@@ -331,7 +348,7 @@ def crawl_forum(site, base, forum_path, language, known_before):
         if not page_topics:
             break
         for pid, purl in page_topics:
-            if post_needs_fetch(site, pid):
+            if post_needs_fetch(site, pid, purl):
                 releases += process_topic(site, pid, purl, language)
                 posts += 1
         if page >= MIN_PAGES and all(pid in known_before for pid, _ in page_topics):

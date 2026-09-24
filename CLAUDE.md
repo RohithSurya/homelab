@@ -305,8 +305,13 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   `mediafusion-api` binary patches) and emits a configurable `FAKE_SEEDERS` (movierulz exposes no
   seeders) so Radarr/Sonarr minimum-seeders doesn't filter everything.
 - **Prowlarr wiring**: add as a generic Torznab indexer, `apiPath=/api`, apiKey `= MOVIERULZ_APIKEY`,
-  baseUrl `http://media-bridge:8002/torznab` (Prowlarr is in gluetun's netns, which is on the default
-  bridge, so it resolves the container name; fall back to the host LAN IP `:8002` if not).
+  baseUrl **`http://10.0.0.179:8002/torznab`** — the reserved Ethernet IP, NOT `media-bridge:8002`.
+  Prowlarr lives in gluetun's netns, and gluetun resolves DNS itself (`DNS_ADDRESS=9.9.9.9`), not via
+  Docker's embedded resolver, so **container names do not resolve** there (the `172.17.0.1` bridge
+  gateway is unreachable too); the LAN IP works because `FIREWALL_OUTBOUND_SUBNETS` allows 10.0.0.0/24.
+  The failure is silent: Radarr's `t=caps` call to Prowlarr 500s (`Name does not resolve`), Radarr logs
+  `Unable to connect to movierulz (Prowlarr)` and just **drops the indexer from every search** (its
+  "N active indexers" count shrinks) — until 2026-09-13 this hid movierulz + tamilmv from all *arr searches.
 - **Query resolution (`search_terms` + `unorm`) — alias-aware, and never "match everything":**
   Radarr searches a movie's **alternate titles**, which for Indian films are **native-script**
   (`கருப்பு`) — and it strips the vowel signs first (`கருப்பு` → `கர பப`). Two consequences, both
@@ -368,8 +373,16 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   FlareSolverr, extract full topic URLs (`TOPIC_RE`, slug required so nav links are ignored), fetch each
   topic, `MAGNET_RE` + `parse_magnet` (language from the forum map). Bounded per pass by
   `TAMILMV_MAX_PAGES` (per-forum cap) + incremental all-known stop; empty-post retry as in movierulz.
+- **Slug-change refetch (`post_needs_fetch(site, pid, url)` + `_slug`)**: unlike movierulz (one post per
+  episode batch), tamilmv posts a running season as **one topic** and appends each new batch to it,
+  retitling it as it grows (`S03 EP (01-04)` → `S03 EP (01-32)`) — and the listing URL's slug follows. A
+  post with magnets used to be "done forever", so a series was read once at its first batch and never
+  again (Heart Beat S03 sat at episodes 1-4 in the feed for 8 weeks while the topic held 1-32). A topic
+  whose listing slug differs from the stored `posts.url` slug is now re-read; the slug is compared
+  host-agnostically so a domain rotation doesn't re-read everything, and `mark_post` always refreshes `url`.
 - **Prowlarr wiring**: generic Torznab indexer, `apiPath=/api`, apiKey `= TAMILMV_APIKEY`, baseUrl
-  `http://media-bridge:8005/torznab`. Querying it hits the local sqlite only (no CF), so keeping RSS
+  **`http://10.0.0.179:8005/torznab`** (LAN IP, not `media-bridge:8005` — container names don't resolve in
+  gluetun's netns; see movierulz's Prowlarr wiring). Querying it hits the local sqlite only (no CF), so keeping RSS
   enabled on this indexer is cheap — the CF cost is entirely in the background crawler.
 - **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`query_matches`,
   so the alias expansion and the "never match everything" guard described above apply here too.
