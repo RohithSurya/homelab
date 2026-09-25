@@ -237,6 +237,13 @@ class QbitTest(unittest.TestCase):
         self.assertTrue(cm.exception.never_fits)
         self.assertEqual(self.qb.adds, [])
 
+    def test_full_counts_non_bridge_torrents_too(self):
+        self.be.remote.small[".quota"] = quota(100)
+        # a manual ratio-building torrent (no media-bridge tag) still has 100 GiB to write
+        self.qb.torrents["r" * 40] = dict(hash="r" * 40, amount_left=100 * GiB, tags="ratio-building", state="downloading", progress=0.1)
+        with self.assertRaises(Full):  # 230 - 100 - 100 - 20 = 10 GiB < 15
+            self.be.add(*self.drop("R12", magnet("9" * 40, 15 * GiB)))
+
     def test_magnet_without_size_needs_headroom(self):
         self.be.remote.small[".quota"] = quota(185)  # 230-185-20 = 25 GiB < 40 GiB headroom
         p, m = self.drop("R4", magnet("d" * 40))

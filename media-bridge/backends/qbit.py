@@ -385,7 +385,8 @@ class QbitBackend(Backend):
         used, limit, _ = self._quota_state()
         if used is None:
             return None
-        pending = sum(max(0, t.get("amount_left", 0)) for t in self._info(tag=TAG))
+        # every torrent on the box, not just ours: manual/ratio-building ones fill the quota too
+        pending = sum(max(0, t.get("amount_left", 0)) for t in self._info())
         return limit - used - pending - self.reserved
 
     # --- contract --------------------------------------------------------------------------------
