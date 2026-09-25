@@ -152,7 +152,6 @@ services:
       # CLAUDE.md) — do not forward any of them.
       - "8002:8002"                              # movierulz Torznab feed
       - "8003:8003"                              # youtube grabber web form
-      - "8004:8004"                              # daddylive resolver M3U/EPG for Jellyfin
       - "8005:8005"                              # tamilmv/tamilblasters Torznab feed
     environment:
       - TZ=America/New_York
@@ -160,8 +159,8 @@ services:
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
       - POLL_INTERVAL=30
-      - SEED_HOLD=176400                            # 49h: private-tracker results stay on Seedr to seed (H&R rules)
       - STALL_TIMEOUT=2700                          # 45 min, in seconds
+      - SEED_HOLD=176400                            # 49h: private-tracker results stay on Seedr to seed (H&R rules)
       - SEEDR_FTP_HOST=ftps.seedr.cc                # FTP fallback for CDN-404'd files + byte resume; empty = off
       - SEEDR_FTP_PASSWORD_B64=${SEEDR_FTP_PASSWORD_B64:-}  # optional; unset = account password
       # --- shared *arr / jellyfin / ntfy ---
@@ -208,13 +207,16 @@ services:
       # Emergency overrides if a GitHub seed itself dies before upstream updates it:
       # - TAMILMV_SEED_OVERRIDE=https://www.1tamilmv.<tld>
       # - TAMILBLASTERS_SEED_OVERRIDE=https://1tamilblasters.<tld>
-      # --- daddylive resolver -> Jellyfin Live TV (M3U/EPG on host:8004) ---
-      - DLHD_BASE=${DLHD_BASE}                     # real dlhd site URL kept in .env, out of source
-      - DADDYLIVE_PUBLIC_URL=http://10.0.0.179:8004 # fallback only: /hls + M3U URLs now derive from the request Host, so this is used just by the precheck thread (no request context). 10.0.0.179 = reserved Ethernet IP.
-      - DADDYLIVE_PORT=8004
-      - DADDYLIVE_REFRESH=3600                      # re-pull the channel list hourly
-      - DADDYLIVE_FAVORITES=54,51,60                # channel ids kept pre-resolved+validated (54 FOX, 51 ABC, 60 Sky F1); edit to taste
-      - DADDYLIVE_PRECHECK=240                      # re-test favorites (all players) every N seconds
+      # --- daddylive resolver -> Jellyfin Live TV: DISABLED 2026-09-24 (code kept in media-bridge/daddylive.py).
+      #     To re-enable: set true, uncomment the vars below, re-add the "8004:8004" port, and re-add the
+      #     Jellyfin M3U tuner + XMLTV guide (see CLAUDE.md). ---
+      - DADDYLIVE_ENABLED=false
+      # - DLHD_BASE=${DLHD_BASE}                     # real dlhd site URL kept in .env, out of source
+      # - DADDYLIVE_PUBLIC_URL=http://10.0.0.179:8004 # fallback for the precheck thread only; request URLs derive from Host
+      # - DADDYLIVE_PORT=8004
+      # - DADDYLIVE_REFRESH=3600                      # re-pull the channel list hourly
+      # - DADDYLIVE_FAVORITES=54,51,60                # channel ids kept pre-resolved+validated (54 FOX, 51 ABC, 60 Sky F1)
+      # - DADDYLIVE_PRECHECK=240                      # re-test favorites (all players) every N seconds
       # --- youtube grabber (no-torrent fallback: pull a full-movie YouTube upload) ---
       - YOUTUBE_PORT=8003
       - DATA_HOST_PATH=/home/rosurya/media-server/data  # HOST path of ./data; sibling yt-dlp containers bind-mount by host path
@@ -232,10 +234,10 @@ services:
     labels:
       - 'wud.watch=false'
       - 'updater.policy=never'
-      - "autoheal=true"                           # restart if the daddylive HTTP server hangs
+      - "autoheal=true"                           # restart if the tamilmv Torznab server (healthcheck) hangs
       - "diun.enable=false"                        # locally-built image (no registry) -> skip update checks
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/daddylive.m3u', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/torznab/api?t=caps', timeout=5)"]
       interval: 60s
       timeout: 10s
       retries: 3

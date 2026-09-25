@@ -16,6 +16,7 @@ Each unit runs in its own thread wrapped so a crash logs + ntfy-alerts + restart
 without taking down the others (threads are I/O-bound; requests releases the GIL,
 so seedr's large blocking downloads don't stall the Torznab server or crawler).
 """
+import os
 import threading
 import time
 
@@ -45,17 +46,25 @@ def supervise(name, target):
     return t
 
 
+# DaddyLive is switched off (2026-09-24) but kept in the tree; DADDYLIVE_ENABLED=true brings it back.
+DADDYLIVE_ENABLED = os.environ.get("DADDYLIVE_ENABLED", "true").lower() == "true"
+
+
 def main():
-    clog("main", "media-bridge starting: seedr + reaper + movierulz + tamilmv + daddylive + youtube")
+    parts = ["seedr", "reaper", "movierulz", "tamilmv"] + (["daddylive"] if DADDYLIVE_ENABLED else []) + ["youtube"]
+    clog("main", "media-bridge starting: " + " + ".join(parts))
     supervise("seedr", seedr.run_forever)
     supervise("reaper", reaper.run_forever)
     supervise("movierulz-crawler", movierulz.run_crawler)
     supervise("movierulz-torznab", movierulz.serve_torznab)
     supervise("tamilmv-crawler", tamilmv.run_crawler)
     supervise("tamilmv-torznab", tamilmv.serve_torznab)
-    supervise("daddylive-refresher", daddylive.run_refresher)
-    supervise("daddylive-precheck", daddylive.run_precheck)
-    supervise("daddylive-server", daddylive.serve)
+    if DADDYLIVE_ENABLED:
+        supervise("daddylive-refresher", daddylive.run_refresher)
+        supervise("daddylive-precheck", daddylive.run_precheck)
+        supervise("daddylive-server", daddylive.serve)
+    else:
+        clog("main", "daddylive disabled (DADDYLIVE_ENABLED=false)")
     supervise("youtube-worker", youtube.run_worker)
     supervise("youtube-server", youtube.serve)
     while True:

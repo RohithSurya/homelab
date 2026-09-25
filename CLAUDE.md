@@ -8,8 +8,8 @@ A self-hosted media automation stack defined by a single `docker-compose.yaml`, 
 **Jetson Nano Super (aarch64)**. Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
 `media-bridge/` (six responsibilities in one container: seedr bridge + jellyfin-reaper + movierulz
-scraper/Torznab feed + tamilmv/tamilblasters scraper/Torznab feed + daddylive live-TV resolver +
-youtube grabber); everything else is an off-the-shelf image. Service config/state directories
+scraper/Torznab feed + tamilmv/tamilblasters scraper/Torznab feed + daddylive live-TV resolver
+(**disabled** since 2026-09-24) + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
 (`prowlarr/`, `radarr/`, `sonarr/`, `bazarr/`, `jellyfin/`, `data/`, `media-bridge/config/`) are
 runtime data and are gitignored — only the compose file and the custom service code are version-controlled.
 
@@ -30,7 +30,7 @@ docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun
 ```
 
 There is no build/lint/test tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its six components as 11 supervised threads). To
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 8 supervised threads — 11 with daddylive re-enabled). To
 exercise a change, rebuild the service and watch its logs.
 Secrets come from `.env` (gitignored); see `.env.example` for the required keys.
 
@@ -48,7 +48,7 @@ Consequences that drive most edits here:
 - **Restart gotcha**: restarting gluetun recreates its netns and silently breaks every dependent
   container. After any gluetun restart you MUST `docker restart prowlarr flaresolverr sonarr radarr`
   (or `docker compose down && up -d`). `media-bridge` and `jellyfin` are unaffected — and the
-  `media-bridge` host-published feeds (movierulz Torznab `8002`, youtube grabber `8003`, daddylive live-TV `8004`, tamilmv Torznab `8005`) keep serving,
+  `media-bridge` host-published feeds (movierulz Torznab `8002`, youtube grabber `8003`, tamilmv Torznab `8005`; daddylive `8004` is disabled) keep serving,
   since they are published on the host, not on gluetun.
 - **Cross-service URLs inside the netns**: containers sharing gluetun's namespace talk to the *arr
   apps via the hostname **`gluetun`** (e.g. `http://gluetun:7878`), NOT `radarr`/`sonarr` (which don't
@@ -141,7 +141,7 @@ moved to the wire untouched; Wi-Fi is statically pinned to `10.0.0.180` (Network
 `ipv4.method=manual`), with a matching router DHCP reservation on `f8:3d:c6:57:20:87` holding that address
 out of the pool. Nothing in this stack depends on the Wi-Fi address any more, which is the point — do not
 re-pin it anywhere).
-The four feeds (`8002`–`8005`) publish as plain `"800x:800x"`. Binding a literal address here has two
+The feeds (`8002`, `8003`, `8005`; `8004` while daddylive was on) publish as plain `"800x:800x"`. Binding a literal address here has two
 failure modes, both hit in practice: it (1) **dies with its NIC** — and since all four binds live in one
 container, a Wi-Fi blip stopped Docker from starting `media-bridge` *at all*, taking `[seedr]` and
 `[reaper]` down with it; and (2) **races the DHCP lease at boot**, because `docker.service` orders on
@@ -425,7 +425,16 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
 - **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`query_matches`,
   so the alias expansion and the "never match everything" guard described above apply here too.
 
-### daddylive component (`media-bridge/daddylive.py`)
+### daddylive component (`media-bridge/daddylive.py`) — DISABLED 2026-09-24
+
+**Switched off, code kept.** `DADDYLIVE_ENABLED=false` in compose keeps `main.py` from starting its three
+threads; the `8004` port is unpublished; the `DADDYLIVE_*`/`DLHD_BASE` vars are commented out; the
+container healthcheck moved from `:8004/daddylive.m3u` to `:8005/torznab/api?t=caps` (autoheal would
+otherwise restart-loop the whole container); and the Jellyfin M3U tuner + XMLTV guide were deleted. To
+re-enable, undo all five: flag → `true`, uncomment the vars, re-add `"8004:8004"`, optionally point the
+healthcheck back, and re-add the tuner/guide in Jellyfin (URLs under *Jellyfin wiring* below). Everything
+below describes the component as it ran.
+
 
 A refresher thread + a stdlib HTTP server (`:8004`, host-published) that turns DaddyLive (DLHD) into a
 Jellyfin **Live TV** source (M3U tuner + XMLTV EPG). Built because nothing off-the-shelf works on this
