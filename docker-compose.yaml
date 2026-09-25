@@ -158,7 +158,7 @@ services:
       # --- blackhole bridge (bridge.py) + its download backends (backends/) ---
       # Which backend runs each blackhole drop, first match wins: <private|public|*>:<backend>.
       # e.g. private:seedbox,public:seedr. The *arr apps are unaffected by any choice here.
-      - BRIDGE_ROUTE=*:seedr
+      - BRIDGE_ROUTE=private:seedbox,public:seedr   # 2026-09-25: private trackers -> Pulsed seedbox (per-tracker seed rules), public -> Seedr
       # --- Seedr backend ---
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation

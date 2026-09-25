@@ -201,8 +201,8 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
 
 ### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
 
-**Status (2026-09-25):** built and tested, **not routed yet** (`BRIDGE_ROUTE=*:seedr`). Rollout plan:
-`private:seedbox,public:seedr` after a live test torrent, then public too; plan file
+**Status (2026-09-25):** live for **private** torrents (`BRIDGE_ROUTE=private:seedbox,public:seedr`). Rollout plan:
+public too once the P1 pull worker has parallel SFTP streams (single stream = 12 MB/s vs Seedr ~38); plan file
 `~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`.
 
 - **Secrets come from Bitwarden Secrets Manager** (cloud, US), never `.env`: `vault.py` shells out to the
