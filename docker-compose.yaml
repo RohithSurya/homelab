@@ -167,6 +167,20 @@ services:
       - SEED_HOLD=176400                            # 49h: private-tracker results stay on Seedr to seed (H&R rules)
       - SEEDR_FTP_HOST=ftps.seedr.cc                # FTP fallback for CDN-404'd files + byte resume; empty = off
       - SEEDR_FTP_PASSWORD_B64=${SEEDR_FTP_PASSWORD_B64:-}  # optional; unset = account password
+      # --- private-tracker seed rules (hit-and-run); key = substring of the grab's indexer name.
+      #     <hours>h = seed time required; <ratio>|<hours>h = whichever first. A drop whose rule
+      #     exceeds its backend's cap (Seedr: 48h) waits in the blackhole instead of being sent.
+      #     iptorrents is 48h only while the account is VIP (H&R-exempt until 2026-10-25): set it
+      #     to 1.0|336h when VIP ends. private-default covers unknown trackers and stays strictest.
+      - SEED_RULES=hd-space=48h,iptorrents=48h,torrenthaven=120h,retrotoon=72h,czteam=1.0|72h,private-default=336h
+      # --- seedbox backend (qBittorrent over SSH, backends/qbit.py). Secrets are NOT here: the SSH
+      #     keys, qBittorrent password and pinned host key come from the vault (vault.py, token in
+      #     media-bridge/config/bws_token). Only used once BRIDGE_ROUTE names "seedbox".
+      - SEEDBOX_SSH_HOST=${SEEDBOX_SSH_HOST:-}
+      - SEEDBOX_SSH_USER=${SEEDBOX_SSH_USER:-}
+      - SEEDBOX_QBIT_USER=${SEEDBOX_QBIT_USER:-}
+      - SEEDBOX_QUOTA_GB=230                        # fallback only; the real figure is read from ~/.quota
+      - BWS_SERVER_URL=https://vault.bitwarden.com  # Bitwarden Secrets Manager, US region
       # --- shared *arr / jellyfin / ntfy ---
       - RADARR_URL=http://gluetun:7878
       - RADARR_API_KEY=${RADARR_API_KEY}

@@ -194,6 +194,7 @@ class SeedrBackend(Backend):
     label = "Seedr"
     tag = "seedr"
     max_seed_hours = SEEDR_MAX_SEED_HOURS
+    full_retries = 5
     fetch_fail_log = "Seedr CDN failing"
     fetch_fail_note = "Seedr reported it complete but its CDN kept 404ing"
 
@@ -227,7 +228,9 @@ class SeedrBackend(Backend):
                     free = r.get("space_max", 0) - r.get("space_used", 0)
                 except Exception:
                     free = 0
-                raise Full(free) from e
+                # plenty of free space yet still 413 => the torrent itself is bigger than
+                # the account; it will never fit.
+                raise Full(free, never_fits=free > 20e9) from e
             if code == 409:
                 raise Exists() from e
             raise

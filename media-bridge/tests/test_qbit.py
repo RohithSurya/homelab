@@ -1,0 +1,354 @@
+"""Offline tests for backends/qbit.py: a fake qBittorrent WebUI (HTTP only, no BitTorrent) on
+127.0.0.1 plus a fake SFTP/remote. Nothing here ever speaks BitTorrent or touches the network.
+"""
+
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+os.environ.update(SEEDBOX_SSH_HOST="box.invalid", SEEDBOX_SSH_USER="u")
+os.environ.pop("NTFY_TOPIC", None)
+
+import vault  # noqa: E402
+import backends.qbit as q  # noqa: E402
+from backends.base import DONE, DOWNLOADING, UNAVAILABLE, Exists, Full  # noqa: E402
+
+GiB = 1024**3
+PASSWORD = "qbit-secret"
+vault.get = lambda name: {"SEEDBOX_QBIT_PASSWORD": PASSWORD}[name]
+q.ntfy = lambda *a, **k: None
+
+
+class FakeQbit:
+    def __init__(self):
+        self.torrents = {}
+        self.files = {}
+        self.add_mode = "ok4"
+        self.adds, self.deleted, self.resumed = [], [], []
+        self.logins = 0
+        self.password = PASSWORD
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body="", ctype="text/plain"):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _form(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(n).decode()).items()}
+
+    def _authed(self):
+        return "SID=ok" in (self.headers.get("Cookie") or "")
+
+    def do_GET(self):
+        S = self.server.qb
+        u = urllib.parse.urlsplit(self.path)
+        qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        if not self._authed():
+            return self._send(403, "Forbidden")
+        if u.path == "/api/v2/app/version":
+            return self._send(200, "v4.5.2")
+        if u.path == "/api/v2/torrents/info":
+            ts = list(S.torrents.values())
+            if "hashes" in qs:
+                want = set(qs["hashes"].split("|"))
+                ts = [t for t in ts if t["hash"] in want]
+            if "tag" in qs:
+                ts = [t for t in ts if qs["tag"] in t.get("tags", "")]
+            return self._send(200, json.dumps(ts), "application/json")
+        if u.path == "/api/v2/torrents/files":
+            return self._send(200, json.dumps(S.files.get(qs["hash"], [])), "application/json")
+        self._send(404)
+
+    def do_POST(self):
+        S = self.server.qb
+        u = urllib.parse.urlsplit(self.path)
+        form = self._form()
+        if u.path == "/api/v2/auth/login":
+            S.logins += 1
+            if form.get("password") == S.password:
+                self.send_response(200)
+                self.send_header("Set-Cookie", "SID=ok; path=/")
+                self.send_header("Content-Length", "3")
+                self.end_headers()
+                return self.wfile.write(b"Ok.")
+            return self._send(200, "Fails.")
+        if not self._authed():
+            return self._send(403, "Forbidden")
+        if u.path == "/api/v2/torrents/add":
+            S.adds.append(form)
+            if S.add_mode == "409":
+                return self._send(409, "")
+            h = urllib.parse.parse_qs(urllib.parse.urlsplit(form["urls"]).query)["xt"][0].split(":")[-1]
+            S.torrents[h] = dict(hash=h, name="x", progress=0.0, state="metaDL", amount_left=1, tags=form.get("tags", ""))
+            if S.add_mode == "json5":
+                return self._send(200, json.dumps({"success_count": 1, "failure_count": 0}), "application/json")
+            return self._send(200, "Ok.")
+        if u.path == "/api/v2/torrents/delete":
+            S.deleted.append(form["hashes"])
+            S.torrents.pop(form["hashes"], None)
+            return self._send(200, "")
+        if u.path in ("/api/v2/torrents/resume", "/api/v2/torrents/start"):
+            S.resumed.append(form["hashes"])
+            return self._send(200, "")
+        self._send(404)
+
+
+class FakeFile:
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        self.prefetched = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+    def seek(self, n):
+        self.f.seek(n)
+
+    def prefetch(self, size, max_concurrent_requests=None):
+        self.prefetched = (size, max_concurrent_requests)
+
+    def read(self, n):
+        return self.f.read(n)
+
+
+class FakeSFTP:
+    def __init__(self, root):
+        self.root = root
+
+    def _p(self, remote):
+        return self.root / remote.lstrip("/")
+
+    def stat(self, remote):
+        return os.stat(self._p(remote))
+
+    def open(self, remote, mode="rb"):
+        return FakeFile(self._p(remote))
+
+
+class FakeRemote:
+    def __init__(self, url, root):
+        self.url, self.root = url, root
+        self.small = {".qbittorrentPort": "37301", ".quota": ""}
+
+    def base_url(self):
+        return self.url
+
+    def read_small(self, path):
+        return self.small[path]
+
+    def qbit_port(self, refresh=False):
+        return 37301
+
+    def sftp(self):
+        return FakeSFTP(self.root)
+
+
+def quota(used_gib, limit_gib=230):
+    return (f"Disk quotas for user u (uid 1):\n  Filesystem space quota limit grace files quota limit grace\n"
+            f"  /dev/md0 {int(used_gib * 1024 * 1024)}K {limit_gib}G {int(limit_gib * 1.25)}G  1 115k 144k\n")
+
+
+def magnet(h, size=None):
+    m = f"magnet:?xt=urn:btih:{h}&dn=Some.Release"
+    return m + (f"&xl={size}" if size else "")
+
+
+class QbitTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        self.qb = self.srv.qb = FakeQbit()
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.be = q.QbitBackend()
+        self.be.remote = FakeRemote(f"http://127.0.0.1:{self.srv.server_address[1]}", self.tmp / "remote")
+        self.be.remote.small[".quota"] = quota(10)
+        self.bh = self.tmp / "blackhole" / "radarr"
+        self.bh.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def drop(self, name, m):
+        p = self.bh / f"{name}.magnet"
+        p.write_text(m)
+        return p, m
+
+    # --- quota / add -----------------------------------------------------------------------------
+
+    def test_parse_quota(self):
+        self.assertEqual(q.parse_quota(quota(0.5)), (int(0.5 * GiB), 230 * GiB))
+
+    def test_add_sets_safe_options(self):
+        p, m = self.drop("R1", magnet("a" * 40, 5 * GiB))
+        keys = self.be.add(p, m)
+        self.assertEqual(keys["torrent_hash"], "a" * 40)
+        a = self.qb.adds[0]
+        self.assertEqual((a["category"], a["tags"], a["paused"], a["stopped"], a["ratioLimit"], a["seedingTimeLimit"]),
+                         ("bridge-radarr", "media-bridge", "false", "false", "-1", "-1"))
+
+    def test_add_full_from_quota_and_pending(self):
+        self.be.remote.small[".quota"] = quota(150)
+        self.qb.torrents["z" * 40] = dict(hash="z" * 40, amount_left=40 * GiB, tags="media-bridge", state="downloading", progress=0.5)
+        p, m = self.drop("R2", magnet("b" * 40, 30 * GiB))  # 230-150-40-20 margin = 20 GiB < 30
+        with self.assertRaises(Full) as cm:
+            self.be.add(p, m)
+        self.assertFalse(cm.exception.never_fits)
+        p, m = self.drop("R3", magnet("c" * 40, 220 * GiB))
+        with self.assertRaises(Full) as cm:
+            self.be.add(p, m)
+        self.assertTrue(cm.exception.never_fits)
+        self.assertEqual(self.qb.adds, [])
+
+    def test_magnet_without_size_needs_headroom(self):
+        self.be.remote.small[".quota"] = quota(185)  # 230-185-20 = 25 GiB < 40 GiB headroom
+        p, m = self.drop("R4", magnet("d" * 40))
+        with self.assertRaises(Full):
+            self.be.add(p, m)
+
+    def test_reserved_counts_adds_within_one_loop(self):
+        # 230 - 170 used - 20 margin = 40 GiB: one 25 GiB add fits, a second one must not, even
+        # though ~/.quota (refreshed each minute) doesn't show the first one yet
+        self.be.remote.small[".quota"] = quota(170)
+        self.be.add(*self.drop("R5", magnet("e" * 40, 25 * GiB)))
+        self.qb.torrents["e" * 40]["amount_left"] = 0  # pretend qBit hasn't allocated yet
+        with self.assertRaises(Full):
+            self.be.add(*self.drop("R6", magnet("f" * 40, 25 * GiB)))
+
+    def test_add_qbit5_json_and_409_and_existing(self):
+        self.qb.add_mode = "json5"
+        self.assertEqual(self.be.add(*self.drop("R7", magnet("1" * 40, GiB)))["torrent_hash"], "1" * 40)
+        with self.assertRaises(Exists):
+            self.be.add(*self.drop("R8", magnet("1" * 40, GiB)))  # already listed
+        self.qb.add_mode = "409"
+        with self.assertRaises(Exists):
+            self.be.add(*self.drop("R9", magnet("2" * 40, GiB)))
+
+    # --- status / holds --------------------------------------------------------------------------
+
+    def rec(self, h, **kw):
+        return dict({"title": "T", "category": "radarr", "torrent_hash": h}, **kw)
+
+    def loop(self, *recs):
+        self.be.begin_loop([(None, r) for r in recs])
+
+    def test_status_states(self):
+        self.qb.torrents["3" * 40] = dict(hash="3" * 40, progress=0.4, state="stoppedDL", name="n")
+        self.qb.torrents["4" * 40] = dict(hash="4" * 40, progress=1.0, state="uploading", name="n", save_path="/d")
+        r3, r4, r5 = self.rec("3" * 40), self.rec("4" * 40), self.rec("5" * 40)
+        self.loop(r3, r4, r5)
+        self.assertEqual(self.be.status(r3), (DOWNLOADING, 40.0))
+        self.assertIn("3" * 40, self.qb.resumed, "a stopped download is resumed, not left to 'stall'")
+        self.assertEqual(self.be.status(r4)[0], DONE)
+        self.assertEqual(self.be.status(r5)[0], UNAVAILABLE)
+
+    def test_hold_over_rules(self):
+        rule = {"hours": 48, "ratio": None}
+        H = {c: c * 40 for c in "6789a"}
+        self.qb.torrents[H["6"]] = dict(hash=H["6"], state="stalledUP", seeding_time=(48 + 3) * 3600 + 1, ratio=0.1)
+        self.qb.torrents[H["7"]] = dict(hash=H["7"], state="stalledUP", seeding_time=48 * 3600, ratio=0.1)  # margin not met
+        self.qb.torrents[H["8"]] = dict(hash=H["8"], state="stoppedUP", seeding_time=3600, ratio=0.1)
+        self.qb.torrents[H["9"]] = dict(hash=H["9"], state="uploading", seeding_time=10, ratio=1.2)
+        self.qb.torrents[H["a"]] = dict(hash=H["a"], state="error", seeding_time=10, ratio=0)
+        recs = {c: self.rec(h, seed_rule=dict(rule, ratio=1.0) if c == "9" else rule) for c, h in H.items()}
+        missing = self.rec("b" * 40, seed_rule=rule)
+        self.loop(*recs.values(), missing)
+        self.assertTrue(self.be.hold_over(recs["6"]))
+        self.assertFalse(self.be.hold_over(recs["7"]))
+        self.assertFalse(self.be.hold_over(recs["8"]))
+        self.assertIn(H["8"], self.qb.resumed)
+        self.assertTrue(self.be.hold_over(recs["9"]), "ratio path")
+        self.assertIsNone(self.be.hold_over(recs["a"]), "broken torrent: unknown, keep")
+        self.assertIsNone(self.be.hold_over(missing), "missing is NEVER 'done'")
+
+    def test_begin_loop_refuses_empty_listing_for_many(self):
+        with self.assertRaises(RuntimeError):
+            self.loop(self.rec("c" * 40), self.rec("d" * 40))
+
+    def test_reap_skips_live_hash(self):
+        h = "e" * 40
+        self.qb.torrents[h] = dict(hash=h, state="downloading", progress=0.1)
+        dead, live = self.rec(h, superseded=True), self.rec(h)
+        self.loop(dead, live)
+        self.be.reap(dead)
+        self.assertEqual(self.qb.deleted, [], "a live re-add with the same hash survives the reaper")
+        self.loop(dead)
+        self.be.reap(dead)
+        self.assertEqual(self.qb.deleted, [h])
+
+    # --- fetch -----------------------------------------------------------------------------------
+
+    def test_fetch_strips_root_and_resumes_part(self):
+        root = self.tmp / "remote" / "home/u/data/Rel.Name"
+        (root / "Subs").mkdir(parents=True)
+        (root / "Rel.Name.mkv").write_bytes(b"A" * 5000)
+        (root / "Subs" / "eng.srt").write_bytes(b"sub")
+        h = "f" * 40
+        self.qb.files[h] = [{"name": "Rel.Name/Rel.Name.mkv", "size": 5000, "priority": 1},
+                            {"name": "Rel.Name/Subs/eng.srt", "size": 3, "priority": 1},
+                            {"name": "Rel.Name/sample.mkv", "size": 9, "priority": 0}]
+        dest = self.tmp / "stage"
+        dest.mkdir()
+        (dest / "Rel.Name.mkv.part").write_bytes(b"A" * 1200)  # earlier partial pull
+        self.be.fetch({"title": "T"}, {"hash": h, "save_path": "/home/u/data", "name": "Rel.Name"}, dest)
+        self.assertEqual((dest / "Rel.Name.mkv").read_bytes(), b"A" * 5000)
+        self.assertEqual((dest / "Subs" / "eng.srt").read_bytes(), b"sub")
+        self.assertFalse((dest / "sample.mkv").exists(), "deselected files are skipped")
+        self.assertFalse(list(dest.rglob("*.part")))
+
+    def test_dropped_keepalive_is_retried_once(self):
+        # qBittorrent closes idle keep-alive connections during long SFTP pulls; the next request
+        # on the pooled connection fails with RemoteDisconnected (seen live 2026-09-25)
+        import requests
+        self.be._api("GET", "/app/version")  # log in, pool a connection
+        real, calls = self.be.s.request, []
+
+        def flaky(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise requests.ConnectionError("Remote end closed connection without response")
+            return real(*a, **k)
+
+        self.be.s.request = flaky
+        self.assertEqual(self.be._api("GET", "/app/version").text, "v4.5.2")
+        self.assertEqual(len(calls), 2)
+
+    # --- login -----------------------------------------------------------------------------------
+
+    def test_refused_login_backs_off_without_retrying(self):
+        self.qb.password = "changed-in-panel"
+        with self.assertRaises(RuntimeError):
+            self.be.add(*self.drop("R10", magnet("7" * 40, GiB)))
+        with self.assertRaises(RuntimeError):
+            self.be.add(*self.drop("R11", magnet("8" * 40, GiB)))
+        self.assertEqual(self.qb.logins, 1, "exactly one login attempt, then back off")
+
+
+if __name__ == "__main__":
+    unittest.main()

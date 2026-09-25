@@ -29,9 +29,12 @@ docker compose logs -f media-bridge               # follow its logs ([bridge]/[s
 docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun restart (see below)
 ```
 
-There is no build/lint/test tooling — `media-bridge` is a small Python package run directly
+There is no build/lint tooling — `media-bridge` is a small Python package run directly
 (`CMD ["python", "-u", "main.py"]`, which starts its components as 8 supervised threads — 11 with daddylive re-enabled). To
-exercise a change, rebuild the service and watch its logs.
+exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
+`unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
+blocks the user for it):
+`docker run --rm --user 1000:1000 -v "$PWD/media-bridge:/app" -w /app --entrypoint python media-server-media-bridge -m unittest discover -s tests`
 Secrets come from `.env` (gitignored); see `.env.example` for the required keys.
 
 ## Architecture: the VPN namespace
@@ -172,8 +175,64 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
 - **`BRIDGE_ROUTE`** (compose) picks the backend per drop, first match wins: `<private|public|*>:<backend>`,
   default `*:seedr`. State files carry `"backend"`; files without it (pre-2026-09-25) mean `seedr`.
   A backend named by a route or a live state file must stay registered until its transfers finish.
-- Planned (see `~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`): a qBittorrent+SFTP seedbox
-  backend with per-tracker seed rules, so private trackers with >48h H&R rules can be re-enabled.
+- `backends/qbit.py` — the **seedbox** backend (Pulsed Media PMSS box `3-229mighty`, qBittorrent 4.5.2). See
+  *seedbox backend* below. Log tag `[seedbox]`.
+- **`SEED_RULES`** (compose): per-private-tracker seeding rule, key = substring of the grab's indexer name
+  (from *arr history, retried a few polls since the *arr writes the drop first), `<h>h` or `<ratio>|<h>h`;
+  `private-default` (336h) covers anything unmatched. A drop whose rule exceeds its backend's cap
+  (`max_seed_hours`, Seedr 48) **waits in the blackhole** — never sent to a backend that would H&R it. A
+  magnet whose indexer matches a rule is private too (magnets carry no private flag). `iptorrents=48h` only
+  while the account is VIP (until 2026-10-25) → `1.0|336h` after.
+- **Staged delivery**: fetches land in `downloads/.incoming/<cat>/<release>` and are moved into the watch
+  folder with ONE `rename` only when complete (`deliver`: identical existing dir → keep; different → swap
+  whole, never mix). The *arr blackhole scan imports any watch-folder item idle ~30s, so fetching straight
+  into it let slow/retrying fetches be imported half-done.
+- **Never judge what you can't see**: `status()` may return `UNAVAILABLE` and `hold_over()` may return
+  `None` (torrent not in the listing, client restarting, `error`/`missingFiles`). Those never fail,
+  tombstone, reap, or release a hold — the bridge waits (deadlines frozen) and ntfys after
+  `UNAVAILABLE_ALERT` (2h). **A missing seedbox torrent is never a finished hold.**
+- **Clock freeze** (`freeze_clocks`, marker `.bridge-state/.seen-<backend>`): after any gap in observing a
+  backend (> `CLOCK_GAP`), deadlines that were already running are pushed back by the gap, so an outage
+  can't make every transfer look stalled. **Circuit breaker** (`may_fail`): `BREAKER_FAILS` (3) automatic
+  failures on one backend within 15 min pauses auto-failing there for 1h (+1 ntfy).
+- **Private partials** (`keep_private_partial`): a private torrent that downloaded > 50 MiB is never
+  cancelled on stall/supersede — it's failed in the *arr (re-grab) but kept seeding as an undelivered
+  hold (`no_deliver`), capped at `PARTIAL_HOLD` (7d). Trackers count partial snatches as H&R.
+
+### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
+
+**Status (2026-09-25):** built and tested, **not routed yet** (`BRIDGE_ROUTE=*:seedr`). Rollout plan:
+`private:seedbox,public:seedr` after a live test torrent, then public too; plan file
+`~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`.
+
+- **Secrets come from Bitwarden Secrets Manager** (cloud, US), never `.env`: `vault.py` shells out to the
+  pinned, checksum-verified `bws` CLI baked into the image; the only local secret is the machine-account
+  token `media-bridge/config/bws_token` (mode 600, gitignored). Values live in memory only. Names:
+  `SEEDBOX_ACCOUNT_PASSWORD` (admin use only — media-bridge never needs it), `SEEDBOX_SSH_KEY_SFTP`,
+  `SEEDBOX_SSH_KEY_QBIT`, `SEEDBOX_QBIT_PASSWORD`, `SEEDBOX_SSH_HOSTKEY`, `TRACKER_*`. `python -m vault check`
+  lists names, never values. `bws` parses values starting with `-` as options → `put` uses `--value=`/`--`.
+- **Two restricted SSH keys** on the box (`~/.ssh/authorized_keys`): SFTP key =
+  `restrict,command="/usr/lib/openssh/sftp-server -R"` (read-only SFTP: pulls, `~/.quota`, port file);
+  qBit key = `restrict,port-forwarding,permitopen="127.0.0.1:*",command="/bin/false"` (tunnel only).
+  Host key pinned in `media-bridge/config/seedbox_known_hosts` (+ vault copy); unknown/changed = refuse.
+- **qBittorrent** listens on the box's `127.0.0.1:<~/.qbittorrentPort>` (37301 today; PMSS may move it —
+  re-read on connection errors), reached through a paramiko direct-tcpip tunnel + a local forwarder.
+  Its WebUI password is its own random one; **a password change in the Pulsed panel resets it to the
+  account password** (PMSS `changePw.php`) → the bridge stops at the FIRST refused login (qBittorrent bans
+  127.0.0.1 after repeated failures, which also locks the user's WebUI) and ntfys.
+- **PMSS watchdog flags** in the box home: `~/.qbittorrentEnable` (keeps qBittorrent up), `~/.rtorrentDisable`.
+  The watchdog rewrites only perf/CSRF keys in qBittorrent.conf while it's stopped — not share limits,
+  queueing, or the password. Rootless Docker (~200 MB of the 1 GB cgroup) is root-config; only PM support
+  can disable it.
+- **Space**: `~/.quota` (PMSS `quota -s` snapshot, 230G soft) minus bytes our downloads still need minus
+  this loop's adds; qBittorrent's `free_space_on_disk` is the whole shared disk — never use it. Magnets
+  without `xl=` need `SEEDBOX_UNKNOWN_SIZE_GB` (40) headroom. Full → the drop waits (no retry cap).
+- Adds always set `paused=false`/`stopped=false`, `ratioLimit=-1`, `seedingTimeLimit=-1`, category
+  `bridge-<cat>`, tag `media-bridge`; qBit 4.x `Ok.` and 5.2 JSON/409 both handled. Holds end on
+  qBittorrent's own `seeding_time` ≥ rule + `SEED_MARGIN_HOURS` (3) or ratio; a stopped/queued held
+  torrent is resumed. The reaper never deletes a hash a live record still owns.
+- **Server reboot 2026-09-25**: every port dead from home + "connects but never answers" via VPN looked
+  like an IP ban; it was a reboot. PMSS runs no fail2ban (ADR 0010). Check `uptime` before suspecting a ban.
 
 Seedr backend: HTTP Basic auth; password is base64 in `SEEDR_PASSWORD_B64` because a literal `$` breaks
 Docker/shell interpolation. Per magnet: add to Seedr → poll → download finished files into the watch
