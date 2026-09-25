@@ -155,7 +155,11 @@ services:
       - "8005:8005"                              # tamilmv/tamilblasters Torznab feed
     environment:
       - TZ=America/New_York
-      # --- seedr blackhole bridge ---
+      # --- blackhole bridge (bridge.py) + its download backends (backends/) ---
+      # Which backend runs each blackhole drop, first match wins: <private|public|*>:<backend>.
+      # e.g. private:seedbox,public:seedr. The *arr apps are unaffected by any choice here.
+      - BRIDGE_ROUTE=*:seedr
+      # --- Seedr backend ---
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
       - POLL_INTERVAL=30

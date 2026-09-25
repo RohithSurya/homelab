@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on a
 **Jetson Nano Super (aarch64)**. Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
-`media-bridge/` (six responsibilities in one container: seedr bridge + jellyfin-reaper + movierulz
+`media-bridge/` (six responsibilities in one container: blackhole bridge (Seedr backend) + jellyfin-reaper + movierulz
 scraper/Torznab feed + tamilmv/tamilblasters scraper/Torznab feed + daddylive live-TV resolver
 (**disabled** since 2026-09-24) + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
 (`prowlarr/`, `radarr/`, `sonarr/`, `bazarr/`, `jellyfin/`, `data/`, `media-bridge/config/`) are
@@ -25,7 +25,7 @@ Caddy proxies to `127.0.0.1:8096` (Jellyfin is `network_mode: host`) and exposer
 ```bash
 docker compose up -d                              # bring up / apply compose changes
 docker compose up -d --build media-bridge         # rebuild the custom service after editing its .py
-docker compose logs -f media-bridge               # follow its logs ([seedr]/[reaper]/[movierulz]/[tamilmv]/[daddylive]/[youtube] tags)
+docker compose logs -f media-bridge               # follow its logs ([bridge]/[seedr]/[reaper]/[movierulz]/[tamilmv]/[daddylive]/[youtube] tags)
 docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun restart (see below)
 ```
 
@@ -70,7 +70,7 @@ never joins a swarm; keeping it off-VPN also keeps Seedr CDN downloads direct/fa
 hardlink-friendly and paths map 1:1 across services. Layout:
 - `data/blackhole/{sonarr,radarr}/` — Sonarr/Radarr (configured with a **Torrent Blackhole** download
   client, since Seedr has no native *arr connector) drop `<release>.magnet` files here.
-- `data/downloads/{sonarr,radarr}/` — media-bridge's seedr component writes finished downloads here; the
+- `data/downloads/{sonarr,radarr}/` — media-bridge's blackhole bridge writes finished downloads here; the
   *arr watch-folder scan imports them.
 - `data/media/{tv,movies}` — the Jellyfin library, mounted read-only into jellyfin.
 - `data/blackhole/.bridge-state/` — media-bridge seedr per-transfer state JSON (one file per transfer).
@@ -130,8 +130,8 @@ One container running six components as supervised daemon threads (`main.py` →
 wrapper that logs + ntfy-alerts + restarts, so one crash can't take the others down). It is **off the
 VPN** on the default bridge net; it reaches the *arr apps and FlareSolverr via `http://gluetun:<port>`
 and host-net Jellyfin via `host.docker.internal`. Shared helpers live in `common.py` (`clog`, `norm`,
-`ntfy`). Logs are tagged `[seedr]` / `[reaper]` / `[movierulz]` / `[tamilmv]` / `[daddylive]` / `[youtube]`. Rebuilding/restarting this container to
-ship a movierulz change also restarts the seedr loop mid-download — safe, since seedr resumes from its
+`ntfy`). Logs are tagged `[bridge]` / `[seedr]` / `[reaper]` / `[movierulz]` / `[tamilmv]` / `[daddylive]` / `[youtube]`. Rebuilding/restarting this container to
+ship a movierulz change also restarts the bridge loop mid-download — safe, since the bridge resumes from its
 `.bridge-state` JSON.
 
 **Port bindings: all interfaces, never a literal LAN IP** (changed 2026-08-30, when the Jetson gained a
@@ -143,7 +143,7 @@ out of the pool. Nothing in this stack depends on the Wi-Fi address any more, wh
 re-pin it anywhere).
 The feeds (`8002`, `8003`, `8005`; `8004` while daddylive was on) publish as plain `"800x:800x"`. Binding a literal address here has two
 failure modes, both hit in practice: it (1) **dies with its NIC** — and since all four binds live in one
-container, a Wi-Fi blip stopped Docker from starting `media-bridge` *at all*, taking `[seedr]` and
+container, a Wi-Fi blip stopped Docker from starting `media-bridge` *at all*, taking the bridge and
 `[reaper]` down with it; and (2) **races the DHCP lease at boot**, because `docker.service` orders on
 `network-online.target`, which one interface can satisfy before another's lease exists — the same race
 that took Immich down for 10h on 2026-08-09. The retired `never 0.0.0.0` comment justified itself as
@@ -157,14 +157,30 @@ the Jetson fetch an arbitrary URL and read the bytes back — including loopback
 LAN-only today. Fixing it means allowlisting upstream hosts in `_proxy_hls`, not a firewall rule (the LAN is
 exactly where it is reachable from).
 
-### seedr component (`media-bridge/seedr.py`)
+### blackhole bridge (`media-bridge/bridge.py` + `media-bridge/backends/`)
 
-Polling loop (`process_new_magnets` → `check_completions`, default every 30s) bridging the *arr
-blackhole to Seedr's REST API (HTTP Basic auth; password is base64 in `SEEDR_PASSWORD_B64` because a
-literal `$` breaks Docker/shell interpolation). Per magnet: add to Seedr → poll → download finished
-files into the watch folder → delete from Seedr to free space.
+Polling loop (`process_new_magnets` → `check_completions`, default every 30s) that is the *arr apps'
+download client: they keep the **Torrent Blackhole** client and never see which service downloads.
+Split since 2026-09-25 into a backend-agnostic engine and pluggable **download backends**:
+- `bridge.py` — everything the *arr apps depend on: blackhole scan, `.torrent` parse (`torrentfile.py`),
+  routing, state files, delivery under the release name, supersede, stall / missing-result /
+  unfetchable deadlines, `arr_mark_failed`, and the private-tracker hold. Log tag `[bridge]`.
+- `backends/base.py` — the adapter contract (`add` / `locate` / `begin_loop` / `status` / `fetch` /
+  `cancel` / `discard` / `start_hold` / `hold_over` / `end_hold` / `reap`, plus `Full` / `Exists` /
+  `Rejected`). `backends/__init__.py` registers backends by name and imports them lazily.
+- `backends/seedr.py` — the Seedr REST/FTPS adapter (all the Seedr quirks below live here). Log tag `[seedr]`.
+- **`BRIDGE_ROUTE`** (compose) picks the backend per drop, first match wins: `<private|public|*>:<backend>`,
+  default `*:seedr`. State files carry `"backend"`; files without it (pre-2026-09-25) mean `seedr`.
+  A backend named by a route or a live state file must stay registered until its transfers finish.
+- Planned (see `~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`): a qBittorrent+SFTP seedbox
+  backend with per-tracker seed rules, so private trackers with >48h H&R rules can be re-enabled.
 
-Non-obvious invariants — preserve these when editing:
+Seedr backend: HTTP Basic auth; password is base64 in `SEEDR_PASSWORD_B64` because a literal `$` breaks
+Docker/shell interpolation. Per magnet: add to Seedr → poll → download finished files into the watch
+folder → delete from Seedr to free space.
+
+Non-obvious invariants — preserve these when editing (engine rules in `bridge.py`, Seedr rules in
+`backends/seedr.py`):
 - **Completion is signalled by the torrent leaving `root["torrents"]`**, NOT by the destination folder
   existing. Seedr surfaces the folder early and fills it as files finish; fetching on folder-existence
   grabs a half-finished download.
@@ -179,7 +195,7 @@ Non-obvious invariants — preserve these when editing:
   matches an in-progress *different* release of the same movie triggers `purge_superseded`, which
   deletes the old Seedr transfer immediately and writes a **tombstone** state file; `check_completions`
   reaps the old release's late-appearing folder/partial each loop until `TOMBSTONE_GRACE` expires.
-- **`_name_matches` is the single result/supersede matcher** — used by `check_completions` (both the
+- **`name_matches` (`common.py`) is the single result/supersede matcher** — used by `check_completions` (both the
   folder and the bare-root-file branch) and by the supersede reaper. It requires the full shorter
   normalized name to be a **substring** of the longer (`len>=18`), never a fixed-length prefix:
   - *substring, not prefix*, because Seedr names the result after the torrent's **internal** name, which
@@ -224,7 +240,7 @@ Non-obvious invariants — preserve these when editing:
   a 409 leaves no state file behind, and `check_completions` only ever reads state files, so the
   finished movie would sit in Seedr undelivered while the magnet 409'd on every 30s poll forever.
   The live transfer is matched **by infohash** (exact — the name matcher is not needed here); if it
-  already finished it is no longer in `root["torrents"]`, so it falls back to `_name_matches` over
+  already finished it is no longer in `root["torrents"]`, so it falls back to `name_matches` over
   folders and bare root files, the same two result shapes `check_completions` handles.
 - **`.torrent` drops are uploaded as files** (`POST /rest/transfer/file`, field `file` — same response
   as a magnet add), not converted to magnets: the file keeps the info dict's `private` flag and the
