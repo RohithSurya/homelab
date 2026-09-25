@@ -160,6 +160,7 @@ services:
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
       - POLL_INTERVAL=30
+      - SEED_HOLD=176400                            # 49h: private-tracker results stay on Seedr to seed (H&R rules)
       - STALL_TIMEOUT=2700                          # 45 min, in seconds
       - SEEDR_FTP_HOST=ftps.seedr.cc                # FTP fallback for CDN-404'd files + byte resume; empty = off
       - SEEDR_FTP_PASSWORD_B64=${SEEDR_FTP_PASSWORD_B64:-}  # optional; unset = account password

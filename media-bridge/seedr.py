@@ -91,6 +91,10 @@ FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "5400"))  # 90 min
 # torrent finished alongside a pack holding the same file) would otherwise log "result not
 # visible yet" every poll forever. After this long, tombstone it and fail it in the *arr.
 RESULT_TIMEOUT = int(os.environ.get("RESULT_TIMEOUT", "1800"))  # 30 min
+# A private-tracker result stays on Seedr this long after delivery so Seedr keeps seeding it
+# (the plan seeds 2:1 or 48h, and only while the files exist). 49h = 48h + margin; delivery
+# is already after completion, so the tracker never sees less than 48h.
+SEED_HOLD = int(os.environ.get("SEED_HOLD", "176400"))
 ARR = {
     "radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
     "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY")),
@@ -113,6 +117,17 @@ def list_folder(folder_id=""):
 
 def add_magnet(magnet):
     return api("POST", "/transfer/magnet", data={"magnet": magnet}).json()
+
+
+def add_torrent_file(path):
+    # Same response shape as add_magnet. Uploading the file (not a synthesized magnet) keeps
+    # the info dict intact -- incl. the private flag -- and the passkeyed announce list.
+    with open(path, "rb") as f:
+        return api(
+            "POST",
+            "/transfer/file",
+            files={"file": (path.name, f, "application/x-bittorrent")},
+        ).json()
 
 
 def _bdecode(data, i):
@@ -144,25 +159,20 @@ def _bdecode(data, i):
     raise ValueError(f"bad bencode byte {c!r} at offset {i}")
 
 
-def magnet_from_torrent(path):
-    """Build a magnet URI from a .torrent file. Some indexers (e.g. YTS) hand
-    Radarr/Sonarr a real .torrent rather than a magnet, which the blackhole saves
-    as <release>.torrent. Seedr's add endpoint is magnet-only, so we synthesize one:
-    btih = SHA1 of the *raw* bencoded info-dict bytes (re-encoding could reorder keys
-    and change the hash), name from info['name'], trackers from announce/announce-list."""
+def _read_torrent(path):
+    """(raw info-dict bytes, decoded info dict, tracker URLs) of a .torrent file."""
     data = path.read_bytes()
     if data[:1] != b"d":
         raise ValueError("not a bencoded dict")
     i = 1
-    info_raw = name = None
+    info_raw = info = None
     trackers = []
     while data[i : i + 1] != b"e":
         k, i = _bdecode(data, i)
         if k == b"info":
             start = i
-            v, i = _bdecode(data, i)
+            info, i = _bdecode(data, i)
             info_raw = data[start:i]
-            name = v.get(b"name")
         else:
             v, i = _bdecode(data, i)
             if k == b"announce" and isinstance(v, bytes):
@@ -171,6 +181,22 @@ def magnet_from_torrent(path):
                 trackers += [t for tier in v for t in tier if isinstance(t, bytes)]
     if info_raw is None:
         raise ValueError("no info dict")
+    return info_raw, info, trackers
+
+
+def torrent_is_private(path):
+    # BEP 27: info['private'] == 1 marks a private-tracker torrent.
+    return _read_torrent(path)[1].get(b"private") == 1
+
+
+def magnet_from_torrent(path):
+    """Build a magnet URI from a .torrent file. Uploads go to Seedr as the file itself
+    (add_torrent_file); the magnet is kept for its btih, which the 409/duplicate matching
+    in adopt_existing keys on. btih = SHA1 of the *raw* bencoded info-dict bytes
+    (re-encoding could reorder keys and change the hash), name from info['name'],
+    trackers from announce/announce-list."""
+    info_raw, info, trackers = _read_torrent(path)
+    name = info.get(b"name")
     btih = hashlib.sha1(info_raw).hexdigest()
     dn = (name or path.stem.encode()).decode("utf-8", "replace")
     q = urllib.parse.quote_plus
@@ -272,6 +298,26 @@ def delete_transfer(tid):
         log(f"    (warning) could not delete Seedr transfer {tid}: {e}")
 
 
+def release_or_hold(cat, rec, sp, folder_id=None, file_id=None):
+    """Done with a finished result. Public: delete it from Seedr now and drop the state.
+    Private: Seedr seeds only while the files exist and trackers punish hit-and-runs, so
+    keep the result and the state file until hold_until; check_completions deletes it then."""
+    if rec.get("private"):
+        until = time.time() + SEED_HOLD
+        rec.update(hold_until=until, hold_folder_id=folder_id, hold_file_id=file_id)
+        sp.write_text(json.dumps(rec))
+        log(
+            f"[{cat}] '{rec['title']}' is private -> holding on Seedr to seed until "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}"
+        )
+        return
+    if folder_id is not None:
+        delete_folder(folder_id)
+    if file_id is not None:
+        delete_file(file_id)
+    sp.unlink()
+
+
 def _name_matches(seedr_name, title):
     # True when seedr_name and title are (almost certainly) the SAME release.
     # norm() drops punctuation, so Seedr's sanitization (dashes/spaces/appended group
@@ -327,6 +373,8 @@ def purge_superseded(cat, new_key, new_name, root):
         except Exception:
             continue
         if rec.get("category") != cat or rec.get("superseded"):
+            continue
+        if rec.get("hold_until"):  # delivered + seeding: deleting it now is a hit-and-run
             continue
         if norm(rec.get("title", "")) == norm(new_name):  # same release -> leave it
             continue
@@ -468,10 +516,11 @@ def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
     log(
         f"[{cat}] '{title}' UNFETCHABLE (Seedr CDN failing >{FETCH_TIMEOUT // 60}min: {err}) -> failing & retrying"
     )
-    if folder_id is not None:
-        delete_folder(folder_id)
-    if file_id is not None:
-        delete_file(file_id)
+    if not rec.get("private"):  # private: Seedr is seeding it -> held below instead
+        if folder_id is not None:
+            delete_folder(folder_id)
+        if file_id is not None:
+            delete_file(file_id)
     retried = arr_mark_failed(cat, release)
     notify(
         f"Unfetchable: {release}",
@@ -482,10 +531,15 @@ def handle_fetch_failure(cat, rec, sp, err, folder_id=None, file_id=None):
             else "Could not reach Radarr/Sonarr -- override it manually."
         ),
     )
+    cleanup_local_partial(cat, title, old_release=release)
+    if rec.get("private"):
+        # NOT a tombstone: the tombstone reaper deletes matching Seedr folders every loop.
+        rec["unfetchable"] = True
+        release_or_hold(cat, rec, sp, folder_id=folder_id, file_id=file_id)
+        return
     # tombstone -> reaper cleans any leftover Seedr footprint / local partial and we stop retrying
     rec.update(superseded=True, new_title=None, superseded_at=now, unfetchable=True)
     sp.write_text(json.dumps(rec))
-    cleanup_local_partial(cat, title, old_release=release)
 
 
 def state_file(category, title):
@@ -508,7 +562,7 @@ def _magnet_btih(magnet):
     return h.lower()
 
 
-def adopt_existing(cat, mfile, magnet, nkey):
+def adopt_existing(cat, mfile, magnet, nkey, private=False):
     """Seedr answered 409 Conflict: it ALREADY holds this torrent -- an out-of-band add
     (adding the magnet by hand on seedr.cc is a normal thing to do) or an earlier loop
     whose response we lost. A 409 has no state file behind it, and check_completions()
@@ -573,6 +627,8 @@ def adopt_existing(cat, mfile, magnet, nkey):
         "torrent_hash": thash or btih or None,
         "added": time.time(),
     }
+    if private:
+        rec["private"] = True
     state_file(cat, title).write_text(json.dumps(rec))
     mfile.unlink()
     log(f"    already on Seedr ({where}) -> adopted as '{title}'")
@@ -589,11 +645,13 @@ def process_new_magnets():
             + sorted(bh.glob("*.torrent"))
         )
         for mfile in drops:
+            private = False
             if mfile.suffix == ".torrent":
-                # Indexers that hand the *arr a real .torrent (YTS, etc.) land here;
-                # Seedr only takes magnets, so synthesize one from the file.
+                # Indexers that hand the *arr a real .torrent (private trackers, YTS, ...)
+                # land here. The file itself is uploaded; the magnet only supplies the btih.
                 try:
                     magnet = magnet_from_torrent(mfile)
+                    private = torrent_is_private(mfile)
                 except Exception as e:
                     log(f"[{cat}] cannot parse {mfile.name} ({e}); skipping")
                     continue
@@ -604,9 +662,12 @@ def process_new_magnets():
             # movie identity (Radarr only) -> lets a new release supersede an old
             # in-progress 'zombie' transfer of the SAME movie.
             nkey = movie_key(mfile.stem) if cat == "radarr" else None
-            log(f"[{cat}] adding {mfile.name}")
+            log(f"[{cat}] adding {mfile.name}" + (" (private)" if private else ""))
             try:
-                resp = add_magnet(magnet)
+                if mfile.suffix == ".torrent":
+                    resp = add_torrent_file(mfile)
+                else:
+                    resp = add_magnet(magnet)
             except requests.HTTPError as e:
                 if (
                     getattr(e, "response", None) is not None
@@ -643,7 +704,7 @@ def process_new_magnets():
                 if (
                     getattr(e, "response", None) is not None
                     and e.response.status_code == 409
-                    and adopt_existing(cat, mfile, magnet, nkey)
+                    and adopt_existing(cat, mfile, magnet, nkey, private)
                 ):
                     continue
                 log(f"    add failed ({e}); will retry next loop")
@@ -668,6 +729,8 @@ def process_new_magnets():
                 "torrent_hash": resp.get("torrent_hash"),
                 "added": time.time(),
             }
+            if private:
+                rec["private"] = True
             state_file(cat, title).write_text(json.dumps(rec))
             mfile.unlink()
             log(f"    queued on Seedr as '{title}'")
@@ -685,20 +748,41 @@ def check_completions():
     # mere existence of the folder (that bug grabbed a half-finished folder).
     torrents_by_id = {t.get("id"): t for t in root.get("torrents", [])}
     torrents_by_name = {t.get("name"): t for t in root.get("torrents", [])}
+    records = []
     for sp in sorted(STATE_DIR.glob("*.json")):
-        rec = json.loads(sp.read_text())
+        records.append((sp, json.loads(sp.read_text())))
+    # Results held for private-tracker seeding: the name-matching reaper below must never
+    # touch them, whatever it matches.
+    held = {r.get("hold_folder_id") for _, r in records if r.get("hold_until")}
+    held |= {r.get("hold_file_id") for _, r in records if r.get("hold_until")}
+    held.discard(None)
+    for sp, rec in records:
         title, cat = rec["title"], rec["category"]
+        # delivered private result -> keep seeding until hold_until, then free the space.
+        if rec.get("hold_until"):
+            if time.time() >= rec["hold_until"]:
+                if rec.get("hold_folder_id") is not None:
+                    delete_folder(rec["hold_folder_id"])
+                if rec.get("hold_file_id") is not None:
+                    delete_file(rec["hold_file_id"])
+                sp.unlink()
+                log(f"[{cat}] '{title}' seeding hold over -> removed from Seedr")
+            continue
         # superseded release -> reap its (often late-appearing) Seedr footprint, never
         # the replacement's, until the grace window closes.
         if rec.get("superseded"):
             new_title = rec.get("new_title")
             for name, fid in list(folders.items()):
+                if fid in held:
+                    continue
                 if _name_matches(name, title) and not (
                     new_title and _name_matches(name, new_title)
                 ):
                     log(f"    [override] cleaning leftover Seedr folder '{name}'")
                     delete_folder(fid)
             for f in root.get("files", []):
+                if f["id"] in held:
+                    continue
                 nm = f.get("name", "")
                 if _name_matches(nm, title) and not (
                     new_title and _name_matches(nm, new_title)
@@ -727,9 +811,11 @@ def check_completions():
         # torrent finished (gone from in-progress) -> locate its result.
         # (a) multi-file / wrapped torrents land as a top-level FOLDER
         folder_id = folders.get(title)
+        if folder_id in held:
+            folder_id = None
         if folder_id is None:  # tolerate Seedr sanitizing / site-prefixing the name
             for name, fid in folders.items():
-                if _name_matches(name, title):
+                if fid not in held and _name_matches(name, title):
                     folder_id, title = fid, name
                     break
         # Deliver under the release name the *arr GRABBED, not Seedr's name for the result: the
@@ -742,8 +828,7 @@ def check_completions():
             log(f"[{cat}] '{title}' complete -> fetching folder to {dest}")
             try:
                 fetch_folder_recursive(folder_id, dest)
-                delete_folder(folder_id)
-                sp.unlink()
+                release_or_hold(cat, rec, sp, folder_id=folder_id)
                 log(f"[{cat}] '{title}' delivered.")
                 log(f"[{cat}] '{title}' downloaded to {dest}")
             except Exception as e:
@@ -753,7 +838,7 @@ def check_completions():
         # (b) bare single-file torrents land as a ROOT FILE (no folder)
         match = None
         for f in root.get("files", []):
-            if _name_matches(os.path.splitext(f.get("name", ""))[0], title):
+            if f["id"] not in held and _name_matches(os.path.splitext(f.get("name", ""))[0], title):
                 match = f
                 break
         if match is not None:
@@ -761,8 +846,7 @@ def check_completions():
             log(f"[{cat}] '{title}' complete (single file) -> fetching {match['name']}")
             try:
                 download_file(match["id"], dest, f"/{match['name']}", match.get("size"))
-                delete_file(match["id"])
-                sp.unlink()
+                release_or_hold(cat, rec, sp, file_id=match["id"])
                 log(f"[{cat}] '{title}' delivered.")
                 log(f"[{cat}] '{title}' downloaded to {dest}")
             except Exception as e:

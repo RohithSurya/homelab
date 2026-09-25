@@ -226,6 +226,26 @@ Non-obvious invariants — preserve these when editing:
   The live transfer is matched **by infohash** (exact — the name matcher is not needed here); if it
   already finished it is no longer in `root["torrents"]`, so it falls back to `_name_matches` over
   folders and bare root files, the same two result shapes `check_completions` handles.
+- **`.torrent` drops are uploaded as files** (`POST /rest/transfer/file`, field `file` — same response
+  as a magnet add), not converted to magnets: the file keeps the info dict's `private` flag and the
+  passkeyed announce list. `magnet_from_torrent` survives only to supply the btih for 409 matching.
+  Prowlarr's per-indexer **Prefer Magnet URL is off** on the private trackers so they arrive as `.torrent`.
+- **Private-tracker hold (`SEED_HOLD`, 49h) — hit-and-run protection.** Seedr's Pro plan seeds private
+  torrents **2:1 or 48h, whichever first**, as client **Deluge 2.1.1**, and only while the files are in
+  the account (deleting early is assumed to stop seeding — Seedr doesn't document it). A private
+  torrent still leaves `root["torrents"]` at 100% like a public one; seeding is invisible in the API.
+  So a torrent with `info.private == 1` is marked `private` in its state file, and `release_or_hold`
+  keeps its Seedr folder/file **plus the state file** for `SEED_HOLD` after delivery, then deletes it.
+  Held results are excluded from everything that deletes or matches by name: `purge_superseded`, the
+  tombstone reaper, and the result lookup for other transfers. An unfetchable private result is failed
+  in the *arr but held, never tombstoned (the tombstone reaper deletes every loop). Before this, the
+  bridge deleted each private result right after download — a hit-and-run on every grab.
+- **Which private trackers Seedr can serve** (per-tracker H&R rules vs one 48h window, 2026-09-25):
+  HD-Space 48h ✅ (enabled, **freeleech-only** — its overall ratio must stay ≥1.0 at all times);
+  IPTorrents 1:1-or-336h but **VIP-exempt** for now ✅ (re-check when VIP ends); RetroToon 72h,
+  CZTeam 1:1-or-72h, TorrentHaven 120h (even freeleech) ❌ — **disabled in Prowlarr**; DocsPedia
+  unknown, disabled. Longer rules would need re-seed cycles (delete + re-add after 48h for another
+  window, within the tracker's 10-day window), which each re-download the torrent — not built.
 
 ### reaper component (`media-bridge/reaper.py`)
 
