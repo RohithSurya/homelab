@@ -222,7 +222,8 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   always re-searches), and later grabs of it are dropped. No ntfy for any of these (user decision).
 - **Fail-fast** (`check_failfast`, `FAILFAST*`, public-only, **dry-run by default**): a public download
   with nothing downloaded after 10 min whose backend reports no metadata or 0 swarm seeds
-  (`Backend.swarm()`; Seedr has no swarm data → "still 0%") is failed + re-grabbed instead of waiting for
+  (`Backend.swarm()`: qBittorrent's state/num_complete; Seedr's transfer entry has `seeders`, `leechers`,
+  `connected_to`, `download_rate`, and `size` once metadata is known) is failed + re-grabbed instead of waiting for
   the 45-min stall. movierulz/tamilmv report a fake seeder count (`FAKE_SEEDERS`), so dead picks are common.
 - **Extra public trackers** (`trackers.py`, `PUBLIC_EXTRA_TRACKERS`): ngosang/trackerslist
   `trackers_best.txt` (~20), refreshed daily, cached in `config/trackers_best.txt` (a failed fetch keeps the

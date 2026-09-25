@@ -584,3 +584,20 @@ class FailFastTest(unittest.TestCase):
         self.save("PrivDead 2014 1080p WEB", private=True)
         self.loop()
         self.assertFalse(self.rec("PrivDead 2014 1080p WEB").get("dead"))
+
+
+class SeedrSwarmTest(unittest.TestCase):
+    def test_seedr_swarm_from_transfer_entry(self):
+        os.environ.setdefault("SEEDR_EMAIL", "x")
+        os.environ.setdefault("SEEDR_PASSWORD", "y")
+        import backends.seedr as sd
+        b = sd.SeedrBackend()
+        sd.list_folder = lambda folder_id="": {"folders": [], "files": [], "torrents": [
+            {"id": 1, "name": "A", "progress": 0, "size": 0, "seeders": 0},
+            {"id": 2, "name": "B", "progress": 0, "size": 700 * 2**20, "seeders": 0},
+            {"id": 3, "name": "C", "progress": 3, "size": 700 * 2**20, "seeders": "12"}]}
+        b.begin_loop([])
+        self.assertEqual(b.swarm({"title": "A", "user_torrent_id": 1}), {"metadata": False, "seeds": 0})
+        self.assertEqual(b.swarm({"title": "B", "user_torrent_id": 2}), {"metadata": True, "seeds": 0})
+        self.assertEqual(b.swarm({"title": "C", "user_torrent_id": 3}), {"metadata": True, "seeds": 12})
+        self.assertIsNone(b.swarm({"title": "gone", "user_torrent_id": 9}))

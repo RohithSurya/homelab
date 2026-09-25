@@ -310,6 +310,18 @@ class SeedrBackend(Backend):
                 return DONE, {"kind": "file", "id": f["id"], "name": f["name"], "size": f.get("size")}
         return NOT_VISIBLE, None
 
+    def swarm(self, rec):
+        """Seedr's transfer entry reports the swarm too (seen live 2026-09-25): 'seeders',
+        'leechers', 'connected_to', 'download_rate', and 'size' once the metadata is known."""
+        t = self.torrents_by_id.get(rec.get("user_torrent_id")) or self.torrents_by_name.get(rec["title"])
+        if t is None:
+            return None
+        try:
+            seeds = int(t.get("seeders"))
+        except (TypeError, ValueError):
+            seeds = None
+        return {"metadata": bool(t.get("size")), "seeds": seeds if seeds is None or seeds >= 0 else None}
+
     def fetch(self, rec, result, dest_dir):
         if result["kind"] == "folder":
             fetch_folder_recursive(result["id"], dest_dir)
