@@ -40,6 +40,7 @@ import requests
 import backends
 import bridgelog as ev
 import puller
+import trackers
 from backends.base import DONE, DOWNLOADING, UNAVAILABLE, Exists, Full, Rejected
 from common import clog, name_matches, norm, ntfy
 from torrentfile import (
@@ -111,6 +112,13 @@ SLOW_MIN_PROGRESS = float(os.environ.get("SLOW_MIN_PROGRESS", "5"))
 SLOW_MAX_ETA_H = float(os.environ.get("SLOW_MAX_ETA_H", "24"))
 SLOW_CONFIRM = int(os.environ.get("SLOW_CONFIRM", "3600"))
 RATE_WINDOW = 3600
+# Fail-fast (public only): a download that after FAILFAST_AFTER still has no metadata, or whose
+# swarm reports 0 seeds, with nothing downloaded -> fail + re-grab now instead of waiting for the
+# 45-min stall rule (movierulz/tamilmv report fake seeder counts, so dead picks are common).
+# Seedr exposes no swarm data: there it's "still 0%". Dry-run by default: log only.
+FAILFAST = os.environ.get("FAILFAST", "public").lower()  # public|off
+FAILFAST_DRY_RUN = os.environ.get("FAILFAST_DRY_RUN", "true").lower() != "false"
+FAILFAST_AFTER = int(os.environ.get("FAILFAST_AFTER", "600"))
 # Give up on a movie/episode after this many failed attempts (user decision: 10): unmonitor it in the
 # *arr FIRST (marking failed always triggers a re-search), then fail the grab, and silently drop any
 # later grab of it. Dry-run by default: log only.
@@ -830,6 +838,10 @@ def process_new_magnets():
                             "delete the file from the blackhole.",
                         )
                     continue
+            extra = 0
+            if not private and mfile.suffix != ".torrent":
+                # public magnet: more trackers -> the backend finds the swarm sooner (never private)
+                magnet, extra = trackers.add_to_magnet(magnet, trackers.get())
             # movie identity (Radarr only) -> lets a new release supersede an old
             # in-progress 'zombie' transfer of the SAME movie.
             nkey = movie_key(mfile.stem) if cat == "radarr" else None
@@ -902,11 +914,13 @@ def process_new_magnets():
                 rec.update(private=True, seed_rule=rule, indexer=indexer)
             if arr_keys:
                 rec.update(arr_keys=arr_keys, history_ids=info.get("history_ids"))
+            if not private and mfile.suffix == ".torrent":
+                extra = be.extra_trackers(rec, trackers.get())  # public .torrent (e.g. YTS) on the seedbox
             state_file(cat, title).write_text(json.dumps(rec))
             mfile.unlink()
             DROP_STATE.pop(mfile.name, None)
             ev.emit(rec, "added", "queued", private=bool(private), indexer=indexer,
-                    rule=(rule or {}).get("key"), size=keys.get("size"), keys=arr_keys)
+                    rule=(rule or {}).get("key"), size=keys.get("size"), keys=arr_keys, trackers_added=extra)
             prior = ev.attempt_count(arr_keys)
             if prior:
                 ev.emit(rec, "replacement_grabbed", None, attempt=prior + 1)
@@ -986,6 +1000,8 @@ def check_one(be, sp, rec):
         elif now - rec.get("last_progress_at", rec.get("added", now)) > STALL_TIMEOUT:
             handle_stalled(be, cat, rec, sp, prog)
             return
+        if check_failfast(be, cat, rec, sp, prog, now):
+            return
         check_slow(be, cat, rec, sp, prog, now)
         return  # still in progress -> do NOT fetch yet
     if state == DONE:
@@ -1048,6 +1064,42 @@ def check_one(be, sp, rec):
         return
     be.log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
     handle_missing_result(be, cat, rec, sp)
+
+
+def check_failfast(be, cat, rec, sp, prog, now):
+    """Fail-fast for dead public picks (see FAILFAST_*). True if the transfer was failed."""
+    if FAILFAST == "off" or rec.get("private") or rec.get("failfast_flagged"):
+        return False
+    if now - rec.get("added", now) < FAILFAST_AFTER or (rec.get("last_progress") or 0) > 0:
+        return False  # too early, or it has started: alive
+    sw = be.swarm(rec)
+    if sw is None:
+        why = f"still 0% after {(now - rec['added']) / 60:.0f}min" if prog == 0 else None
+    elif not sw.get("metadata"):
+        why = f"no metadata after {(now - rec['added']) / 60:.0f}min"
+    elif sw.get("seeds") == 0:
+        why = "swarm reports 0 seeds"
+    else:
+        why = None
+    if not why:
+        return False
+    if FAILFAST_DRY_RUN:
+        rec["failfast_flagged"] = why
+        save(sp, rec)
+        ev.emit(rec, "would_fail_dead", None, reason=why)
+        be.log(f"[{cat}] '{rec['title']}' looks DEAD ({why}) -> would fail & re-grab (dry-run)")
+        return False
+    if not may_fail(be, f"dead '{rec['title']}'"):
+        return False
+    be.log(f"[{cat}] '{rec['title']}' looks DEAD ({why}) -> failing & re-grabbing")
+    be.cancel(rec)
+    record_failure(be, cat, rec, "dead")
+    retried = arr_mark_failed(cat, rec.get("release_name", rec["title"]), rec.get("history_ids"))
+    rec.update(superseded=True, new_title=None, superseded_at=now, dead=True)
+    save(sp, rec)
+    ev.emit(rec, "failed", "cleaning_up", reason="dead", detail=why, rearr=retried)
+    cleanup_local_partial(cat, rec["title"], old_release=rec.get("release_name"))
+    return True
 
 
 def check_slow(be, cat, rec, sp, prog, now):

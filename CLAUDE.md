@@ -220,6 +220,15 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   24h for 1h → fail + re-grab. **Give-up** (`record_failure`, `GIVE_UP_*`, **dry-run by default**): the
   10th failed attempt for a movie/episode unmonitors it in the *arr BEFORE marking failed (marking failed
   always re-searches), and later grabs of it are dropped. No ntfy for any of these (user decision).
+- **Fail-fast** (`check_failfast`, `FAILFAST*`, public-only, **dry-run by default**): a public download
+  with nothing downloaded after 10 min whose backend reports no metadata or 0 swarm seeds
+  (`Backend.swarm()`; Seedr has no swarm data → "still 0%") is failed + re-grabbed instead of waiting for
+  the 45-min stall. movierulz/tamilmv report a fake seeder count (`FAKE_SEEDERS`), so dead picks are common.
+- **Extra public trackers** (`trackers.py`, `PUBLIC_EXTRA_TRACKERS`): ngosang/trackerslist
+  `trackers_best.txt` (~20), refreshed daily, cached in `config/trackers_best.txt` (a failed fetch keeps the
+  cache). Appended to public magnets (`&tr=`) before any backend; public `.torrent`s on the seedbox get them
+  via `/torrents/addTrackers`. **Never for a private torrent** — public by BOTH checks only (no private flag,
+  indexer not a `SEED_RULES` tracker): announcing a private infohash to public trackers gets accounts banned.
 
 ### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
 

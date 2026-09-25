@@ -37,6 +37,7 @@ class Fake(Backend):
 
     def add(self, drop, magnet):
         self.calls.append(("add", drop.stem))
+        self.added_magnets.append(magnet)
         if self.next_add:
             e, self.next_add = self.next_add, None
             raise e
@@ -92,6 +93,14 @@ class Fake(Backend):
     def reap(self, rec):
         self.calls.append(("reap", rec["title"]))
 
+    def extra_trackers(self, rec, trackers_):
+        self.extra.append(rec["title"])
+        return len(trackers_)
+
+    def swarm(self, rec):
+        t = self.t.get(rec["torrent_hash"])
+        return None if t is None or "swarm" not in t else t["swarm"]
+
 
 FAKE = Fake()
 backends._instances["fake"] = FAKE
@@ -100,6 +109,9 @@ backends._instances["seedr"] = FAKE  # legacy recs without a backend key
 import bridge  # noqa: E402
 import bridgelog  # noqa: E402
 import puller  # noqa: E402
+import trackers  # noqa: E402
+
+PUBLIC_LIST = ["udp://tracker.one:1337/announce", "udp://tracker.two:6969/announce"]
 
 MAGNET = "magnet:?xt=urn:btih:{h}&dn=x"
 
@@ -124,6 +136,9 @@ class EngineTest(unittest.TestCase):
         bridge.arr_mark_failed = lambda cat, rel, hids=None: (self.marked.append(rel), self.actions.append(("fail", rel)))[0] or True
         bridge.unmonitor = lambda cat, keys: self.actions.append(("unmonitor", tuple(keys))) or True
         bridge.SLOW_DRY_RUN, bridge.GIVE_UP_DRY_RUN, bridge.GIVE_UP_AFTER = True, True, 10
+        bridge.FAILFAST_DRY_RUN = True
+        trackers.get = lambda: list(PUBLIC_LIST)  # never fetch from GitHub in tests
+        FAKE.added_magnets, FAKE.extra = [], []
         bridge.notify = lambda *a, **k: None
         FAKE.t.clear()
         FAKE.calls.clear()
@@ -462,3 +477,110 @@ class RetryRulesTest(unittest.TestCase):
             bridge.grab_info, bridge.STALL_TIMEOUT = orig, 2700
         row = bridgelog._db().execute("SELECT detail FROM events WHERE type='replacement_grabbed'").fetchone()
         self.assertEqual(json.loads(row[0])["attempt"], 2)
+
+
+class PublicTrackersTest(unittest.TestCase):
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+    drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
+
+    def test_magnet_dedupe(self):
+        m = "magnet:?xt=urn:btih:" + "a" * 40 + "&tr=udp%3A%2F%2Ftracker.one%3A1337%2Fannounce"
+        out, n = trackers.add_to_magnet(m, PUBLIC_LIST)
+        self.assertEqual(n, 1)
+        self.assertEqual(out.count("tracker.one"), 1)
+        self.assertIn("tracker.two", out)
+
+    def test_public_magnet_gets_trackers(self):
+        self.drop("Public 2020 1080p WEB")
+        bridge.process_new_magnets()
+        self.assertIn("tracker.two", FAKE.added_magnets[0])
+
+    def test_private_indexer_magnet_untouched(self):
+        orig = bridge.grab_info
+        bridge.ARR = {"radarr": ("http://radarr.invalid", "k")}
+        bridge.grab_info = lambda cat, rel: {"indexer": "HD-Space (Prowlarr)", "history_ids": [1], "keys": []}
+        try:
+            self.drop("PrivMag 2021 1080p WEB")
+            bridge.process_new_magnets()
+        finally:
+            bridge.grab_info = orig
+        self.assertNotIn("tracker.one", FAKE.added_magnets[0])
+        self.assertTrue(self.rec("PrivMag 2021 1080p WEB").get("private"))
+
+    def _torrent(self, name, private):
+        import hashlib
+        def be(x):
+            if isinstance(x, int): return b"i%de" % x
+            if isinstance(x, str): x = x.encode()
+            if isinstance(x, bytes): return b"%d:%s" % (len(x), x)
+            if isinstance(x, dict): return b"d" + b"".join(be(k) + be(x[k]) for k in sorted(x)) + b"e"
+        info = {"name": name, "piece length": 16384, "pieces": hashlib.sha1(b"x").digest(), "length": 1}
+        if private:
+            info["private"] = 1
+        (self.bh / f"{name}.torrent").write_bytes(be({"announce": "http://t.invalid/a", "info": info}))
+
+    def test_private_torrent_never_gets_trackers(self):
+        self._torrent("Priv 2019 1080p BluRay", private=True)
+        bridge.process_new_magnets()
+        self.assertEqual(FAKE.extra, [])
+        self.assertTrue(self.rec("Priv 2019 1080p BluRay").get("private"))
+
+    def test_public_torrent_file_gets_trackers(self):
+        self._torrent("Pub 2019 1080p BluRay", private=False)
+        bridge.process_new_magnets()
+        self.assertEqual(FAKE.extra, ["Pub 2019 1080p BluRay"])
+
+    def test_list_fetch_failure_uses_cache(self):
+        import importlib
+        real = importlib.reload(trackers)
+        try:
+            real.CACHE = self.tmp / "trackers.txt"
+            real.CACHE.write_text("udp://cached:1/announce\n")
+            import os as _os
+            _os.utime(real.CACHE, (0, 0))  # stale -> a refresh is attempted
+            real.URL = "http://127.0.0.1:9/nothing"  # refused
+            self.assertEqual(real.get(), ["udp://cached:1/announce"])
+        finally:
+            real.get = lambda: list(PUBLIC_LIST)
+
+
+class FailFastTest(unittest.TestCase):
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+    drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
+
+    def dead(self, title, swarm=None):
+        self.drop(title)
+        self.loop()
+        self.save(title, added=time.time() - 900)
+        if swarm is not None:
+            FAKE.t["h-" + title]["swarm"] = swarm
+
+    def test_dry_run_only_flags(self):
+        self.dead("Dead 2011 1080p WEB", {"metadata": False, "seeds": None})
+        self.loop()
+        r = self.rec("Dead 2011 1080p WEB")
+        self.assertIn("no metadata", r.get("failfast_flagged", ""))
+        self.assertFalse(r.get("superseded"))
+
+    def test_live_fails_zero_seeds(self):
+        bridge.FAILFAST_DRY_RUN = False
+        self.dead("Dead 2012 1080p WEB", {"metadata": True, "seeds": 0})
+        self.loop()
+        r = self.rec("Dead 2012 1080p WEB")
+        self.assertTrue(r.get("dead") and r.get("superseded"))
+        self.assertEqual(self.marked, ["Dead 2012 1080p WEB"])
+
+    def test_started_download_is_alive(self):
+        bridge.FAILFAST_DRY_RUN = False
+        self.dead("Alive 2013 1080p WEB", {"metadata": True, "seeds": 0})
+        self.save("Alive 2013 1080p WEB", last_progress=0.4)
+        FAKE.t["h-Alive 2013 1080p WEB"]["progress"] = 0.4
+        self.loop()
+        self.assertFalse(self.rec("Alive 2013 1080p WEB").get("dead"))
+
+    def test_private_is_skipped(self):
+        bridge.FAILFAST_DRY_RUN = False
+        self.dead("PrivDead 2014 1080p WEB", {"metadata": False, "seeds": 0})
+        self.save("PrivDead 2014 1080p WEB", private=True)
+        self.loop()
+        self.assertFalse(self.rec("PrivDead 2014 1080p WEB").get("dead"))

@@ -183,6 +183,11 @@ services:
       - SLOW_RULE_DRY_RUN=true
       - GIVE_UP_AFTER=10                            # failed attempts per movie/episode -> unmonitor + stop
       - GIVE_UP_DRY_RUN=true
+      - FAILFAST=public                             # public|off: no metadata / 0 seeds after 10 min, nothing downloaded
+      - FAILFAST_DRY_RUN=true
+      # --- public torrents only: add ngosang/trackerslist's best ~20 trackers (daily, cached in config).
+      #     NEVER applied to private torrents (would leak their infohash -> tracker ban).
+      - PUBLIC_EXTRA_TRACKERS=on
       # --- seedbox backend (qBittorrent over SSH, backends/qbit.py). Secrets are NOT here: the SSH
       #     keys, qBittorrent password and pinned host key come from the vault (vault.py, token in
       #     media-bridge/config/bws_token). Only used once BRIDGE_ROUTE names "seedbox".

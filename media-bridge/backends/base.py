@@ -131,5 +131,15 @@ class Backend:
         partial snatch as a hit-and-run."""
         return None
 
+    def swarm(self, rec):
+        """What the backend knows about the transfer's swarm, for the fail-fast rule:
+        {"metadata": bool, "seeds": int|None}, or None if it can't tell (Seedr)."""
+        return None
+
+    def extra_trackers(self, rec, trackers):
+        """Add public trackers to an already-added PUBLIC torrent (bridge.py only calls this for
+        public ones). Returns how many were added; 0 if unsupported."""
+        return 0
+
     def reap(self, rec):
         """Called every loop for a tombstoned rec until the bridge's grace window closes."""

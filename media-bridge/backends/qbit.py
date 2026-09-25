@@ -501,6 +501,25 @@ class QbitBackend(Backend):
             return DOWNLOADING, 100.0
         return DONE, {"name": t.get("name", rec["title"]), "hash": t["hash"], "save_path": t.get("save_path", "")}
 
+    def swarm(self, rec):
+        t = self._torrent(rec)
+        if t is None:
+            return None
+        # num_complete = seeds the trackers report for the whole swarm; num_seeds = connected now
+        seeds = max(t.get("num_complete", -1), t.get("num_seeds", 0))
+        return {"metadata": t.get("state") != "metaDL", "seeds": seeds if seeds >= 0 else None}
+
+    def extra_trackers(self, rec, trackers):
+        h = rec.get("torrent_hash")
+        if not (h and trackers):
+            return 0
+        try:
+            self._api("POST", "/torrents/addTrackers", data={"hash": h, "urls": "\n".join(trackers)})
+            return len(trackers)
+        except Exception as e:
+            log(f"    (warning) could not add public trackers to {h}: {e}")
+            return 0
+
     def partial_bytes(self, rec):
         t = self._torrent(rec)
         return None if t is None else t.get("completed", t.get("downloaded", 0))
