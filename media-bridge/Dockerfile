@@ -5,6 +5,7 @@ WORKDIR /app
 # via the host Docker socket (yt-dlp/ffmpeg stay out of this image).
 RUN pip install --no-cache-dir requests docker
 
-COPY common.py seedr.py seedr_ftp.py reaper.py movierulz.py tamilmv.py daddylive.py youtube.py main.py /app/
+COPY common.py torrentfile.py bridge.py seedr_ftp.py reaper.py movierulz.py tamilmv.py daddylive.py youtube.py main.py /app/
+COPY backends/ /app/backends/
 
 CMD ["python", "-u", "main.py"]

@@ -4,7 +4,8 @@ media-bridge entrypoint.
 
 Runs six formerly-separate custom services as supervised daemon threads inside
 one container (all off-VPN, on the default bridge network):
-  * seedr    -- Seedr <-> Sonarr/Radarr blackhole bridge   (30s poll)
+  * bridge   -- Sonarr/Radarr blackhole bridge (30s poll) over pluggable download
+               backends (backends/: Seedr today); BRIDGE_ROUTE picks one per drop
   * reaper   -- Jellyfin "watched movie" -> Radarr reaper   (6h)
   * movierulz-- 5movierulz crawler + Torznab feed for Prowlarr (crawl ~1h, HTTP server)
   * tamilmv  -- tamilmv/tamilblasters forum crawler + Torznab feed :8005 (replaces MediaFusion)
@@ -14,12 +15,13 @@ one container (all off-VPN, on the default bridge network):
 
 Each unit runs in its own thread wrapped so a crash logs + ntfy-alerts + restarts
 without taking down the others (threads are I/O-bound; requests releases the GIL,
-so seedr's large blocking downloads don't stall the Torznab server or crawler).
+so the bridge's large blocking downloads don't stall the Torznab server or crawler).
 """
+import os
 import threading
 import time
 
-import seedr
+import bridge
 import reaper
 import movierulz
 import tamilmv
@@ -45,17 +47,25 @@ def supervise(name, target):
     return t
 
 
+# DaddyLive is switched off (2026-09-24) but kept in the tree; DADDYLIVE_ENABLED=true brings it back.
+DADDYLIVE_ENABLED = os.environ.get("DADDYLIVE_ENABLED", "true").lower() == "true"
+
+
 def main():
-    clog("main", "media-bridge starting: seedr + reaper + movierulz + tamilmv + daddylive + youtube")
-    supervise("seedr", seedr.run_forever)
+    parts = ["bridge", "reaper", "movierulz", "tamilmv"] + (["daddylive"] if DADDYLIVE_ENABLED else []) + ["youtube"]
+    clog("main", "media-bridge starting: " + " + ".join(parts))
+    supervise("bridge", bridge.run_forever)
     supervise("reaper", reaper.run_forever)
     supervise("movierulz-crawler", movierulz.run_crawler)
     supervise("movierulz-torznab", movierulz.serve_torznab)
     supervise("tamilmv-crawler", tamilmv.run_crawler)
     supervise("tamilmv-torznab", tamilmv.serve_torznab)
-    supervise("daddylive-refresher", daddylive.run_refresher)
-    supervise("daddylive-precheck", daddylive.run_precheck)
-    supervise("daddylive-server", daddylive.serve)
+    if DADDYLIVE_ENABLED:
+        supervise("daddylive-refresher", daddylive.run_refresher)
+        supervise("daddylive-precheck", daddylive.run_precheck)
+        supervise("daddylive-server", daddylive.serve)
+    else:
+        clog("main", "daddylive disabled (DADDYLIVE_ENABLED=false)")
     supervise("youtube-worker", youtube.run_worker)
     supervise("youtube-server", youtube.serve)
     while True:
