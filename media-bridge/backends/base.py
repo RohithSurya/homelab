@@ -91,9 +91,20 @@ class Backend:
         raise NotImplementedError
 
     def fetch(self, rec, result, dest_dir):
-        """Copy the finished result into dest_dir (= downloads/<cat>/<release_name>), which the
-        *arr imports from. Must leave only complete files under their final names."""
+        """Copy the finished result into dest_dir (the staging dir). Must leave only complete
+        files under their final names (partials as *.part)."""
         raise NotImplementedError
+
+    def prepare_fetch(self, rec, result):
+        """Bridge thread: whatever the pull needs from the backend's API (e.g. the file list), so
+        the pull worker never shares an API session with the bridge loop. Default: the result."""
+        return result
+
+    def pull(self, rec, plan, dest_dir, cancel):
+        """Pull worker thread: copy the finished transfer described by `plan` into dest_dir,
+        using connections of its own. `cancel` is a threading.Event to honour between chunks
+        (optional). Default: fetch()."""
+        self.fetch(rec, plan, dest_dir)
 
     def cancel(self, rec):
         raise NotImplementedError

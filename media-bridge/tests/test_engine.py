@@ -98,6 +98,8 @@ backends._instances["fake"] = FAKE
 backends._instances["seedr"] = FAKE  # legacy recs without a backend key
 
 import bridge  # noqa: E402
+import bridgelog  # noqa: E402
+import puller  # noqa: E402
 
 MAGNET = "magnet:?xt=urn:btih:{h}&dn=x"
 
@@ -109,11 +111,19 @@ class EngineTest(unittest.TestCase):
         bridge.STATE_DIR = self.tmp / "blackhole" / ".bridge-state"
         bridge.INCOMING = self.tmp / "downloads" / ".incoming"
         bridge.ARR = {}
+        bridgelog._conn = None
+        bridgelog.DB_PATH = str(self.tmp / "bridge.db")
+        puller.DATA_ROOT = str(self.tmp)
+        puller.PULL_MIN_FREE = 0
+        puller._jobs.clear()
         for d in (bridge.FAIL_COUNTS, bridge.WARNED, bridge.INDEXERS, bridge.INDEXER_TRIES,
                   bridge.FAILURES, bridge.BREAKER_UNTIL):
             d.clear()
         self.marked = []
-        bridge.arr_mark_failed = lambda cat, rel: self.marked.append(rel) or True
+        self.actions = []
+        bridge.arr_mark_failed = lambda cat, rel, hids=None: (self.marked.append(rel), self.actions.append(("fail", rel)))[0] or True
+        bridge.unmonitor = lambda cat, keys: self.actions.append(("unmonitor", tuple(keys))) or True
+        bridge.SLOW_DRY_RUN, bridge.GIVE_UP_DRY_RUN, bridge.GIVE_UP_AFTER = True, True, 10
         bridge.notify = lambda *a, **k: None
         FAKE.t.clear()
         FAKE.calls.clear()
@@ -144,6 +154,7 @@ class EngineTest(unittest.TestCase):
     def loop(self):
         bridge.process_new_magnets()
         bridge.check_completions()
+        puller.run_pending()  # the pull worker, synchronously
 
     # --- staged delivery -------------------------------------------------------------------------
 
@@ -151,7 +162,11 @@ class EngineTest(unittest.TestCase):
         self.drop("Real Steel 2011 1080p BluRay x264")
         self.loop()
         FAKE.t["h-Real Steel 2011 1080p BluRay x264"]["done"] = True
-        self.loop()
+        self.loop()  # pull queued + run by the worker
+        self.assertTrue(self.rec("Real Steel 2011 1080p BluRay x264").get("pulling"))
+        self.assertFalse((self.tmp / "downloads/radarr/Real Steel 2011 1080p BluRay x264").exists(),
+                         "nothing in the watch folder until the pull is done and delivered")
+        self.loop()  # bridge sees the finished job -> deliver + discard
         dest = self.tmp / "downloads/radarr/Real Steel 2011 1080p BluRay x264"
         self.assertTrue((dest / "movie.mkv").exists())
         fetched_to = [c[1] for c in FAKE.calls if c[0] == "fetch_to"][0]
@@ -165,7 +180,8 @@ class EngineTest(unittest.TestCase):
         self.loop()
         FAKE.t["h-Broken 2019 1080p WEB"]["done"] = True
         FAKE.fetch_error = "boom"
-        self.loop()
+        self.loop()  # worker fails
+        self.loop()  # bridge sees the failure
         self.assertFalse((self.tmp / "downloads/radarr/Broken 2019 1080p WEB").exists())
         self.assertTrue(self.rec("Broken 2019 1080p WEB").get("fetch_failing_since"))
 
@@ -204,6 +220,7 @@ class EngineTest(unittest.TestCase):
         self.loop()
         self.save("Priv 2021 1080p WEB", private=True, seed_rule={"hours": 48, "ratio": None, "key": "hd-space"})
         FAKE.t["h-Priv 2021 1080p WEB"]["done"] = True
+        self.loop()
         self.loop()
         self.assertTrue(self.rec("Priv 2021 1080p WEB").get("held"))
         del FAKE.t["h-Priv 2021 1080p WEB"]  # vanished from the backend listing
@@ -292,13 +309,14 @@ class EngineTest(unittest.TestCase):
     # --- routing / indexer ------------------------------------------------------------------------
 
     def test_private_magnet_detected_by_indexer(self):
-        orig = bridge.grab_indexer
-        bridge.grab_indexer = lambda cat, rel: "HD-Space (Prowlarr)"
+        orig = bridge.grab_info
+        bridge.ARR = {"radarr": ("http://radarr.invalid", "k")}
+        bridge.grab_info = lambda cat, rel: {"indexer": "HD-Space (Prowlarr)", "history_ids": [7], "keys": ["radarr:movie:5"]}
         try:
             self.drop("Freeleech 2015 1080p BluRay")
             bridge.process_new_magnets()
         finally:
-            bridge.grab_indexer = orig
+            bridge.grab_info = orig
         r = self.rec("Freeleech 2015 1080p BluRay")
         self.assertTrue(r.get("private"))
         self.assertEqual(r["seed_rule"]["key"], "hd-space")
@@ -314,3 +332,133 @@ class EngineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EventLogTest(unittest.TestCase):
+    # same fixture and helpers as EngineTest, without re-running its tests
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+    drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
+
+    def test_timeline_of_a_public_transfer(self):
+        self.drop("Karuppu 2026 1080p WEB")
+        self.loop()
+        FAKE.t["h-Karuppu 2026 1080p WEB"]["progress"] = 42.0
+        self.loop()
+        FAKE.t["h-Karuppu 2026 1080p WEB"]["done"] = True
+        self.loop()
+        self.loop()
+        rows = bridgelog._db().execute(
+            "SELECT type, phase FROM events WHERE release=? ORDER BY id", ("Karuppu 2026 1080p WEB",)).fetchall()
+        self.assertEqual([r[0] for r in rows], ["added", "phase", "phase", "delivered", "done"])
+        self.assertEqual([r[1] for r in rows], ["queued", "downloading", "pulling", "delivered", "done"])
+
+    def test_waiting_reason_logged_once(self):
+        FAKE.full_retries = None
+        try:
+            for _ in range(4):
+                FAKE.next_add = Full(1e9)
+                if not (self.bh / "Big 2018 2160p.magnet").exists():
+                    self.drop("Big 2018 2160p", h="9" * 40)
+                bridge.process_new_magnets()
+        finally:
+            FAKE.full_retries = 5
+        n = bridgelog._db().execute("SELECT COUNT(*) FROM events WHERE type='waiting'").fetchone()[0]
+        self.assertEqual(n, 1, "a waiting drop is logged when its reason changes, not every poll")
+
+    def test_event_log_failure_never_breaks_a_transfer(self):
+        bridgelog._conn = None
+        bridgelog.DB_PATH = "/nonexistent/dir/bridge.db"
+        self.drop("Resilient 2020 1080p WEB")
+        self.loop()
+        self.assertIn("Resilient 2020 1080p WEB", self.recs())
+
+
+class RetryRulesTest(unittest.TestCase):
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+    drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
+
+    def age(self, title, hours, progress):
+        """Make a transfer look `hours` old, progressing at progress%/h over the last hour."""
+        now = time.time()
+        self.save(title, added=now - hours * 3600, last_progress=progress, last_progress_at=now,
+                  rate=[[now - 3600, max(progress - 0.5, 0)], [now - 60, progress]])
+        FAKE.t["h-" + title]["progress"] = progress
+
+    def test_slow_under_5_percent_dry_run_only_flags(self):
+        self.drop("Crawl 2019 1080p WEB")
+        self.loop()
+        self.age("Crawl 2019 1080p WEB", 2.5, 3.0)
+        self.loop()
+        r = self.rec("Crawl 2019 1080p WEB")
+        self.assertIn("under 5%", r.get("slow_flagged", ""))
+        self.assertFalse(r.get("superseded"))
+        self.assertEqual(self.marked, [])
+
+    def test_slow_live_fails_public_and_regrabs(self):
+        bridge.SLOW_DRY_RUN = False
+        self.drop("Crawl 2019 1080p WEB")
+        self.loop()
+        self.age("Crawl 2019 1080p WEB", 2.5, 3.0)
+        self.loop()
+        r = self.rec("Crawl 2019 1080p WEB")
+        self.assertTrue(r.get("slow") and r.get("superseded"))
+        self.assertIn(("cancel", "Crawl 2019 1080p WEB"), FAKE.calls)
+        self.assertEqual(self.marked, ["Crawl 2019 1080p WEB"])
+
+    def test_slow_eta_needs_an_hour_of_confirmation(self):
+        bridge.SLOW_DRY_RUN = False
+        self.drop("Drip 2020 1080p WEB")
+        self.loop()
+        self.age("Drip 2020 1080p WEB", 3, 40.0)  # 0.5%/h -> 120h left
+        self.loop()
+        r = self.rec("Drip 2020 1080p WEB")
+        self.assertTrue(r.get("slow_since") and not r.get("superseded"), "first sighting only starts the clock")
+        self.save("Drip 2020 1080p WEB", slow_since=time.time() - 3700)
+        self.loop()
+        self.assertTrue(self.rec("Drip 2020 1080p WEB").get("slow"))
+
+    def test_slow_rule_skips_private_by_default(self):
+        bridge.SLOW_DRY_RUN = False
+        self.drop("Rare 2010 1080p BluRay")
+        self.loop()
+        self.save("Rare 2010 1080p BluRay", private=True)
+        self.age("Rare 2010 1080p BluRay", 5, 1.0)
+        self.loop()
+        self.assertFalse(self.rec("Rare 2010 1080p BluRay").get("slow_flagged") or
+                         self.rec("Rare 2010 1080p BluRay").get("slow"))
+
+    def test_give_up_unmonitors_before_failing_then_drops_later_grabs(self):
+        bridge.GIVE_UP_DRY_RUN, bridge.GIVE_UP_AFTER = False, 2
+        bridge.ARR = {"radarr": ("http://radarr.invalid", "k")}
+        orig = bridge.grab_info
+        bridge.grab_info = lambda cat, rel: {"indexer": "1337x", "history_ids": [1], "keys": ["radarr:movie:42"]}
+        bridge.STALL_TIMEOUT = 0
+        try:
+            for i, title in enumerate(["Cursed 2001 720p WEB", "Cursed 2001 1080p WEB"]):
+                self.drop(title, h=str(i) * 40)
+                self.loop()
+                self.loop()  # no progress -> stalled -> attempt counted
+            self.assertEqual(self.actions[-2:], [("unmonitor", ("radarr:movie:42",)), ("fail", "Cursed 2001 1080p WEB")],
+                             "unmonitor must come BEFORE marking failed (which triggers a re-search)")
+            self.drop("Cursed 2001 2160p WEB", h="7" * 40)
+            bridge.process_new_magnets()
+            self.assertFalse((self.bh / "Cursed 2001 2160p WEB.magnet").exists())
+            self.assertNotIn("Cursed 2001 2160p WEB", self.recs())
+        finally:
+            bridge.grab_info, bridge.STALL_TIMEOUT = orig, 2700
+
+    def test_replacement_grab_is_recorded_with_attempt_number(self):
+        bridge.ARR = {"radarr": ("http://radarr.invalid", "k")}
+        orig = bridge.grab_info
+        bridge.grab_info = lambda cat, rel: {"indexer": "1337x", "history_ids": [1], "keys": ["radarr:movie:9"]}
+        bridge.STALL_TIMEOUT = 0
+        try:
+            self.drop("Again 2005 720p WEB", h="1" * 40)
+            self.loop()
+            self.loop()
+            self.drop("Again 2005 1080p WEB", h="2" * 40)
+            bridge.process_new_magnets()
+        finally:
+            bridge.grab_info, bridge.STALL_TIMEOUT = orig, 2700
+        row = bridgelog._db().execute("SELECT detail FROM events WHERE type='replacement_grabbed'").fetchone()
+        self.assertEqual(json.loads(row[0])["attempt"], 2)

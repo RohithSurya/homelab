@@ -5,7 +5,8 @@ media-bridge entrypoint.
 Runs six formerly-separate custom services as supervised daemon threads inside
 one container (all off-VPN, on the default bridge network):
   * bridge   -- Sonarr/Radarr blackhole bridge (30s poll) over pluggable download
-               backends (backends/: Seedr today); BRIDGE_ROUTE picks one per drop
+               backends (backends/: Seedr, seedbox); BRIDGE_ROUTE picks one per drop.
+               A second thread (puller) pulls finished transfers home in the background.
   * reaper   -- Jellyfin "watched movie" -> Radarr reaper   (6h)
   * movierulz-- 5movierulz crawler + Torznab feed for Prowlarr (crawl ~1h, HTTP server)
   * tamilmv  -- tamilmv/tamilblasters forum crawler + Torznab feed :8005 (replaces MediaFusion)
@@ -22,6 +23,7 @@ import threading
 import time
 
 import bridge
+import puller
 import reaper
 import movierulz
 import tamilmv
@@ -55,6 +57,7 @@ def main():
     parts = ["bridge", "reaper", "movierulz", "tamilmv"] + (["daddylive"] if DADDYLIVE_ENABLED else []) + ["youtube"]
     clog("main", "media-bridge starting: " + " + ".join(parts))
     supervise("bridge", bridge.run_forever)
+    supervise("bridge-puller", puller.run_worker)  # pulls finished transfers home in the background
     supervise("reaper", reaper.run_forever)
     supervise("movierulz-crawler", movierulz.run_crawler)
     supervise("movierulz-torznab", movierulz.serve_torznab)

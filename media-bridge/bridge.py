@@ -38,6 +38,8 @@ import time
 import requests
 
 import backends
+import bridgelog as ev
+import puller
 from backends.base import DONE, DOWNLOADING, UNAVAILABLE, Exists, Full, Rejected
 from common import clog, name_matches, norm, ntfy
 from torrentfile import (
@@ -51,6 +53,8 @@ from torrentfile import (
 FAIL_COUNTS = {}  # blackhole filename -> consecutive "backend full" attempts (in-memory)
 INDEXER_TRIES = {}  # blackhole filename -> history lookups that found no grab yet (in-memory)
 INDEXER_MAX_TRIES = 5  # the *arr writes the drop before its history row; retry a few polls
+DROP_STATE = {}  # blackhole filename -> last waiting reason logged as an event (in-memory)
+BACKEND_UP = {}  # backend name -> last known reachability (events only on change)
 WARNED = set()  # blackhole filenames already ntfy'd as un-routable (in-memory)
 INDEXERS = {}  # blackhole filename -> indexer it was grabbed from (in-memory)
 TOMBSTONE_GRACE = (
@@ -96,6 +100,22 @@ BREAKER_UNTIL = {}  # backend name -> epoch until which automatic failing is pau
 # it is failed in the *arr but kept as an undelivered seeding hold, for at most PARTIAL_HOLD.
 PARTIAL_MIN_BYTES = int(os.environ.get("PARTIAL_MIN_BYTES", str(50 * 1024 * 1024)))
 PARTIAL_HOLD = int(os.environ.get("PARTIAL_HOLD", str(7 * 86400)))
+# Slow rule (user decision 2026-09-25): fail + re-grab a download still under SLOW_MIN_PROGRESS% after
+# SLOW_MIN_AGE, or whose projected time left (the bridge's own rate over ~1h, not qBittorrent's
+# jittery eta) stays above SLOW_MAX_ETA_H for SLOW_CONFIRM. Scope public|all|off: private swarms are
+# thin by nature, and a private partial can't be cancelled anyway. Dry-run by default: log only.
+SLOW_RULE = os.environ.get("SLOW_RULE", "public").lower()
+SLOW_DRY_RUN = os.environ.get("SLOW_RULE_DRY_RUN", "true").lower() != "false"
+SLOW_MIN_AGE = int(os.environ.get("SLOW_MIN_AGE", "7200"))
+SLOW_MIN_PROGRESS = float(os.environ.get("SLOW_MIN_PROGRESS", "5"))
+SLOW_MAX_ETA_H = float(os.environ.get("SLOW_MAX_ETA_H", "24"))
+SLOW_CONFIRM = int(os.environ.get("SLOW_CONFIRM", "3600"))
+RATE_WINDOW = 3600
+# Give up on a movie/episode after this many failed attempts (user decision: 10): unmonitor it in the
+# *arr FIRST (marking failed always triggers a re-search), then fail the grab, and silently drop any
+# later grab of it. Dry-run by default: log only.
+GIVE_UP_AFTER = int(os.environ.get("GIVE_UP_AFTER", "10"))
+GIVE_UP_DRY_RUN = os.environ.get("GIVE_UP_DRY_RUN", "true").lower() != "false"
 # A transfer its backend can't see (UNAVAILABLE) for this long is ntfy'd once.
 UNAVAILABLE_ALERT = int(os.environ.get("UNAVAILABLE_ALERT", "7200"))
 ARR = {
@@ -187,27 +207,45 @@ def tracker_rule_key(indexer):
     return next((k for k in SEED_RULES if k != "private-default" and ni and norm(k) in ni), None)
 
 
-def grab_indexer(cat, release_name):
-    """The indexer Radarr/Sonarr grabbed release_name from (its newest 'grabbed' history
-    record), or None. Uses plain requests, like arr_mark_failed."""
+def grab_info(cat, release_name):
+    """What Radarr/Sonarr recorded when it grabbed release_name: {'indexer', 'history_ids',
+    'keys'}, or None if no 'grabbed' history row matches (yet). A season pack writes one row per
+    episode at the same moment -> every episode is a key. Keys ('radarr:movie:<id>',
+    'sonarr:episode:<id>') link retries of the same movie/episode across different releases."""
     url, key = ARR.get(cat, (None, None))
     if not url or not key:
         return None
     try:
         h = requests.get(
             f"{url}/api/v3/history",
-            params={"eventType": 1, "pageSize": 50, "sortKey": "date", "sortDirection": "descending"},
+            params={"eventType": 1, "pageSize": 200, "sortKey": "date", "sortDirection": "descending"},
             headers={"X-Api-Key": key},
             timeout=30,
         )
         h.raise_for_status()
         nrel = norm(release_name)
-        for r in h.json().get("records", []):
-            if norm(r.get("sourceTitle", "")) == nrel:
-                return (r.get("data") or {}).get("indexer")
+        rows = [r for r in h.json().get("records", []) if norm(r.get("sourceTitle", "")) == nrel]
+        if not rows:
+            return None
+        newest = rows[0]["date"][:16]  # same grab = same minute
+        rows = [r for r in rows if r["date"][:16] == newest]
+        if cat == "radarr":
+            keys = sorted({f"radarr:movie:{r['movieId']}" for r in rows if r.get("movieId")})
+        else:
+            keys = sorted({f"sonarr:episode:{r['episodeId']}" for r in rows if r.get("episodeId")})
+        return {
+            "indexer": (rows[0].get("data") or {}).get("indexer"),
+            "history_ids": [r["id"] for r in rows],
+            "keys": keys,
+        }
     except Exception as e:
-        log(f"    (warn) {cat} history lookup for the indexer failed: {e}")
+        log(f"    (warn) {cat} history lookup failed: {e}")
     return None
+
+
+def grab_indexer(cat, release_name):
+    info = grab_info(cat, release_name)
+    return info and info.get("indexer")
 
 
 def route(private):
@@ -225,6 +263,25 @@ def backend_for(rec):
     except Exception as e:
         log(f"backend '{name}' unavailable ({e!r}); skipping its transfer '{rec.get('title')}'")
         return None
+
+
+def drop_wait(cat, mfile, reason, **detail):
+    """A drop is waiting in the blackhole: log it as an event only when the reason changes."""
+    if DROP_STATE.get(mfile.name) != reason:
+        DROP_STATE[mfile.name] = reason
+        ev.emit(ev.drop_ref(cat, mfile), "waiting", reason, **detail)
+
+
+def save(sp, rec):
+    sp.write_text(json.dumps(rec))
+
+
+def set_phase(sp, rec, phase, **detail):
+    """Record a phase change (and only a change) as an event."""
+    if rec.get("phase") != phase:
+        rec["phase"] = phase
+        save(sp, rec)
+        ev.emit(rec, "phase", phase, **detail)
 
 
 def held(rec):
@@ -251,11 +308,12 @@ def cleanup_local_partial(cat, old_title, new_title=None, old_release=None):
     # remove a superseded release's partially-fetched download dir. The dir is named after
     # the *arr release (see check_completions) -- or, for dirs written before that, after the
     # backend's result name (often sanitized) -- so match either name fuzzily.
+    busy = puller.busy_paths()
     for base in (DATA / "downloads" / cat, INCOMING / cat):
         if not base.exists():
             continue
         for d in base.iterdir():
-            if not d.is_dir():
+            if not d.is_dir() or str(d) in busy:  # a running pull owns (and cleans) its own dir
                 continue
             if new_title and name_matches(d.name, new_title):  # never the replacement's dir
                 continue
@@ -301,6 +359,8 @@ def may_fail(be, what):
     if len(recent) >= BREAKER_FAILS:
         BREAKER_UNTIL[be.name] = now + BREAKER_PAUSE
         FAILURES[be.name] = []
+        ev.emit({"tid": f"backend:{be.name}", "backend": be.name}, "circuit_breaker", None,
+                failures=len(recent), held_back=what)
         be.log(
             f"CIRCUIT BREAKER: {len(recent)} automatic failures on {be.label} within "
             f"{BREAKER_WINDOW // 60}min -> not failing anything there for {BREAKER_PAUSE // 60}min ({what} held back)"
@@ -350,6 +410,44 @@ def freeze_clocks(be, recs):
     be.log(f"{be.label} was unobserved for {gap / 60:.0f}min -> deadlines of {shifted} transfer(s) pushed back")
 
 
+def unmonitor(cat, keys):
+    """Stop the *arr searching for these movies/episodes (give-up). Plain requests."""
+    url, key = ARR.get(cat, (None, None))
+    if not url or not key:
+        return False
+    ids = [int(k.rsplit(":", 1)[1]) for k in keys]
+    try:
+        if cat == "radarr":
+            r = requests.put(f"{url}/api/v3/movie/editor", json={"movieIds": ids, "monitored": False},
+                             headers={"X-Api-Key": key}, timeout=30)
+        else:
+            r = requests.put(f"{url}/api/v3/episode/monitor", json={"episodeIds": ids, "monitored": False},
+                             headers={"X-Api-Key": key}, timeout=30)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log(f"    (warn) {cat} unmonitor {keys} failed: {e}")
+        return False
+
+
+def record_failure(be, cat, rec, reason):
+    """Count a failed attempt for the transfer's movie/episodes; on the GIVE_UP_AFTER-th, give up
+    on them. Called BEFORE arr_mark_failed: unmonitoring must come first, because marking a grab
+    failed always makes the *arr search again."""
+    keys = rec.get("arr_keys") or []
+    n = ev.attempt_failed(keys, rec.get("release_name"), reason)
+    if not keys or n < GIVE_UP_AFTER:
+        return
+    if GIVE_UP_DRY_RUN:
+        ev.emit(rec, "would_give_up", None, attempts=n, keys=keys)
+        be.log(f"[{cat}] '{rec['title']}': {n} failed attempts for {keys} -> WOULD give up (dry-run)")
+        return
+    done = unmonitor(cat, keys)
+    ev.mark_gave_up(keys)
+    ev.emit(rec, "gave_up", None, attempts=n, keys=keys, unmonitored=done)
+    be.log(f"[{cat}] '{rec['title']}': {n} failed attempts -> gave up on {keys} (unmonitored={done})")
+
+
 def keep_private_partial(be, cat, rec, sp, why):
     """A private torrent that already downloaded something must not be deleted (trackers count a
     partial snatch as a hit-and-run). Fail it in the *arr so it re-grabs, but keep the torrent
@@ -360,9 +458,11 @@ def keep_private_partial(be, cat, rec, sp, why):
     if not got or got < PARTIAL_MIN_BYTES:
         return False
     release = rec.get("release_name", rec["title"])
-    arr_mark_failed(cat, release)
+    record_failure(be, cat, rec, why)
+    arr_mark_failed(cat, release, rec.get("history_ids"))
     rec.update(held=True, no_deliver=True, hold_max_until=time.time() + PARTIAL_HOLD, partial_reason=why)
     sp.write_text(json.dumps(rec))
+    ev.emit(rec, "partial_kept", "seeding_undelivered", reason=why, downloaded=got)
     be.log(
         f"[{cat}] '{rec['title']}' {why}, but it is private with {got / 2**20:.0f} MiB downloaded -> "
         f"failed in the *arr, torrent KEPT seeding (max {PARTIAL_HOLD // 86400}d) to avoid a hit-and-run"
@@ -393,9 +493,12 @@ def purge_superseded(cat, new_key, new_name):
             continue
         if be is not None:
             be.cancel(rec)
+        if rec.get("tid"):
+            puller.cancel(rec["tid"])
         cleanup_local_partial(cat, rec["title"], new_name, rec.get("release_name"))
         rec.update(superseded=True, new_title=new_name, superseded_at=time.time())
         sp.write_text(json.dumps(rec))  # tombstone -> reaped by check_completions
+        ev.emit(rec, "superseded", "cleaning_up", by=new_name)
         n += 1
         tid = rec.get("user_torrent_id") or rec.get("torrent_hash")
         log(f"    [override] superseded '{rec['title']}' (transfer {tid}); deferring result cleanup")
@@ -406,13 +509,28 @@ def notify(title, body):
     ntfy(title, body, priority="high", tags="warning")
 
 
-def arr_mark_failed(cat, release_name):
-    """Find the most recent 'grabbed' history record for release_name and mark it failed
-    -> Radarr/Sonarr blocklists it and (autoRedownloadFailed) grabs a different release.
+def arr_mark_failed(cat, release_name, history_ids=None):
+    """Mark the grab failed -> Radarr/Sonarr blocklists it and (autoRedownloadFailed) grabs a
+    different release. By the history ids recorded at add time when known (every episode of a
+    pack; the name search below only sees the newest 100 rows and marks one episode), else by
+    finding the newest 'grabbed' row for release_name.
     Uses plain requests, never a backend session (Seedr's carries Basic-auth we must not leak)."""
     url, key = ARR.get(cat, (None, None))
     if not url or not key:
         return False
+    if history_ids:
+        ok = False
+        for hid in history_ids:
+            try:
+                requests.post(
+                    f"{url}/api/v3/history/failed/{hid}", headers={"X-Api-Key": key}, timeout=30
+                ).raise_for_status()
+                ok = True
+            except Exception as e:
+                log(f"    (warn) {cat} mark-failed of history {hid} failed: {e}")
+        if ok:
+            log(f"    marked {cat} history {history_ids} failed -> blocklist + auto re-search")
+            return True
     try:
         h = requests.get(
             f"{url}/api/v3/history",
@@ -456,11 +574,13 @@ def release_or_hold(be, cat, rec, sp, result):
         until = be.start_hold(rec, result)
         rec["held"] = True
         sp.write_text(json.dumps(rec))
+        ev.emit(rec, "hold_started", "seeding_hold", until=until, rule=rec.get("seed_rule"))
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(until)) if until else "its seeding rule is met"
         be.log(f"[{cat}] '{rec['title']}' is private -> holding on {be.label} to seed until {when}")
         return
     be.discard(rec, result)
     sp.unlink()
+    ev.emit(rec, "done", "done")
 
 
 def handle_stalled(be, cat, rec, sp, prog):
@@ -474,7 +594,8 @@ def handle_stalled(be, cat, rec, sp, prog):
         f"[{cat}] '{title}' STALLED on {be.label} ({prog}% for >{STALL_TIMEOUT // 60}min) -> failing & retrying"
     )
     be.cancel(rec)  # free the dead transfer
-    retried = arr_mark_failed(cat, release)
+    record_failure(be, cat, rec, "stalled")
+    retried = arr_mark_failed(cat, release, rec.get("history_ids"))
     notify(
         f"Stalled: {release}",
         f"Stuck at {prog}% for {STALL_TIMEOUT // 60} min on {be.label}. "
@@ -487,6 +608,7 @@ def handle_stalled(be, cat, rec, sp, prog):
     # tombstone -> the reaper cleans any partial result/local dir and we stop re-failing
     rec.update(superseded=True, new_title=None, superseded_at=time.time(), stalled=True)
     sp.write_text(json.dumps(rec))
+    ev.emit(rec, "failed", "cleaning_up", reason="stalled", progress=prog, rearr=retried)
     cleanup_local_partial(cat, title, old_release=release)
 
 
@@ -500,6 +622,7 @@ def handle_missing_result(be, cat, rec, sp):
     if since is None:
         rec["result_missing_since"] = now
         sp.write_text(json.dumps(rec))
+        ev.emit(rec, "result_missing", "waiting_for_result")
         return
     if now - since < RESULT_TIMEOUT:
         return
@@ -510,7 +633,8 @@ def handle_missing_result(be, cat, rec, sp):
     be.log(
         f"[{cat}] '{title}' finished but result MISSING from {be.label} for >{RESULT_TIMEOUT // 60}min -> failing"
     )
-    retried = arr_mark_failed(cat, release)
+    record_failure(be, cat, rec, "missing_result")
+    retried = arr_mark_failed(cat, release, rec.get("history_ids"))
     notify(
         f"Missing result: {release}",
         f"{be.label} finished it but never produced a file for {RESULT_TIMEOUT // 60} min. "
@@ -522,6 +646,7 @@ def handle_missing_result(be, cat, rec, sp):
     )
     rec.update(superseded=True, new_title=None, superseded_at=now, missing_result=True)
     sp.write_text(json.dumps(rec))
+    ev.emit(rec, "failed", "cleaning_up", reason="missing_result", rearr=retried)
     cleanup_local_partial(cat, title, old_release=release)
 
 
@@ -536,6 +661,7 @@ def handle_fetch_failure(be, cat, rec, sp, err, result):
     if since is None:
         rec["fetch_failing_since"] = now
         sp.write_text(json.dumps(rec))
+        ev.emit(rec, "fetch_failing", "fetch_retrying", error=err)
         return
     if now - since < FETCH_TIMEOUT:
         return
@@ -548,7 +674,8 @@ def handle_fetch_failure(be, cat, rec, sp, err, result):
     )
     if not rec.get("private"):  # private: it is seeding -> held below instead
         be.discard(rec, result)
-    retried = arr_mark_failed(cat, release)
+    record_failure(be, cat, rec, "unfetchable")
+    retried = arr_mark_failed(cat, release, rec.get("history_ids"))
     notify(
         f"Unfetchable: {release}",
         f"{be.fetch_fail_note} for {FETCH_TIMEOUT // 60} min. "
@@ -567,9 +694,11 @@ def handle_fetch_failure(be, cat, rec, sp, err, result):
     # tombstone -> reaper cleans any leftover result / local partial and we stop retrying
     rec.update(superseded=True, new_title=None, superseded_at=now, unfetchable=True)
     sp.write_text(json.dumps(rec))
+    ev.emit(rec, "failed", "cleaning_up", reason="unfetchable", error=err, rearr=retried)
 
 
-def adopt_existing(be, cat, mfile, magnet, nkey, private=False, rule=None, indexer=None):
+def adopt_existing(be, cat, mfile, magnet, nkey, private=False, rule=None, indexer=None,
+                   arr_keys=None, history_ids=None):
     """The backend says it ALREADY holds this torrent -- an out-of-band add (adding the
     magnet by hand on seedr.cc is a normal thing to do) or an earlier loop whose response we
     lost. That leaves no state file behind, and check_completions() only ever looks at state
@@ -588,6 +717,7 @@ def adopt_existing(be, cat, mfile, magnet, nkey, private=False, rule=None, index
         for sp, rec in load_records():
             if (rec.get("torrent_hash") or "").lower() == btih and not rec.get("superseded"):
                 mfile.unlink()
+                ev.emit(rec, "duplicate_dropped", None, drop=mfile.name)
                 be.log(f"    409: already tracked as '{rec.get('title')}' -> dropped duplicate {mfile.name}")
                 return True
     found = be.locate(btih, mfile.stem)
@@ -600,10 +730,15 @@ def adopt_existing(be, cat, mfile, magnet, nkey, private=False, rule=None, index
     rec = {"category": cat, "title": title, "release_name": mfile.stem, "backend": be.name}
     rec.update(keys)
     rec["added"] = time.time()
+    ev.ensure_tid(rec)
     if private:
         rec.update(private=True, seed_rule=rule, indexer=indexer)
+    if arr_keys:
+        rec.update(arr_keys=arr_keys, history_ids=history_ids)
     state_file(cat, title).write_text(json.dumps(rec))
     mfile.unlink()
+    DROP_STATE.pop(mfile.name, None)
+    ev.emit(rec, "adopted", "queued", where=where, indexer=indexer)
     be.log(f"    already on {be.label} ({where}) -> adopted as '{title}'")
     return True
 
@@ -634,37 +769,54 @@ def process_new_magnets():
                 if not magnet.startswith("magnet:"):
                     continue
                 hosts = magnet_meta(magnet)[3]
-                # A magnet from a private tracker (an indexer with a SEED_RULES entry) must be held
-                # like a .torrent one; nothing in a magnet says "private". One lookup per drop.
-                if SEED_RULES and mfile.name not in INDEXERS:
-                    INDEXERS[mfile.name] = grab_indexer(cat, mfile.stem)
-                if tracker_rule_key(INDEXERS.get(mfile.name)):
-                    private = True
+            # What the *arr recorded for this grab: its indexer (private-tracker rules; a magnet
+            # from a known private tracker is private too) and the movie/episode ids (attempts,
+            # give-up, mark-failed by id). The *arr writes the drop just before its history row,
+            # so a miss is retried for a few polls (private: longer -- the rule depends on it).
+            if ARR.get(cat, (None, None))[0] and mfile.name not in INDEXERS:
+                found = grab_info(cat, mfile.stem)
+                tries = INDEXER_TRIES.get(mfile.name, 0) + 1
+                limit = INDEXER_MAX_TRIES if private else 2
+                if found is None and tries < limit:
+                    INDEXER_TRIES[mfile.name] = tries
+                    drop_wait(cat, mfile, "looking_up_grab")
+                    continue
+                INDEXERS[mfile.name] = found or {}
+            info = INDEXERS.get(mfile.name) or {}
+            if mfile.suffix != ".torrent" and tracker_rule_key(info.get("indexer")):
+                private = True
+            arr_keys = info.get("keys") or []
+            if arr_keys and ev.given_up(arr_keys):
+                if GIVE_UP_DRY_RUN:
+                    drop_wait(cat, mfile, "would_drop_given_up", keys=arr_keys)
+                else:
+                    ev.emit(ev.drop_ref(cat, mfile), "dropped", None, reason="given_up", keys=arr_keys)
+                    DROP_STATE.pop(mfile.name, None)
+                    INDEXERS.pop(mfile.name, None)
+                    INDEXER_TRIES.pop(mfile.name, None)
+                    log(f"[{cat}] {mfile.name}: gave up on {arr_keys} earlier -> dropping this grab")
+                    mfile.unlink()
+                    continue
             name = route(private)
             if name is None:
                 log(f"[{cat}] no BRIDGE_ROUTE matches {mfile.name} ({'private' if private else 'public'}); leaving it")
+                drop_wait(cat, mfile, "no_route", private=private)
                 continue
             try:
                 be = backends.get(name)
             except Exception as e:
                 log(f"[{cat}] backend '{name}' unavailable ({e!r}); leaving {mfile.name}")
+                drop_wait(cat, mfile, "backend_unavailable", backend=name, error=repr(e))
                 continue
-            rule = indexer = None
+            rule = None
+            indexer = info.get("indexer")
             if private:
-                if mfile.name not in INDEXERS:
-                    found = grab_indexer(cat, mfile.stem)
-                    tries = INDEXER_TRIES.get(mfile.name, 0) + 1
-                    if found is None and tries < INDEXER_MAX_TRIES:
-                        # the *arr writes the drop just before its history row: ask again next poll
-                        # rather than fall back to the strictest rule for good
-                        INDEXER_TRIES[mfile.name] = tries
-                        continue
-                    INDEXERS[mfile.name] = found  # a real answer, or None after the retries
-                indexer = INDEXERS[mfile.name]
                 rule, how = seed_rule(indexer, hosts)
                 cap = be.max_seed_hours
                 if cap is not None and rule["hours"] > cap:
                     # Sending it would be a hit-and-run: the backend stops seeding first.
+                    drop_wait(cat, mfile, "seed_rule_exceeds_backend", rule=rule["key"],
+                              needs_hours=rule["hours"], backend=be.name, cap_hours=cap)
                     if mfile.name not in WARNED:
                         WARNED.add(mfile.name)
                         be.log(
@@ -701,6 +853,8 @@ def process_new_magnets():
                 FAIL_COUNTS[mfile.name] = n
                 limit = be.full_retries
                 if e.never_fits or (limit is not None and n >= limit):
+                    ev.emit(ev.drop_ref(cat, mfile), "dropped", None, reason="too_large", free=free)
+                    DROP_STATE.pop(mfile.name, None)
                     be.log(
                         f"    '{mfile.name}' does not fit {be.label} ({free / 1e9:.0f}GB free) -> dropping (too large)"
                     )
@@ -710,21 +864,27 @@ def process_new_magnets():
                     be.log(
                         f"    add refused ({be.label} full, {free / 1e9:.0f}GB free); attempt {n}/{limit}, will retry"
                     )
-                elif n == 1 or n % 120 == 0:  # waits indefinitely -> log ~hourly, not every poll
+                if mfile.exists():  # not just dropped as too large
+                    drop_wait(cat, mfile, "backend_full", backend=be.name, free_gib=round(free / 2**30, 1))
+                if limit is None and (n == 1 or n % 120 == 0):  # waits indefinitely -> log ~hourly
                     be.log(
                         f"    {be.label} full ({free / 1e9:.0f}GB free) -> {mfile.name} waits in the blackhole for space"
                     )
                 continue
             except Exists:
-                if not adopt_existing(be, cat, mfile, magnet, nkey, private, rule, indexer):
+                if not adopt_existing(be, cat, mfile, magnet, nkey, private, rule, indexer,
+                                      arr_keys, info.get("history_ids")):
                     be.log("    add failed (already exists, not adoptable yet); will retry next loop")
                 continue
             except Rejected as e:
                 be.log(f"    {be.label} rejected it: {e}; dropping {mfile.name}")
+                ev.emit(ev.drop_ref(cat, mfile), "dropped", None, reason="rejected", error=str(e))
+                DROP_STATE.pop(mfile.name, None)
                 mfile.unlink()
                 continue
             except Exception as e:
                 be.log(f"    add failed ({e}); will retry next loop")
+                drop_wait(cat, mfile, "add_error", backend=be.name, error=str(e)[:200])
                 continue
             FAIL_COUNTS.pop(mfile.name, None)
             WARNED.discard(mfile.name)
@@ -737,10 +897,19 @@ def process_new_magnets():
             rec = {"category": cat, "title": title, "release_name": mfile.stem, "backend": be.name}
             rec.update({k: v for k, v in keys.items() if k != "title"})
             rec["added"] = time.time()
+            ev.ensure_tid(rec)
             if private:
                 rec.update(private=True, seed_rule=rule, indexer=indexer)
+            if arr_keys:
+                rec.update(arr_keys=arr_keys, history_ids=info.get("history_ids"))
             state_file(cat, title).write_text(json.dumps(rec))
             mfile.unlink()
+            DROP_STATE.pop(mfile.name, None)
+            ev.emit(rec, "added", "queued", private=bool(private), indexer=indexer,
+                    rule=(rule or {}).get("key"), size=keys.get("size"), keys=arr_keys)
+            prior = ev.attempt_count(arr_keys)
+            if prior:
+                ev.emit(rec, "replacement_grabbed", None, attempt=prior + 1)
             be.log(f"    queued on {be.label} as '{title}'")
 
 
@@ -748,6 +917,9 @@ def check_completions():
     if not STATE_DIR.exists() or not any(STATE_DIR.glob("*.json")):
         return
     records = load_records()
+    for sp, rec in records:
+        if ev.ensure_tid(rec):  # state written before the event log existed
+            save(sp, rec)
     by_backend = {}
     for sp, rec in records:
         be = backend_for(rec)
@@ -759,7 +931,13 @@ def check_completions():
         except Exception as e:
             # one backend being unreachable must not stall the others
             be.log(f"loop error: {e}")
+            if BACKEND_UP.get(be.name, True):
+                BACKEND_UP[be.name] = False
+                ev.emit({"tid": f"backend:{be.name}", "backend": be.name}, "backend_down", None, error=str(e)[:300])
             continue
+        if not BACKEND_UP.get(be.name, True):
+            ev.emit({"tid": f"backend:{be.name}", "backend": be.name}, "backend_up", None)
+        BACKEND_UP[be.name] = True
         freeze_clocks(be, recs)
         for sp, rec in recs:
             check_one(be, sp, rec)
@@ -780,6 +958,7 @@ def check_one(be, sp, rec):
         if over:
             be.end_hold(rec)
             sp.unlink()
+            ev.emit(rec, "hold_ended", "done", rule=(rec.get("seed_rule") or {}).get("key"))
             be.log(f"[{cat}] '{title}' seeding hold over -> removed from {be.label}")
         return
     # superseded release -> reap its (often late-appearing) footprint, never the
@@ -789,6 +968,7 @@ def check_one(be, sp, rec):
         cleanup_local_partial(cat, title, rec.get("new_title"), rec.get("release_name"))
         if time.time() - rec.get("superseded_at", 0) > TOMBSTONE_GRACE:
             sp.unlink()
+            ev.emit(rec, "cleanup_closed", "ended")
             be.log(f"    [override] cleanup window closed for '{title}'")
         return
     state, info = be.status(rec)
@@ -798,12 +978,15 @@ def check_one(be, sp, rec):
     clear_unavailable(rec, sp)
     if state == DOWNLOADING:
         prog, now = info, time.time()
+        set_phase(sp, rec, "downloading")
         be.log(f"[{cat}] '{title}' downloading on {be.label} ({prog}%)")
         if rec.get("last_progress") is None or prog > rec["last_progress"] + 0.05:
             rec.update(last_progress=prog, last_progress_at=now)  # advanced -> reset stall clock
             sp.write_text(json.dumps(rec))
         elif now - rec.get("last_progress_at", rec.get("added", now)) > STALL_TIMEOUT:
             handle_stalled(be, cat, rec, sp, prog)
+            return
+        check_slow(be, cat, rec, sp, prog, now)
         return  # still in progress -> do NOT fetch yet
     if state == DONE:
         result = info
@@ -814,21 +997,111 @@ def check_one(be, sp, rec):
         release = rec.get("release_name") or title
         dest = DATA / "downloads" / cat / release
         stage = INCOMING / cat / release
-        be.log(f"[{cat}] '{result['name']}' complete -> fetching to {stage}")
+        job = puller.get(rec["tid"])
+        if job is None:
+            # hand the pull to the worker; this loop moves on (a 30 GB pull no longer blocks it)
+            try:
+                plan = be.prepare_fetch(rec, result)
+            except Exception as e:
+                be.log(f"    can't plan the fetch of '{title}': {e}; will retry")
+                handle_fetch_failure(be, cat, rec, sp, str(e), result)
+                return
+            size = (plan.get("size") if isinstance(plan, dict) else None) or rec.get("size")
+            puller.submit(be, rec, plan, stage, size)
+            if not rec.get("pulling"):
+                rec["pulling"] = True
+                if size:
+                    rec["size"] = size
+                save(sp, rec)
+            set_phase(sp, rec, "pulling", size=size)
+            be.log(f"[{cat}] '{result['name']}' complete -> pulling to the Jetson")
+            return
+        if job.status in ("queued", "waiting_space", "running"):
+            return  # still pulling
+        puller.forget(rec["tid"])
+        if job.status == "cancelled":
+            return
+        if job.status == "failed":
+            rec.pop("pulling", None)
+            save(sp, rec)
+            be.log(f"    fetch failed for '{title}': {job.error}; will retry")
+            handle_fetch_failure(be, cat, rec, sp, job.error, result)
+            return
         try:
-            be.fetch(rec, result, stage)
             if not stage.exists():
                 raise RuntimeError("fetch produced no files")
             how = deliver(stage, dest)
         except Exception as e:
-            be.log(f"    fetch failed for '{title}': {e}; will retry")
+            rec.pop("pulling", None)
+            save(sp, rec)
+            be.log(f"    delivery of '{title}' failed: {e}; will retry")
             handle_fetch_failure(be, cat, rec, sp, str(e), result)
             return
-        be.log(f"[{cat}] '{title}' {how} -> {dest}")
+        secs = max((job.finished or time.time()) - (job.started or time.time()), 1e-6)
+        rec.pop("pulling", None)
+        rec.pop("fetch_failing_since", None)
+        save(sp, rec)
+        ev.emit(rec, "delivered", "delivered", how=how, bytes=job.bytes, secs=round(secs, 1),
+                mb_s=round(job.bytes / secs / 1e6, 1))
+        be.log(f"[{cat}] '{title}' {how} -> {dest} ({job.bytes / 1e6:.0f} MB in {secs:.0f}s)")
         release_or_hold(be, cat, rec, sp, result)
         return
     be.log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
     handle_missing_result(be, cat, rec, sp)
+
+
+def check_slow(be, cat, rec, sp, prog, now):
+    """The slow rule (see SLOW_*): track the bridge's own progress rate, and fail + re-grab a
+    download that is hopeless -- or, in dry-run, just record that it would have."""
+    if SLOW_RULE == "off" or (SLOW_RULE == "public" and rec.get("private")):
+        return
+    samples = rec.setdefault("rate", [])
+    if not samples or now - samples[-1][0] >= 300:
+        samples.append([now, prog])
+        # keep ~1.5 windows of samples, always one old enough to span the window
+        while len(samples) > 2 and now - samples[1][0] >= RATE_WINDOW:
+            samples.pop(0)
+        save(sp, rec)
+    if now - rec.get("added", now) < SLOW_MIN_AGE:
+        return
+    why = None
+    if prog < SLOW_MIN_PROGRESS:
+        why = f"under {SLOW_MIN_PROGRESS:g}% after {(now - rec['added']) / 3600:.1f}h"
+    else:
+        t0, p0 = samples[0]
+        span_h = (now - t0) / 3600
+        rate = (prog - p0) / span_h if span_h >= 0.5 else None  # %/h over up to ~1h
+        eta_h = (100 - prog) / rate if rate else float("inf") if rate is not None else None
+        if eta_h is not None and eta_h > SLOW_MAX_ETA_H:
+            if not rec.get("slow_since"):
+                rec["slow_since"] = now
+                save(sp, rec)
+            elif now - rec["slow_since"] >= SLOW_CONFIRM:
+                why = f"projected {eta_h:.0f}h left at {rate or 0:.2f}%/h"
+        elif rec.get("slow_since"):
+            rec.pop("slow_since")
+            save(sp, rec)
+    if not why:
+        return
+    if SLOW_DRY_RUN:
+        if not rec.get("slow_flagged"):
+            rec["slow_flagged"] = why
+            save(sp, rec)
+            ev.emit(rec, "would_fail_slow", None, reason=why, progress=prog)
+            be.log(f"[{cat}] '{rec['title']}' is SLOW ({why}) -> would fail & re-grab (dry-run)")
+        return
+    if not may_fail(be, f"slow '{rec['title']}'"):
+        return
+    if keep_private_partial(be, cat, rec, sp, f"too slow ({why})"):
+        return
+    be.log(f"[{cat}] '{rec['title']}' too SLOW ({why}) -> failing & re-grabbing")
+    be.cancel(rec)
+    record_failure(be, cat, rec, "slow")
+    retried = arr_mark_failed(cat, rec.get("release_name", rec["title"]), rec.get("history_ids"))
+    rec.update(superseded=True, new_title=None, superseded_at=now, slow=True)
+    save(sp, rec)
+    ev.emit(rec, "failed", "cleaning_up", reason="slow", detail=why, rearr=retried)
+    cleanup_local_partial(cat, rec["title"], old_release=rec.get("release_name"))
 
 
 def note_unavailable(be, cat, rec, sp, why):
@@ -836,6 +1109,7 @@ def note_unavailable(be, cat, rec, sp, why):
     if not rec.get("unavailable_since"):
         rec["unavailable_since"] = now
         sp.write_text(json.dumps(rec))
+        ev.emit(rec, "unavailable", "waiting", why=why)
         be.log(f"[{cat}] '{rec['title']}' unavailable on {be.label} ({why}); waiting, deadlines frozen")
     elif now - rec["unavailable_since"] > UNAVAILABLE_ALERT and not rec.get("unavailable_alerted"):
         rec["unavailable_alerted"] = True
@@ -852,6 +1126,7 @@ def clear_unavailable(rec, sp):
         # the time it was invisible doesn't count against its deadlines
         gap = time.time() - rec.pop("unavailable_since")
         rec.pop("unavailable_alerted", None)
+        ev.emit(rec, "visible_again", None, after_s=round(gap))
         for k in ("last_progress_at", "result_missing_since", "fetch_failing_since"):
             if rec.get(k):
                 rec[k] += gap

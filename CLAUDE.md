@@ -199,6 +199,28 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   cancelled on stall/supersede — it's failed in the *arr (re-grab) but kept seeding as an undelivered
   hold (`no_deliver`), capped at `PARTIAL_HOLD` (7d). Trackers count partial snatches as H&R.
 
+- **Pull worker** (`puller.py`, thread `bridge-puller`): on `DONE` the bridge calls `be.prepare_fetch`
+  (API calls stay on the bridge thread) and queues a job; the worker runs `be.pull` with connections of
+  its own and writes only inside its `.incoming` stage dir; the bridge delivers + releases/holds when it
+  sees the job done. So a long pull no longer freezes the loop. One job at a time; a job that would leave
+  < `PULL_MIN_FREE_GB` on the Jetson waits (`waiting_space`, never counted as a fetch failure). Supersede
+  cancels a running pull (the worker removes its own stage); `cleanup_local_partial` skips busy stages.
+  Seedr uses a per-thread requests session. `puller.run_pending()` runs jobs synchronously (tests).
+- **Event log** (`bridgelog.py`, `config/bridge.db`, WAL): append-only `events` (tid, type, phase,
+  release, detail) + `attempts` per movie/episode. Every transfer carries `rec["tid"]` (legacy states get
+  one on sight). Waiting drops are logged only when their reason changes (`drop_wait`). All writes are
+  swallowed on error — the log can never break a transfer. Look things up with
+  `docker exec media-bridge python -m bridgelog` (active + waiting), `... bridgelog <name>` (timeline),
+  `... bridgelog --attempts`.
+- **Grab info** (`grab_info`): the *arr's "grabbed" history rows for the drop give the indexer, the
+  history ids (all episodes of a pack) and attempt keys (`radarr:movie:<id>` / `sonarr:episode:<id>`).
+  `arr_mark_failed` marks by those ids (the name search sees only 100 rows and one episode of a pack).
+- **Slow rule** (`check_slow`, `SLOW_*`, public-only, **dry-run by default**): after 2h, <5% or a
+  projected ETA (the bridge's own ~1h rate — qBittorrent's `eta` is 8640000 whenever speed is 0) above
+  24h for 1h → fail + re-grab. **Give-up** (`record_failure`, `GIVE_UP_*`, **dry-run by default**): the
+  10th failed attempt for a movie/episode unmonitors it in the *arr BEFORE marking failed (marking failed
+  always re-searches), and later grabs of it are dropped. No ntfy for any of these (user decision).
+
 ### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
 
 **Status (2026-09-25):** live for **private** torrents (`BRIDGE_ROUTE=private:seedbox,public:seedr`). Rollout plan:
@@ -216,7 +238,8 @@ public too once the P1 pull worker has parallel SFTP streams (single stream = 12
   qBit key = `restrict,port-forwarding,permitopen="127.0.0.1:*",command="/bin/false"` (tunnel only).
   Host key pinned in `media-bridge/config/seedbox_known_hosts` (+ vault copy); unknown/changed = refuse.
 - **qBittorrent** listens on the box's `127.0.0.1:<~/.qbittorrentPort>` (37301 today; PMSS may move it —
-  re-read on connection errors), reached through a paramiko direct-tcpip tunnel + a local forwarder.
+  re-read on connection errors), reached through a paramiko direct-tcpip tunnel + a local forwarder. Pulls: `PULL_SEGMENTS` (4)
+  parallel SFTP streams per file ≥ 64 MiB, each on its own SSH connection, resumable via `<file>.part.map`.
   Its WebUI password is its own random one; **a password change in the Pulsed panel resets it to the
   account password** (PMSS `changePw.php`) → the bridge stops at the FIRST refused login (qBittorrent bans
   127.0.0.1 after repeated failures, which also locks the user's WebUI) and ntfys.

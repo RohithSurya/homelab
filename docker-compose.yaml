@@ -173,6 +173,16 @@ services:
       #     iptorrents is 48h only while the account is VIP (H&R-exempt until 2026-10-25): set it
       #     to 1.0|336h when VIP ends. private-default covers unknown trackers and stays strictest.
       - SEED_RULES=hd-space=48h,iptorrents=48h,torrenthaven=120h,retrotoon=72h,czteam=1.0|72h,private-default=336h
+      # --- pulls home (puller.py): parallel SFTP streams per big file (measured on the box: 1 -> 13,
+      #     4 -> 32, 8 -> 30 MB/s), and never start a pull that would leave less than this free here.
+      - PULL_SEGMENTS=4
+      - PULL_MIN_FREE_GB=25
+      # --- retry rules (user decisions 2026-09-25). Both start in DRY-RUN: they only log what they
+      #     would do (`python -m bridgelog` / events table) until switched to false after review.
+      - SLOW_RULE=public                            # public|all|off: <5% after 2h, or projected ETA > 24h
+      - SLOW_RULE_DRY_RUN=true
+      - GIVE_UP_AFTER=10                            # failed attempts per movie/episode -> unmonitor + stop
+      - GIVE_UP_DRY_RUN=true
       # --- seedbox backend (qBittorrent over SSH, backends/qbit.py). Secrets are NOT here: the SSH
       #     keys, qBittorrent password and pinned host key come from the vault (vault.py, token in
       #     media-bridge/config/bws_token). Only used once BRIDGE_ROUTE names "seedbox".

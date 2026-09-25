@@ -20,6 +20,7 @@ survive Docker/shell '$' interpolation; plain SEEDR_PASSWORD also accepted.
 import base64
 import os
 import pathlib
+import threading
 import time
 
 import requests
@@ -52,10 +53,20 @@ SEED_HOLD = int(os.environ.get("SEED_HOLD", "176400"))
 # What the Seedr plan itself seeds a private torrent for, at most (Pro: 2:1 or 48h).
 SEEDR_MAX_SEED_HOURS = float(os.environ.get("SEEDR_MAX_SEED_HOURS", "48"))
 
-# Seedr Basic-auth lives on this session only -- never reuse it for anything else.
-SESSION = requests.Session()
-SESSION.auth = (EMAIL, PASSWORD)
-SESSION.headers["User-Agent"] = "seedr-bridge/1.0"
+# Seedr Basic-auth lives on these sessions only -- never reuse them for anything else. One per
+# thread: the pull worker downloads while the bridge thread polls, and a requests.Session isn't
+# safe to share across threads.
+_tls = threading.local()
+
+
+def _session():
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.auth = (EMAIL, PASSWORD)
+        s.headers["User-Agent"] = "seedr-bridge/1.0"
+        _tls.session = s
+    return s
 
 
 def log(msg):
@@ -63,7 +74,7 @@ def log(msg):
 
 
 def api(method, path, **kw):
-    r = SESSION.request(method, f"{BASE}{path}", timeout=kw.pop("timeout", 60), **kw)
+    r = _session().request(method, f"{BASE}{path}", timeout=kw.pop("timeout", 60), **kw)
     r.raise_for_status()
     return r
 
@@ -101,7 +112,7 @@ def download_file(file_id, dest: pathlib.Path, remote=None, size=None):
         seedr_ftp.download(remote, tmp)
     else:
         try:
-            with SESSION.get(
+            with _session().get(
                 f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
             ) as r:
                 r.raise_for_status()

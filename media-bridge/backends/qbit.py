@@ -67,7 +67,13 @@ UNKNOWN_SIZE = float(os.environ.get("SEEDBOX_UNKNOWN_SIZE_GB", "40")) * GiB  # a
 SEED_MARGIN_HOURS = float(os.environ.get("SEED_MARGIN_HOURS", "3"))
 LOGIN_BACKOFF = int(os.environ.get("SEEDBOX_LOGIN_BACKOFF", "1800"))
 SFTP_TIMEOUT = int(os.environ.get("SEEDBOX_SFTP_TIMEOUT", "120"))
-PREFETCH_REQUESTS = int(os.environ.get("SEEDBOX_PREFETCH_REQUESTS", "64"))  # bounds memory per file
+PREFETCH_REQUESTS = int(os.environ.get("SEEDBOX_PREFETCH_REQUESTS", "64"))  # bounds memory per stream
+# Parallel SFTP streams per large file, each on its own SSH connection (= its own TCP stream):
+# one stream Helsinki -> Jetson measured 12.1 MB/s (window/RTT-bound), so throughput scales with
+# streams until the link or the box's disk saturates. The box allows 10 sessions/connection and
+# MaxStartups 60; Pulsed's KB suggests 5-8 threads at most.
+PULL_SEGMENTS = int(os.environ.get("PULL_SEGMENTS", "4"))
+SEGMENT_MIN = int(float(os.environ.get("PULL_SEGMENT_MIN_MB", "64")) * 1024**2)  # smaller files: 1 stream
 QUOTA_REFRESH = 120
 DEFAULT_RULE = {"hours": 336.0, "ratio": None}  # a held rec that somehow lacks its rule
 CHUNK = 1 << 20
@@ -173,6 +179,28 @@ class Remote:
     def read_small(self, path):
         with self.sftp().open(path, "r") as f:
             return f.read().decode(errors="replace")
+
+    def open_sftp(self):
+        """A fresh SSH connection + SFTP client with the read-only key, owned by the caller (the
+        pull worker): never shared with the bridge thread's cached one. Caller closes both."""
+        import paramiko
+
+        pinned = self._pinned_key(paramiko)
+        sock = socket.create_connection((HOST, SSH_PORT), timeout=30)
+        t = paramiko.Transport(sock)
+        try:
+            t.banner_timeout = 30
+            t.start_client(timeout=30)
+            key = t.get_remote_server_key()
+            if pinned.get(key.get_name()) != key:
+                raise RuntimeError(f"seedbox SSH host key CHANGED for {HOST}; refusing to connect")
+            t.auth_publickey(USER, paramiko.Ed25519Key.from_private_key(io.StringIO(vault.get("SEEDBOX_SSH_KEY_SFTP"))))
+            sftp = paramiko.SFTPClient.from_transport(t)
+            sftp.get_channel().settimeout(SFTP_TIMEOUT)
+            return t, sftp
+        except Exception:
+            t.close()
+            raise
 
     def close(self):
         with self._lock:
@@ -477,7 +505,9 @@ class QbitBackend(Backend):
         t = self._torrent(rec)
         return None if t is None else t.get("completed", t.get("downloaded", 0))
 
-    def fetch(self, rec, result, dest_dir):
+    def prepare_fetch(self, rec, result):
+        """Bridge thread: the file list from qBittorrent -> a plain plan the pull worker can run
+        without touching the API session."""
         files = [
             f
             for f in self._api("GET", "/torrents/files", params={"hash": result["hash"]}).json()
@@ -485,14 +515,46 @@ class QbitBackend(Backend):
         ]
         if not files:
             raise RuntimeError("qBittorrent lists no files for this torrent")
-        # Deliver the torrent's CONTENTS into dest_dir, as the Seedr backend does: strip the
+        # Deliver the torrent's CONTENTS into the dest dir, as the Seedr backend does: strip the
         # torrent's own root folder when every file sits under one.
         parts = [f["name"].split("/") for f in files]
         strip = 1 if all(len(p) > 1 for p in parts) and len({p[0] for p in parts}) == 1 else 0
-        sftp = self.remote.sftp()
-        for f, p in zip(files, parts):
-            remote = posixpath.join(result["save_path"], f["name"])
-            self._get(sftp, remote, dest_dir.joinpath(*p[strip:]), f.get("size"))
+        return {
+            "name": result.get("name"),
+            "files": [
+                {"remote": posixpath.join(result["save_path"], f["name"]), "rel": p[strip:], "size": f.get("size")}
+                for f, p in zip(files, parts)
+            ],
+            "size": sum(f.get("size", 0) for f in files),
+        }
+
+    def pull(self, rec, plan, dest_dir, cancel=None):
+        """Pull worker thread: every file of the plan over SFTP, big ones in PULL_SEGMENTS
+        parallel streams, each stream on its own SSH connection."""
+        conns = []
+        try:
+            for f in plan["files"]:
+                if cancel is not None and cancel.is_set():
+                    return
+                local = dest_dir.joinpath(*f["rel"])
+                size = f["size"]
+                n = PULL_SEGMENTS if size and size >= SEGMENT_MIN else 1
+                while len(conns) < n:
+                    conns.append(self.remote.open_sftp())
+                if n == 1 and not local.with_suffix(local.suffix + ".part.map").exists():
+                    self._get(conns[0][1], f["remote"], local, size)
+                else:
+                    self._get_segmented([c[1] for c in conns[:max(n, 1)]], f["remote"], local, size, cancel)
+        finally:
+            for t, sftp in conns:
+                for x in (sftp, t):
+                    try:
+                        x.close()
+                    except Exception:
+                        pass
+
+    def fetch(self, rec, result, dest_dir):
+        self.pull(rec, self.prepare_fetch(rec, result), dest_dir)
 
     def cancel(self, rec):
         self._delete(rec.get("torrent_hash"))
@@ -538,6 +600,85 @@ class QbitBackend(Backend):
             self._delete(h)
 
     # --- SFTP pull --------------------------------------------------------------------------------
+
+    def _get_segmented(self, sftps, remote, local, size, cancel=None):
+        """remote -> local split into len(sftps) byte ranges pulled in parallel, written in place
+        (os.pwrite) into a preallocated <local>.part. Progress per range is kept in
+        <local>.part.map, so a restart resumes every range where it stopped."""
+        if local.exists() and local.stat().st_size == size:
+            return
+        local.parent.mkdir(parents=True, exist_ok=True)
+        tmp = local.with_suffix(local.suffix + ".part")
+        mapf = local.with_suffix(local.suffix + ".part.map")
+        segs = None
+        if mapf.exists() and tmp.exists():
+            try:
+                m = json.loads(mapf.read_text())
+                if m.get("size") == size:
+                    segs = m["segs"]
+            except (OSError, ValueError):
+                segs = None
+        if segs is None:
+            n = len(sftps)
+            step = -(-size // n)
+            segs = [[i * step, min(size, (i + 1) * step), i * step] for i in range(n) if i * step < size]
+            with open(tmp, "wb") as f:
+                f.truncate(size)  # sparse preallocation; ranges are filled in place
+            mapf.write_text(json.dumps({"size": size, "segs": segs}))
+        todo = [s for s in segs if s[2] < s[1]]
+        done0 = sum(s[2] - s[0] for s in segs)
+        if done0:
+            log(f"    resuming {local.name} at {done0:,} of {size:,} B")
+        lock = threading.Lock()
+        errors = []
+        fd = os.open(tmp, os.O_RDWR)
+        t0 = time.time()
+
+        def save():
+            with lock:
+                mapf.write_text(json.dumps({"size": size, "segs": segs}))
+
+        def worker(seg, sftp):
+            try:
+                with sftp.open(remote, "rb") as rf:
+                    rf.seek(seg[2])
+                    rf.prefetch(seg[1], max_concurrent_requests=PREFETCH_REQUESTS)  # arg = END offset
+                    since_save = 0
+                    while seg[2] < seg[1]:
+                        if cancel is not None and cancel.is_set():
+                            return
+                        chunk = rf.read(min(CHUNK, seg[1] - seg[2]))
+                        if not chunk:
+                            raise RuntimeError(f"short read at {seg[2]:,}")
+                        os.pwrite(fd, chunk, seg[2])
+                        seg[2] += len(chunk)
+                        since_save += len(chunk)
+                        if since_save >= 64 * CHUNK:
+                            save()
+                            since_save = 0
+            except Exception as e:
+                errors.append(e)
+
+        try:
+            threads = [threading.Thread(target=worker, args=(seg, sftps[i % len(sftps)]), daemon=True)
+                       for i, seg in enumerate(todo)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+        finally:
+            os.close(fd)
+            save()
+        if errors:
+            raise RuntimeError(f"{local.name}: {errors[0]}")
+        if cancel is not None and cancel.is_set():
+            return
+        if any(s[2] < s[1] for s in segs) or tmp.stat().st_size != size:
+            raise RuntimeError(f"{local.name}: incomplete after pull")
+        tmp.rename(local)
+        mapf.unlink(missing_ok=True)
+        secs = max(time.time() - t0, 1e-6)
+        log(f"    downloaded {local.name} ({size:,} bytes, {len(todo)} streams, {(size - done0) / secs / 1e6:.1f} MB/s)")
 
     def _get(self, sftp, remote, local, size):
         """remote -> local via <local>.part, resuming at the .part's size; verified by size."""

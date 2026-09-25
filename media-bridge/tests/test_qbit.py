@@ -135,6 +135,9 @@ class FakeSFTP:
     def __init__(self, root):
         self.root = root
 
+    def close(self):
+        pass
+
     def _p(self, remote):
         return self.root / remote.lstrip("/")
 
@@ -161,6 +164,14 @@ class FakeRemote:
 
     def sftp(self):
         return FakeSFTP(self.root)
+
+    def open_sftp(self):
+        return FakeTransport(), FakeSFTP(self.root)
+
+
+class FakeTransport:
+    def close(self):
+        pass
 
 
 def quota(used_gib, limit_gib=230):
@@ -338,6 +349,47 @@ class QbitTest(unittest.TestCase):
         self.be.s.request = flaky
         self.assertEqual(self.be._api("GET", "/app/version").text, "v4.5.2")
         self.assertEqual(len(calls), 2)
+
+    def test_segmented_pull_parallel_and_resume(self):
+        q.SEGMENT_MIN, q.PULL_SEGMENTS, q.CHUNK = 1000, 4, 256
+        try:
+            root = self.tmp / "remote" / "home/u/data"
+            root.mkdir(parents=True)
+            data = bytes(range(256)) * 40  # 10240 B, distinct bytes per offset
+            (root / "Big.mkv").write_bytes(data)
+            plan = {"files": [{"remote": "/home/u/data/Big.mkv", "rel": ["Big.mkv"], "size": len(data)}]}
+            dest = self.tmp / "stage"
+            # an interrupted earlier pull: map says segment 0 got 1000 B, the rest nothing
+            dest.mkdir()
+            part = dest / "Big.mkv.part"
+            with open(part, "wb") as f:
+                f.truncate(len(data))
+                f.seek(0)
+                f.write(data[:1000])
+            step = -(-len(data) // 4)
+            segs = [[i * step, min(len(data), (i + 1) * step), i * step] for i in range(4)]
+            segs[0][2] = 1000
+            (dest / "Big.mkv.part.map").write_text(json.dumps({"size": len(data), "segs": segs}))
+            self.be.pull({"title": "T"}, plan, dest)
+            self.assertEqual((dest / "Big.mkv").read_bytes(), data, "every byte in place after a resumed parallel pull")
+            self.assertFalse(list(dest.glob("*.part*")))
+        finally:
+            q.SEGMENT_MIN, q.PULL_SEGMENTS, q.CHUNK = 64 * 1024**2, 4, 1 << 20
+
+    def test_segmented_pull_cancel_stops(self):
+        import threading as th
+        q.SEGMENT_MIN, q.CHUNK = 1000, 256
+        try:
+            root = self.tmp / "remote" / "home/u/data"
+            root.mkdir(parents=True)
+            (root / "Big.mkv").write_bytes(b"x" * 10240)
+            plan = {"files": [{"remote": "/home/u/data/Big.mkv", "rel": ["Big.mkv"], "size": 10240}]}
+            cancel = th.Event()
+            cancel.set()
+            self.be.pull({"title": "T"}, plan, self.tmp / "stage", cancel)
+            self.assertFalse((self.tmp / "stage" / "Big.mkv").exists())
+        finally:
+            q.SEGMENT_MIN, q.CHUNK = 64 * 1024**2, 1 << 20
 
     # --- login -----------------------------------------------------------------------------------
 
