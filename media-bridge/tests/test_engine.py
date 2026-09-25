@@ -601,3 +601,32 @@ class SeedrSwarmTest(unittest.TestCase):
         self.assertEqual(b.swarm({"title": "B", "user_torrent_id": 2}), {"metadata": True, "seeds": 0})
         self.assertEqual(b.swarm({"title": "C", "user_torrent_id": 3}), {"metadata": True, "seeds": 12})
         self.assertIsNone(b.swarm({"title": "gone", "user_torrent_id": 9}))
+
+
+class StatusPageTest(unittest.TestCase):
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+    drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
+
+    def test_status_and_escaping(self):
+        import bridgeweb
+        evil = "Evil <img src=x onerror=alert(1)> 2020 1080p WEB"
+        self.drop(evil)
+        self.loop()
+        FAKE.t["h-" + evil]["progress"] = 12.5
+        self.loop()
+        self.drop("Waiting 2021 1080p WEB", h="w" * 40)  # not processed yet -> shows as waiting
+        s = bridgeweb.status()
+        self.assertEqual(s["active"][0]["phase"], "downloading")
+        self.assertEqual(s["active"][0]["progress"], 12.5)
+        self.assertEqual(len(s["waiting"]), 1)
+        page = bridgeweb.page()
+        self.assertNotIn("<img", page)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", page)
+        code, ctype, body = bridgeweb.handle("/bridge/status.json")
+        self.assertEqual((code, ctype), (200, "application/json"))
+        json.loads(body)
+        tid = self.rec(evil)["tid"]
+        code, _, body = bridgeweb.handle(f"/bridge/transfer/{tid}")
+        self.assertEqual(code, 200)
+        self.assertIn("added", body)
+        self.assertNotIn("<img", body)

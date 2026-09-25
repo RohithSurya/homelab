@@ -231,6 +231,14 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   via `/torrents/addTrackers`. **Never for a private torrent** — public by BOTH checks only (no private flag,
   indexer not a `SEED_RULES` tracker): announcing a private infohash to public trackers gets accounts banned.
 
+- **Status page** (`bridgeweb.py`) on the youtube server: `http://10.0.0.179:8003/bridge` (HTML, 30s refresh),
+  `/bridge/status.json`, `/bridge/transfer/<tid>` (timeline). Same process as the bridge, so it reads the
+  pull worker's jobs and each backend's last poll snapshot — rendering never calls Seedr or the seedbox.
+  Shows where each transfer is + until when (qBit eta, else the bridge's own rate; pull ETA from staged
+  bytes; hold end from seeding_time vs rule), waiting drops with their reason, holds, last 7 days, and the
+  dry-run rule decisions. Names come from scraped sites → everything `html.escape`d + a script-free CSP.
+  LAN-only like `:8003` itself; never put it behind Caddy (it shows private-tracker names).
+
 ### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
 
 **Status (2026-09-25):** live for **private** torrents (`BRIDGE_ROUTE=private:seedbox,public:seedr`). Rollout plan:

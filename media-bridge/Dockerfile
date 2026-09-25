@@ -19,7 +19,7 @@ zipfile.ZipFile(io.BytesIO(data)).extract("bws", "/usr/local/bin")
 os.chmod("/usr/local/bin/bws", 0o755)
 PY
 
-COPY common.py torrentfile.py trackers.py vault.py bridgelog.py puller.py bridge.py seedr_ftp.py reaper.py movierulz.py tamilmv.py daddylive.py youtube.py main.py /app/
+COPY common.py torrentfile.py trackers.py vault.py bridgelog.py puller.py bridge.py bridgeweb.py seedr_ftp.py reaper.py movierulz.py tamilmv.py daddylive.py youtube.py main.py /app/
 COPY backends/ /app/backends/
 
 CMD ["python", "-u", "main.py"]
