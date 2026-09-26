@@ -68,5 +68,48 @@ class PullerTest(unittest.TestCase):
         self.assertEqual(job.status, "cancelled")
 
 
+class ExtractTest(unittest.TestCase):
+    """RAR extraction with a fake unrar (real archives need the non-free rar tool to create)."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.fake = self.tmp / "fake-unrar"
+        # fake unrar: "x -o+ -y -idq <first> <dest>/" -> writes <dest>/<stem>.mkv, or fails for "bad"
+        self.fake.write_text("#!/bin/sh\ncase \"$5\" in *bad*) echo 'CRC failed' >&2; exit 3;; esac\n"
+                             "n=$(basename \"$5\"); n=${n%.rar}; n=${n%.part01}\nprintf movie > \"$6$n.mkv\"\n")
+        self.fake.chmod(0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_extract_old_style_volumes_and_skip_sample(self):
+        st = self.tmp / "stage"
+        (st / "Sample").mkdir(parents=True)
+        for n in ("rel.rar", "rel.r00", "rel.r01", "rel.sfv", "rel.nfo"):
+            (st / n).write_text("x")
+        (st / "Sample" / "rel.sample.rar").write_text("x")
+        self.assertEqual(puller.extract_archives(st, unrar=str(self.fake)), 1)
+        self.assertEqual((st / "rel.mkv").read_text(), "movie")
+        self.assertEqual(sorted(p.name for p in st.iterdir()), ["Sample", "rel.mkv", "rel.nfo"])
+        self.assertTrue((st / "Sample" / "rel.sample.rar").exists(), "samples are left alone")
+
+    def test_extract_part_style(self):
+        st = self.tmp / "stage"
+        st.mkdir()
+        for n in ("rel.part01.rar", "rel.part02.rar", "rel.part03.rar"):
+            (st / n).write_text("x")
+        self.assertEqual(puller.extract_archives(st, unrar=str(self.fake)), 1)
+        self.assertEqual(sorted(p.name for p in st.iterdir()), ["rel.mkv"])
+
+    def test_failure_raises_and_leaves_volumes(self):
+        st = self.tmp / "stage"
+        st.mkdir()
+        for n in ("bad.rar", "bad.r00"):
+            (st / n).write_text("x")
+        with self.assertRaises(RuntimeError):
+            puller.extract_archives(st, unrar=str(self.fake))
+        self.assertEqual(sorted(p.name for p in st.iterdir()), ["bad.r00", "bad.rar"], "no half-extracted output")
+
+
 if __name__ == "__main__":
     unittest.main()

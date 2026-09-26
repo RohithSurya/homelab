@@ -14,7 +14,9 @@ the Jetson's disk (PULL_MIN_FREE_GB left over) waits instead of starting.
 
 import os
 import queue
+import re
 import shutil
+import subprocess
 import threading
 import time
 
@@ -26,6 +28,48 @@ DATA_ROOT = os.environ.get("PULL_DATA_ROOT", "/data")
 
 class Cancelled(Exception):
     pass
+
+
+# Scene releases (common on private trackers) arrive as RAR volumes: name.rar + name.r00..rNN, or
+# name.part01.rar..partNN.rar. Radarr/Sonarr never unpack archives, so a RAR'd release sits in the
+# watch folder forever with only its sample importable. Extract in the staging dir before delivery.
+_VOLUME = re.compile(r"\.(rar|r\d\d|sfv)$", re.I)
+
+
+def _first_volume(name):
+    n = name.lower()
+    m = re.search(r"\.part(\d+)\.rar$", n)
+    return int(m.group(1)) == 1 if m else n.endswith(".rar")
+
+
+def extract_archives(stage, unrar="unrar"):
+    """Extract every RAR set under stage (not inside Sample/ dirs) next to its volumes, then remove
+    the volumes. Extraction goes to a temp dir first and is moved in only when unrar succeeds, so a
+    half-extracted file never appears. Returns how many sets were extracted; raises on failure."""
+    sets = [
+        p for p in sorted(stage.rglob("*.rar"))
+        if p.is_file() and _first_volume(p.name)
+        and not any(part.lower() == "sample" for part in p.relative_to(stage).parts[:-1])
+    ]
+    done = 0
+    for first in sets:
+        tmp = first.parent / ".extracting"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        r = subprocess.run([unrar, "x", "-o+", "-y", "-idq", str(first), str(tmp) + os.sep],
+                           capture_output=True, text=True, timeout=6 * 3600)
+        if r.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(f"unrar failed on {first.name} ({r.returncode}): {(r.stderr or r.stdout).strip()[-200:]}")
+        for f in tmp.iterdir():
+            os.replace(f, first.parent / f.name)
+        tmp.rmdir()
+        stem = re.sub(r"(\.part\d+)?\.rar$", "", first.name, flags=re.I)
+        for v in first.parent.iterdir():
+            if v.is_file() and v.name.startswith(stem) and (_VOLUME.search(v.name) or re.search(r"\.part\d+\.rar$", v.name, re.I)):
+                v.unlink()
+        done += 1
+    return done
 
 
 class Job:
@@ -110,6 +154,10 @@ def _run(job):
     job.be.pull(job.rec, job.plan, job.stage, job.cancel)
     if job.cancel.is_set():
         raise Cancelled()
+    if job.stage.exists():
+        n = extract_archives(job.stage)
+        if n:
+            log(f"    extracted {n} RAR set(s) in '{job.rec.get('release_name')}'")
     job.bytes = max(0, _staged_bytes(job.stage) - before)
 
 

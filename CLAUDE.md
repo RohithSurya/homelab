@@ -67,6 +67,19 @@ never joins a swarm; keeping it off-VPN also keeps Seedr CDN downloads direct/fa
 `jellyfin` (both `network_mode: host` for LAN/DLNA/Tailscale reach; they hit the *arr apps on
 `127.0.0.1` because gluetun publishes those ports on the host).
 
+**`home-egress` (tinyproxy, host `:8006`) — the one per-indexer VPN exception.** Some private trackers
+bind the login cookie to the IP it was issued to: **KrazyZone** (no opt-out; its login form has only
+"Remember Me") answers the VPN exit IP with an empty 200 + `Refresh: account-login.php` +
+`Set-Cookie: pass=deleted`, which Prowlarr reports as "Redirected to …account-login.php". Since the
+browser login happens from the home IPv4, those indexers go through this proxy: Prowlarr indexer proxy
+`home-egress` (HTTP `10.0.0.179:8006`) + tag `home-egress` on the indexer — Prowlarr only proxies
+indexers that carry the tag. Everything else stays on the VPN. Guards: `home-egress/filter` is a
+destination allowlist (`FilterDefaultDeny`; `prowlarr.servarr.com` is on it because Prowlarr won't save or
+health-check a proxy that can't reach it), and `Allow 172.16.0.0/12` admits only docker-bridge sources
+(gluetun's netns arrives as `172.22.0.1`), so LAN hosts get refused. Config is bind-mounted: edit
+the filter and `docker restart home-egress`. If Comcast changes the home IPv4, the cookie dies — re-login in
+the browser and paste the new cookie.
+
 ## The `/data` single-root convention
 
 `./data` is mounted into sonarr, radarr, media-bridge, and bazarr at the same path so imports are
@@ -206,6 +219,10 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   < `PULL_MIN_FREE_GB` on the Jetson waits (`waiting_space`, never counted as a fetch failure). Supersede
   cancels a running pull (the worker removes its own stage); `cleanup_local_partial` skips busy stages.
   Seedr uses a per-thread requests session. `puller.run_pending()` runs jobs synchronously (tests).
+  **Scene RARs**: after a pull the worker extracts every RAR set in the stage (`extract_archives`: `.rar`+`.rNN`
+  or `.partNN.rar`, not inside `Sample/`) with Debian's non-free `unrar` (baked into the image), into a temp
+  dir moved in only on success, then deletes the volumes — Radarr/Sonarr never unpack archives, so a RAR'd
+  private release (IPTorrents SKYFiRE etc.) otherwise imports nothing but its sample.
 - **Event log** (`bridgelog.py`, `config/bridge.db`, WAL): append-only `events` (tid, type, phase,
   release, detail) + `attempts` per movie/episode. Every transfer carries `rec["tid"]` (legacy states get
   one on sight). Waiting drops are logged only when their reason changes (`drop_wait`). All writes are
