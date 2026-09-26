@@ -124,6 +124,15 @@ FAILFAST_AFTER = int(os.environ.get("FAILFAST_AFTER", "600"))
 # later grab of it. Dry-run by default: log only.
 GIVE_UP_AFTER = int(os.environ.get("GIVE_UP_AFTER", "10"))
 GIVE_UP_DRY_RUN = os.environ.get("GIVE_UP_DRY_RUN", "true").lower() != "false"
+# Import fix: the bridge's own deliveries that the *arr blocks only because the release name doesn't
+# match the series/movie (e.g. "Rewired with Joe Dispenza" vs Sonarr's "Rewired") are manual-imported
+# with the movie/episode ids the *arr itself recorded at grab time -- never guessed from names.
+IMPORT_FIX = os.environ.get("IMPORT_FIX", "on").lower() not in ("off", "false", "0")
+IMPORT_CHECK_INTERVAL = int(os.environ.get("IMPORT_CHECK_INTERVAL", "120"))
+IMPORT_WATCH_TTL = int(os.environ.get("IMPORT_WATCH_TTL", str(24 * 3600)))
+IMPORT_BLOCK_RE = re.compile(r"title mismatch|unknown (series|movie)", re.I)
+VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv")
+_import_checked_at = 0.0
 # A transfer its backend can't see (UNAVAILABLE) for this long is ntfy'd once.
 UNAVAILABLE_ALERT = int(os.environ.get("UNAVAILABLE_ALERT", "7200"))
 ARR = {
@@ -416,6 +425,145 @@ def freeze_clocks(be, recs):
             sp.write_text(json.dumps(rec))
             shifted += 1
     be.log(f"{be.label} was unobserved for {gap / 60:.0f}min -> deadlines of {shifted} transfer(s) pushed back")
+
+
+def arr_api(cat, method, path, params=None, body=None, timeout=60):
+    """Plain-requests call to Radarr/Sonarr (never a backend session). Returns parsed JSON."""
+    url, key = ARR.get(cat, (None, None))
+    if not url or not key:
+        raise RuntimeError(f"{cat} not configured")
+    r = requests.request(method, f"{url}/api/v3{path}", params=params, json=body,
+                         headers={"X-Api-Key": key}, timeout=timeout)
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+
+def _watch_file():
+    return STATE_DIR / ".import-watch.json"
+
+
+def watch_import(rec, dest):
+    """Remember a delivery so check_imports can fix a title-mismatch block on it."""
+    if not IMPORT_FIX or not rec.get("arr_keys"):
+        return
+    try:
+        f = _watch_file()
+        w = json.loads(f.read_text()) if f.exists() else {}
+        w[rec["tid"]] = {"category": rec["category"], "release": rec.get("release_name") or rec["title"],
+                         "dest": str(dest), "keys": rec["arr_keys"], "tid": rec["tid"], "at": time.time(), "tries": 0}
+        f.write_text(json.dumps(w))
+    except Exception as e:
+        log(f"    (warn) import watch: {e}")
+
+
+def _episode_map(keys):
+    """{(season, episode): episode id} and the series id, for the *arr's recorded episode keys."""
+    ids = [int(k.rsplit(":", 1)[1]) for k in keys if k.startswith("sonarr:episode:")]
+    eps = arr_api("sonarr", "GET", "/episode", params={"episodeIds": ids}) if ids else []
+    if isinstance(eps, dict):
+        eps = [eps]
+    return {(e["seasonNumber"], e["episodeNumber"]): e["id"] for e in eps}, (eps[0]["seriesId"] if eps else None)
+
+
+def manual_import(cat, entry, download_id):
+    """ManualImport the delivered folder, mapped ONLY to the movie/episodes recorded at grab time.
+    Returns the number of files handed to the *arr."""
+    items = arr_api(cat, "GET", "/manualimport", params={"folder": entry["dest"], "filterExistingFiles": "false"})
+    vids = [i for i in items if i["path"].lower().endswith(VIDEO_EXT) and "sample" not in i["path"].lower()]
+    if not vids:
+        return 0
+    files = []
+    base = lambda i: {"path": i["path"], "folderName": pathlib.Path(entry["dest"]).name, "quality": i["quality"],
+                      "languages": i.get("languages") or [], "releaseGroup": i.get("releaseGroup") or "",
+                      "downloadId": download_id or i.get("downloadId"), "indexerFlags": i.get("indexerFlags") or 0}
+    if cat == "radarr":
+        movie = next((int(k.rsplit(":", 1)[1]) for k in entry["keys"] if k.startswith("radarr:movie:")), None)
+        if movie is None:
+            return 0
+        best = max(vids, key=lambda i: i.get("size") or 0)  # one movie: the main file
+        files.append(dict(base(best), movieId=movie))
+    else:
+        emap, series = _episode_map(entry["keys"])
+        if not emap or series is None:
+            return 0
+        for i in vids:
+            name = pathlib.Path(i["path"]).name
+            m = re.search(r"s(\d{1,2})e(\d{1,3})(?:-?e(\d{1,3}))?", name, re.I)
+            if m:
+                s_, e1 = int(m.group(1)), int(m.group(2))
+                e2 = int(m.group(3)) if m.group(3) else e1
+                ids = [emap[(s_, e)] for e in range(e1, e2 + 1) if (s_, e) in emap]
+            elif len(vids) == 1 and len(emap) == 1:
+                ids = list(emap.values())
+            else:
+                ids = []
+            if ids:
+                files.append(dict(base(i), seriesId=series, episodeIds=ids, releaseType="singleEpisode" if len(ids) == 1 else "multiEpisode"))
+            else:
+                log(f"    import fix: can't map {name} to one of the grabbed episodes; left for manual import")
+    if files:
+        arr_api(cat, "POST", "/command", body={"name": "ManualImport", "files": files, "importMode": "auto"})
+    return len(files)
+
+
+def check_imports():
+    """Every IMPORT_CHECK_INTERVAL: fix the bridge's own deliveries the *arr blocks only for a title
+    mismatch; drop watched entries that left the queue (imported) or expired."""
+    global _import_checked_at
+    if not IMPORT_FIX or time.time() - _import_checked_at < IMPORT_CHECK_INTERVAL:
+        return
+    _import_checked_at = time.time()
+    f = _watch_file()
+    if not f.exists():
+        return
+    try:
+        watch = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return
+    if not watch:
+        return
+    queues = {}
+    for cat in {e["category"] for e in watch.values()}:
+        try:
+            extra = {"includeUnknownSeriesItems": "true"} if cat == "sonarr" else {"includeUnknownMovieItems": "true"}
+            queues[cat] = arr_api(cat, "GET", "/queue", params=dict(pageSize=500, **extra)).get("records", [])
+        except Exception as e:
+            log(f"    (warn) import fix: {cat} queue unreadable: {e}")
+    now = time.time()
+    for tid, entry in list(watch.items()):
+        cat = entry["category"]
+        if cat not in queues:
+            continue
+        rel = norm(entry["release"])
+        hits = [q for q in queues[cat] if norm(q.get("title", "")) == rel]
+        ref = {"tid": tid, "release_name": entry["release"], "category": cat}
+        if not hits:
+            if now - entry["at"] > 600:  # give the *arr a scan or two before calling it gone
+                watch.pop(tid)
+            continue
+        q = hits[0]
+        msgs = " ".join(m for s_ in q.get("statusMessages", []) for m in s_.get("messages", []))
+        if q.get("trackedDownloadState") != "importBlocked":
+            pass
+        elif IMPORT_BLOCK_RE.search(msgs) and entry["tries"] < 3 and now - entry.get("last_try", 0) > 600:
+            entry["tries"] += 1
+            entry["last_try"] = now
+            try:
+                n = manual_import(cat, entry, q.get("downloadId"))
+                ev.emit(ref, "import_forced", None, files=n, reason=msgs[:120])
+                log(f"[{cat}] import fix: '{entry['release']}' blocked ({msgs[:60]}) -> manual-imported {n} file(s)")
+            except Exception as e:
+                ev.emit(ref, "import_fix_failed", None, error=str(e)[:200])
+                log(f"    (warn) import fix failed for '{entry['release']}': {e}")
+        elif not IMPORT_BLOCK_RE.search(msgs) and not entry.get("noted"):
+            entry["noted"] = True  # e.g. Sonarr's "TBA title, recently aired": it clears by itself
+            ev.emit(ref, "import_blocked", None, reason=msgs[:200])
+        if now - entry["at"] > IMPORT_WATCH_TTL:
+            watch.pop(tid, None)
+    try:
+        f.write_text(json.dumps(watch))
+    except OSError as e:
+        log(f"    (warn) import watch: {e}")
 
 
 def unmonitor(cat, keys):
@@ -1057,6 +1205,7 @@ def check_one(be, sp, rec):
         rec.pop("pulling", None)
         rec.pop("fetch_failing_since", None)
         save(sp, rec)
+        watch_import(rec, dest)
         ev.emit(rec, "delivered", "delivered", how=how, bytes=job.bytes, secs=round(secs, 1),
                 mb_s=round(job.bytes / secs / 1e6, 1))
         be.log(f"[{cat}] '{title}' {how} -> {dest} ({job.bytes / 1e6:.0f} MB in {secs:.0f}s)")
@@ -1196,6 +1345,7 @@ def run_forever():
         try:
             process_new_magnets()
             check_completions()
+            check_imports()
         except Exception as e:
             log(f"loop error: {e}")
         time.sleep(POLL)

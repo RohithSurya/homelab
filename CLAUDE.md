@@ -247,6 +247,13 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   cache). Appended to public magnets (`&tr=`) before any backend; public `.torrent`s on the seedbox get them
   via `/torrents/addTrackers`. **Never for a private torrent** — public by BOTH checks only (no private flag,
   indexer not a `SEED_RULES` tracker): announcing a private infohash to public trackers gets accounts banned.
+- **Import fix** (`check_imports`, `IMPORT_FIX`, default on): every delivery with grab-time ids (`arr_keys`) goes on
+  a watch-list (`.bridge-state/.import-watch.json`, 24h). Every 2 min the *arr queue is read; a watched item that is
+  `importBlocked` for **"title mismatch" / "Unknown Series/Movie"** (e.g. `Rewired with Joe Dispenza` vs Sonarr's
+  `Rewired`) gets a `ManualImport` command, mapped **only** to the recorded movie / episodes (Radarr: largest
+  video → `movieId`; Sonarr: `SxxEyy` in each filename → episode ids from the key set, anything unmappable is
+  skipped). Up to 3 tries, 10 min apart. Other block reasons (TBA title, not an upgrade) are only logged
+  (`import_blocked` event), never forced. The manualimport GET uses `folder=` only.
 
 - **Status page** (`bridgeweb.py`) on the youtube server: `http://10.0.0.179:8003/bridge` (HTML, 30s refresh),
   `/bridge/status.json`, `/bridge/transfer/<tid>` (timeline). Same process as the bridge, so it reads the

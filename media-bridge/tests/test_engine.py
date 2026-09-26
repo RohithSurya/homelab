@@ -479,6 +479,100 @@ class RetryRulesTest(unittest.TestCase):
         self.assertEqual(json.loads(row[0])["attempt"], 2)
 
 
+class ImportFixTest(unittest.TestCase):
+    """check_imports: manual-import only the bridge's own title-mismatch blocks, only to recorded ids."""
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+
+    def fake_arr(self, queue, items, episodes=()):
+        self.posted = []
+
+        def api(cat, method, path, params=None, body=None, timeout=60):
+            if path == "/queue":
+                return {"records": queue}
+            if path == "/manualimport":
+                return items
+            if path == "/episode":
+                return [e for e in episodes if e["id"] in params["episodeIds"]]
+            if method == "POST":
+                self.posted.append(body)
+                return {}
+            raise AssertionError(path)
+        bridge.arr_api = api
+        bridge._import_checked_at = 0
+
+    def watch(self, cat, release, keys, at=None):
+        bridge.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {"tid": "t1", "category": cat, "release_name": release, "title": release, "arr_keys": keys}
+        bridge.watch_import(rec, f"/data/downloads/{cat}/{release}")
+        if at:
+            w = json.loads(bridge._watch_file().read_text())
+            w["t1"]["at"] = at
+            bridge._watch_file().write_text(json.dumps(w))
+
+    def blocked(self, title, msg):
+        return {"title": title, "trackedDownloadState": "importBlocked", "downloadId": "D1",
+                "statusMessages": [{"title": title, "messages": [msg]}]}
+
+    def item(self, path, size=1):
+        return {"path": path, "size": size, "quality": {"q": 1}, "languages": [], "releaseGroup": "G"}
+
+    def setup_orig(self):
+        self.orig = bridge.arr_api
+        self.addCleanup(setattr, bridge, "arr_api", self.orig)
+
+    def test_series_title_mismatch_imports_recorded_episodes_only(self):
+        self.setup_orig()
+        rel = "Rewired.with.Joe.Dispenza.S01.1080p-SKYFiRE"
+        eps = [{"id": 101, "seasonNumber": 1, "episodeNumber": 1, "seriesId": 14},
+               {"id": 102, "seasonNumber": 1, "episodeNumber": 2, "seriesId": 14}]
+        d = f"/data/downloads/sonarr/{rel}/"
+        self.fake_arr([self.blocked(rel, "Series title mismatch; automatic import is not possible.")],
+                      [self.item(d + "rewired.s01e01.mkv"), self.item(d + "rewired.s01e02.mkv"),
+                       self.item(d + "rewired.s01e03.mkv"), self.item(d + "sample/rewired.s01e01.sample.mkv"),
+                       self.item(d + "rewired.s01e01.nfo")], eps)
+        self.watch("sonarr", rel, ["sonarr:episode:101", "sonarr:episode:102"])
+        bridge.check_imports()
+        self.assertEqual(len(self.posted), 1)
+        files = self.posted[0]["files"]
+        self.assertEqual([(f["path"].rsplit("/", 1)[1], f["episodeIds"], f["seriesId"]) for f in files],
+                         [("rewired.s01e01.mkv", [101], 14), ("rewired.s01e02.mkv", [102], 14)])
+        self.assertEqual(files[0]["downloadId"], "D1")
+        self.assertEqual(self.posted[0]["importMode"], "auto")
+        bridge.check_imports()  # throttled + spaced retries: no second import right away
+        self.assertEqual(len(self.posted), 1)
+
+    def test_movie_picks_largest_video_for_recorded_movie(self):
+        self.setup_orig()
+        rel = "Veerabhadrudu 2026 1080p WEB"
+        d = f"/data/downloads/radarr/{rel}/"
+        self.fake_arr([self.blocked(rel, "Unknown Movie")],
+                      [self.item(d + "a.mkv", 5), self.item(d + "b.mkv", 9)])
+        self.watch("radarr", rel, ["radarr:movie:77"])
+        bridge.check_imports()
+        self.assertEqual([(f["path"], f["movieId"]) for f in self.posted[0]["files"]], [(d + "b.mkv", 77)])
+
+    def test_other_block_reasons_are_left_alone(self):
+        self.setup_orig()
+        rel = "Heart Beat S03E33 1080p"
+        self.fake_arr([self.blocked(rel, "Episode has a TBA title and recently aired")], [])
+        self.watch("sonarr", rel, ["sonarr:episode:1"])
+        bridge.check_imports()
+        self.assertEqual(self.posted, [])
+        self.assertIn("t1", json.loads(bridge._watch_file().read_text()))
+
+    def test_entry_dropped_once_gone_from_queue(self):
+        self.setup_orig()
+        self.fake_arr([], [])
+        self.watch("radarr", "X 2026 1080p", ["radarr:movie:1"], at=time.time() - 3600)
+        bridge.check_imports()
+        self.assertEqual(json.loads(bridge._watch_file().read_text()), {})
+
+    def test_no_keys_no_watch(self):
+        bridge.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        bridge.watch_import({"tid": "t", "category": "radarr", "title": "x"}, "/d")
+        self.assertFalse(bridge._watch_file().exists())
+
+
 class PublicTrackersTest(unittest.TestCase):
     setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
     drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
