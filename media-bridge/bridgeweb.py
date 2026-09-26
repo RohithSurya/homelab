@@ -105,7 +105,7 @@ def _transfer(rec):
         got = puller._staged_bytes(stage) if stage.exists() else 0
         out["progress"] = round(100 * got / size, 1) if size else None
         if job and job.status == "running" and job.started:
-            spd = got / max(now - job.started, 1)
+            spd = max(0, got - job.before) / max(now - job.started, 1)  # this run only, not a resume's head start
             out["speed_mb_s"] = round(spd / 1e6, 1)
             if size and spd > 0:
                 out["eta"] = _when(now + (size - got) / spd)

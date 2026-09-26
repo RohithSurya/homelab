@@ -1,5 +1,6 @@
 """Offline tests for puller.py (the background pull worker)."""
 
+import json
 import pathlib
 import shutil
 import sys
@@ -66,6 +67,70 @@ class PullerTest(unittest.TestCase):
         puller.cancel("t3")
         t.join(5)
         self.assertEqual(job.status, "cancelled")
+
+
+    # --- progress of sparse, segmented .part files -----------------------------------------------
+
+    def sparse_part(self, stage, size, written, map_bytes=None):
+        stage.mkdir(parents=True, exist_ok=True)
+        part = stage / "Big.mkv.part"
+        with open(part, "wb") as f:
+            f.truncate(size)
+            f.seek(0)
+            f.write(b"x" * written)
+        if map_bytes is not None:
+            (stage / "Big.mkv.part.map").write_text(
+                json.dumps({"size": size, "segs": [[0, size // 2, map_bytes], [size // 2, size, size // 2]]}))
+        return part
+
+    def test_staged_bytes_counts_the_map_not_the_preallocation(self):
+        stage = self.tmp / "st"
+        self.sparse_part(stage, 10 << 20, 1 << 20, map_bytes=1 << 20)
+        (stage / "eng.srt").write_bytes(b"s" * 300)
+        self.assertEqual(puller._staged_bytes(stage), (1 << 20) + 300)
+
+    def test_staged_bytes_without_map_counts_allocated_blocks(self):
+        stage = self.tmp / "st2"
+        self.sparse_part(stage, 10 << 20, 1 << 20)
+        got = puller._staged_bytes(stage)
+        self.assertGreaterEqual(got, 1 << 20)
+        self.assertLess(got, 2 << 20, "not the 10 MiB preallocated size")
+
+    def test_disk_guard_sees_what_a_resumed_pull_still_needs(self):
+        stage = self.tmp / "s4"
+        self.sparse_part(stage, 10 << 20, 1 << 20, map_bytes=1 << 20)
+        puller._free_bytes = lambda: 100 << 20
+        puller.PULL_MIN_FREE = 95 << 20  # room for 5 MiB more; 9 MiB are still to come
+        try:
+            job = puller.submit(SlowBackend(), {"tid": "t4", "release_name": "R"}, {}, stage, 10 << 20)
+            t = threading.Thread(target=puller.run_pending, daemon=True)
+            t.start()
+            for _ in range(50):
+                if job.status == "waiting_space":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(job.status, "waiting_space")
+            puller.cancel("t4")
+            t.join(5)
+        finally:
+            puller._free_bytes = FREE_BYTES
+
+    def test_job_bytes_count_only_this_run(self):
+        stage = self.tmp / "s5"
+        stage.mkdir()
+        (stage / "f.mkv.part").write_bytes(b"x" * 60)  # an earlier, interrupted pull
+
+        class Resuming(SlowBackend):
+            def pull(self, rec, plan, dest, cancel):
+                (dest / "f.mkv.part").unlink()
+                super().pull(rec, plan, dest, cancel)
+
+        job = puller.submit(Resuming(), {"tid": "t5", "release_name": "R"}, {}, stage, 100)
+        puller.run_pending()
+        self.assertEqual((job.status, job.before, job.bytes), ("done", 60, 40))
+
+
+FREE_BYTES = puller._free_bytes
 
 
 class ExtractTest(unittest.TestCase):

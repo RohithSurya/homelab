@@ -6,11 +6,14 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -407,6 +410,305 @@ class QbitTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.be.add(*self.drop("R11", magnet("8" * 40, GiB)))
         self.assertEqual(self.qb.logins, 1, "exactly one login attempt, then back off")
+
+
+class CountingFile(FakeFile):
+    """FakeFile that records read sizes and tells its client when it is in use."""
+
+    def __init__(self, path, client):
+        super().__init__(path)
+        self.client = client
+
+    def __enter__(self):
+        with self.client.lock:
+            self.client.active += 1
+            self.client.max_active = max(self.client.max_active, self.client.active)
+        return self
+
+    def __exit__(self, *a):
+        with self.client.lock:
+            self.client.active -= 1
+        super().__exit__(*a)
+
+    def read(self, n):
+        c = self.client
+        c.reads.append(n)
+        if c.fail_after is not None and len(c.reads) > c.fail_after:
+            raise OSError("connection dropped")
+        if c.on_read:
+            c.on_read()
+        time.sleep(c.delay)
+        return super().read(n)
+
+
+class CountingSFTP(FakeSFTP):
+    def __init__(self, root):
+        super().__init__(root)
+        self.lock = threading.Lock()
+        self.active = self.max_active = 0
+        self.reads, self.closed = [], False
+        self.delay, self.fail_after, self.on_read = 0.0, None, None
+
+    def open(self, remote, mode="rb"):
+        return CountingFile(self._p(remote), self)
+
+    def close(self):
+        self.closed = True
+
+
+class PullFixesTest(unittest.TestCase):
+    """The pull path on its own (no qBittorrent needed): progress, cancel, durability, one client
+    per stream, abort on the first error, path safety."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.root = self.tmp / "remote"
+        (self.root / "home/u/data").mkdir(parents=True)
+        self.be = q.QbitBackend()
+        self.be.remote = FakeRemote(None, self.root)
+        self.clients = []
+
+        def open_sftp():
+            c = CountingSFTP(self.root)
+            self.clients.append(c)
+            return FakeTransport(), c
+
+        self.be.remote.open_sftp = open_sftp
+        self.saved = (q.SEGMENT_MIN, q.PULL_SEGMENTS, q.CHUNK, q.READ_SIZE)
+        q.SEGMENT_MIN, q.PULL_SEGMENTS, q.CHUNK = 1000, 4, 256
+        self.dest = self.tmp / "stage"
+
+    def tearDown(self):
+        q.SEGMENT_MIN, q.PULL_SEGMENTS, q.CHUNK, q.READ_SIZE = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def remote_file(self, name, data):
+        (self.root / "home/u/data" / name).write_bytes(data)
+        return {"files": [{"remote": f"/home/u/data/{name}", "rel": [name], "size": len(data)}]}
+
+    def test_small_file_pull_honours_cancel_and_resumes(self):
+        q.READ_SIZE, q.SEGMENT_MIN = 1000, 10**9  # single-stream _get
+        data = bytes(range(250)) * 20
+        plan = self.remote_file("Small.mkv", data)
+        cancel = threading.Event()
+        orig = self.be.remote.open_sftp
+
+        def open_sftp():
+            t, c = orig()
+            c.on_read = cancel.set  # cancelled right after the first read
+            return t, c
+
+        self.be.remote.open_sftp = open_sftp
+        self.be.pull({"title": "T"}, plan, self.dest, cancel)
+        self.assertFalse((self.dest / "Small.mkv").exists(), "a cancelled pull never renames")
+        self.assertEqual((self.dest / "Small.mkv.part").stat().st_size, 1000, "partial kept for resume")
+        self.assertTrue(self.clients[0].closed, "the abandoned connection is closed")
+        self.be.remote.open_sftp = orig
+        self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertEqual((self.dest / "Small.mkv").read_bytes(), data)
+
+    def test_sparse_part_without_map_is_never_resumed(self):
+        q.SEGMENT_MIN = 10**9
+        data = b"z" * 100_000
+        plan = self.remote_file("S.mkv", data)
+        self.dest.mkdir()
+        with open(self.dest / "S.mkv.part", "wb") as f:
+            f.truncate(len(data))  # a segmented pull's preallocation whose map is gone
+        self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertEqual((self.dest / "S.mkv").read_bytes(), data, "not 100 kB of zeros")
+
+    def test_reads_ask_paramiko_for_one_request_at_a_time(self):
+        data = os.urandom(20_000)
+        plan = self.remote_file("R.mkv", data)
+        CountingFile.MAX_REQUEST_SIZE = 512
+        try:
+            self.be.pull({"title": "T"}, plan, self.dest)
+        finally:
+            del CountingFile.MAX_REQUEST_SIZE
+        self.assertEqual((self.dest / "R.mkv").read_bytes(), data)
+        self.assertLessEqual(max(r for c in self.clients for r in c.reads), 512)
+
+    def test_map_saved_only_after_fsync_and_atomically(self):
+        data = os.urandom(200_000)
+        plan = self.remote_file("M.mkv", data)
+        q.PULL_SEGMENTS = 1
+        events = []
+        real_fsync, real_save = q.os.fsync, q._save_map
+        with mock.patch.object(q.os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1]), \
+                mock.patch.object(q, "_save_map", lambda *a: (events.append("map"), real_save(*a))[1]):
+            self.dest.mkdir()
+            (self.dest / "M.mkv.part.map").write_text("{}")  # force the segmented path
+            (self.dest / "M.mkv.part").write_bytes(b"")
+            self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertEqual((self.dest / "M.mkv").read_bytes(), data)
+        later = events[1:]  # the first map is written at preallocation, before any data
+        self.assertGreater(later.count("map"), 1, "saved periodically, not only at the end")
+        for i, e in enumerate(later):
+            if e == "map":
+                self.assertEqual(later[i - 1], "fsync", "data fsynced before the map claims it")
+        self.assertFalse(list(self.dest.glob("*.tmp")))
+
+    def test_resumed_map_with_more_ranges_than_clients_never_shares_a_client(self):
+        data = bytes(range(256)) * 40
+        plan = self.remote_file("Big.mkv", data)
+        self.dest.mkdir()
+        with open(self.dest / "Big.mkv.part", "wb") as f:
+            f.truncate(len(data))
+        step = -(-len(data) // 6)
+        segs = [[i * step, min(len(data), (i + 1) * step), i * step] for i in range(6)]
+        (self.dest / "Big.mkv.part.map").write_text(json.dumps({"size": len(data), "segs": segs}))
+        q.PULL_SEGMENTS = 2  # the map was cut for 6 streams, only 2 now
+        orig = self.be.remote.open_sftp
+
+        def open_sftp():
+            t, c = orig()
+            c.delay = 0.001  # keeps streams overlapping
+            return t, c
+
+        self.be.remote.open_sftp = open_sftp
+        self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertEqual((self.dest / "Big.mkv").read_bytes(), data)
+        self.assertEqual(len(self.clients), 2)
+        self.assertEqual([c.max_active for c in self.clients], [1, 1], "one open file per client at a time")
+
+    def test_first_stream_error_stops_its_siblings(self):
+        data = os.urandom(64 * 1024)
+        plan = self.remote_file("E.mkv", data)
+        n = 0
+
+        def open_sftp():
+            nonlocal n
+            c = CountingSFTP(self.root)
+            c.delay = 0.002
+            if n == 0:
+                c.fail_after = 2  # the first stream's connection drops early
+            n += 1
+            self.clients.append(c)
+            return FakeTransport(), c
+
+        self.be.remote.open_sftp = open_sftp
+        q.READ_SIZE = 256
+        with self.assertRaises(RuntimeError):
+            self.be.pull({"title": "T"}, plan, self.dest)
+        per_stream = len(data) // 4 // 256  # reads a sibling would need to finish its range
+        self.assertTrue(all(len(c.reads) < per_stream for c in self.clients[1:]), "siblings stopped early")
+        self.assertTrue(all(c.closed for c in self.clients))
+        self.assertTrue((self.dest / "E.mkv.part.map").exists(), "progress kept for the retry")
+
+    def test_paths_outside_the_stage_are_refused(self):
+        (self.root / "home/u/data/x").write_bytes(b"x")
+        for rel in (["..", "evil.mkv"], ["sub", "..", "..", "evil.mkv"], ["/tmp/evil.mkv"], [""]):
+            plan = {"files": [{"remote": "/home/u/data/x", "rel": rel, "size": 1}]}
+            with self.assertRaises(RuntimeError, msg=rel):
+                self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertFalse((self.tmp / "evil.mkv").exists())
+        self.assertEqual(self.clients, [], "refused before any connection is opened")
+
+
+class RealParamikoTest(unittest.TestCase):
+    """The pull against real paramiko: an in-process SFTP server over a socketpair (no network).
+    Checks what the fakes can't: paramiko's own read/prefetch behaviour, and that an aborted pull
+    leaves no prefetch thread spinning."""
+
+    @classmethod
+    def setUpClass(cls):
+        import logging
+
+        import paramiko
+
+        logging.getLogger("paramiko").setLevel(logging.CRITICAL)  # "connection reset" at teardown
+        cls.pk = paramiko
+        cls.hostkey = paramiko.ECDSAKey.generate()
+
+    def setUp(self):
+        pk = self.pk
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.root = self.tmp / "remote"
+        (self.root / "home/u/data").mkdir(parents=True)
+        self.servers, self.delay = [], 0.0
+        root, test = self.root, self
+
+        class Handle(pk.SFTPHandle):
+            def read(self, offset, length):
+                time.sleep(test.delay)
+                return super().read(offset, length)
+
+            def stat(self):
+                return pk.SFTPAttributes.from_stat(os.fstat(self.readfile.fileno()))
+
+        class Files(pk.SFTPServerInterface):
+            def open(self, path, flags, attr):
+                h = Handle(flags)
+                h.readfile = open(root / path.lstrip("/"), "rb")
+                h.filename = path
+                return h
+
+            def stat(self, path):
+                return pk.SFTPAttributes.from_stat(os.stat(root / path.lstrip("/")))
+
+            lstat = stat
+
+        class Server(pk.ServerInterface):
+            def get_allowed_auths(self, username):
+                return "none"
+
+            def check_auth_none(self, username):
+                return pk.AUTH_SUCCESSFUL
+
+            def check_channel_request(self, kind, chanid):
+                return pk.OPEN_SUCCEEDED
+
+        def open_sftp():
+            a, b = socket.socketpair()
+            st = pk.Transport(b)
+            st.add_server_key(self.hostkey)
+            st.set_subsystem_handler("sftp", pk.SFTPServer, Files)
+            st.start_server(event=threading.Event(), server=Server())
+            self.servers.append(st)
+            ct = pk.Transport(a)
+            ct.start_client(timeout=10)
+            ct.auth_none("u")
+            return ct, pk.SFTPClient.from_transport(ct)
+
+        self.be = q.QbitBackend()
+        self.be.remote = FakeRemote(None, self.root)
+        self.be.remote.open_sftp = open_sftp
+        self.saved = (q.SEGMENT_MIN, q.PULL_SEGMENTS, q.PREFETCH_REQUESTS)
+        q.SEGMENT_MIN, q.PULL_SEGMENTS = 1 << 20, 4
+        self.dest = self.tmp / "stage"
+
+    def tearDown(self):
+        q.SEGMENT_MIN, q.PULL_SEGMENTS, q.PREFETCH_REQUESTS = self.saved
+        for st in self.servers:
+            st.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def prefetchers():
+        return [t for t in threading.enumerate() if t.name.endswith("(_prefetch_thread)") and t.is_alive()]
+
+    def test_segmented_pull_through_real_paramiko(self):
+        data = os.urandom(3 << 20)
+        (self.root / "home/u/data/Real.mkv").write_bytes(data)
+        plan = {"files": [{"remote": "/home/u/data/Real.mkv", "rel": ["Real.mkv"], "size": len(data)}]}
+        self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertEqual((self.dest / "Real.mkv").read_bytes(), data)
+
+    def test_cancelled_pull_leaves_no_prefetch_thread_spinning(self):
+        q.PREFETCH_REQUESTS = 4  # few slots: the prefetch thread sits in its wait loop
+        self.delay = 0.02  # 32 requests per stream -> ~0.6 s, so the 0.3 s cancel lands mid-pull
+        data = os.urandom(4 << 20)
+        (self.root / "home/u/data/Slow.mkv").write_bytes(data)
+        plan = {"files": [{"remote": "/home/u/data/Slow.mkv", "rel": ["Slow.mkv"], "size": len(data)}]}
+        before = set(self.prefetchers())
+        cancel = threading.Event()
+        threading.Timer(0.3, cancel.set).start()
+        self.be.pull({"title": "T"}, plan, self.dest, cancel)
+        self.assertFalse((self.dest / "Slow.mkv").exists())
+        deadline = time.time() + 5
+        while set(self.prefetchers()) - before and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(set(self.prefetchers()) - before, set(), "no leaked prefetch threads")
 
 
 if __name__ == "__main__":

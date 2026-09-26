@@ -76,7 +76,11 @@ PULL_SEGMENTS = int(os.environ.get("PULL_SEGMENTS", "4"))
 SEGMENT_MIN = int(float(os.environ.get("PULL_SEGMENT_MIN_MB", "64")) * 1024**2)  # smaller files: 1 stream
 QUOTA_REFRESH = 120
 DEFAULT_RULE = {"hours": 336.0, "ratio": None}  # a held rec that somehow lacks its rule
-CHUNK = 1 << 20
+CHUNK = 1 << 20  # pwrite batch
+# Per read() from paramiko: the file's own SFTPFile.MAX_REQUEST_SIZE when it has one. Asking for more
+# (the old 1 MiB) made BufferedFile.read concatenate its 32 KiB responses one by one into a growing
+# bytes object -- ~16 MiB of copying per MiB pulled, all under the GIL.
+READ_SIZE = 32768
 # Brief states where progress is 1.0 but the files aren't settled yet.
 SETTLING = {"moving", "checkingUP", "checkingResumeData", "allocating", "checkingDL"}
 STOPPED_UP = {"pausedUP", "stoppedUP", "queuedUP"}
@@ -86,6 +90,52 @@ BROKEN = {"error", "missingFiles", "unknown"}
 
 def log(msg):
     clog("seedbox", msg)
+
+
+def _local_path(dest_dir, rel):
+    """dest_dir/<rel>, refusing anything that would land outside dest_dir: file names come from the
+    torrent, i.e. from whoever made it."""
+    if not rel or any(p in ("", ".", "..") or "\0" in p for p in rel):
+        raise RuntimeError(f"unsafe path in torrent: {'/'.join(rel)!r}")
+    local = dest_dir.joinpath(*rel)
+    if not local.resolve().is_relative_to(dest_dir.resolve()):
+        raise RuntimeError(f"unsafe path in torrent: {'/'.join(rel)!r}")
+    return local
+
+
+def _save_map(mapf, size, segs):
+    """Atomic: a crash mid-write must never leave a torn map behind."""
+    tmp = mapf.with_name(mapf.name + ".tmp")
+    tmp.write_text(json.dumps({"size": size, "segs": segs}))
+    os.replace(tmp, mapf)
+
+
+def _abandon(sftps, files):
+    """After an aborted pull (cancel or error): paramiko's prefetch thread waits for a free request
+    slot in a busy loop that never checks whether its file or channel is gone, so it would spin
+    forever. Close the channels (the caller is giving up on them anyway), then empty each file's
+    slot table: the thread wakes, fails its next send on the closed channel and exits."""
+    for sftp in sftps:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+    for rf in files:
+        lock = getattr(rf, "_prefetch_lock", None)
+        if lock is not None:
+            with lock:
+                rf._prefetch_extents.clear()
+
+
+def _quiet_prefetch_exit(args, _prev=threading.excepthook):
+    # that failed send is how _abandon ends the thread: expected, not worth a traceback
+    name = args.thread.name if args.thread is not None else ""
+    if name.endswith("(_prefetch_thread)") and issubclass(args.exc_type, (OSError, EOFError)):
+        return
+    _prev(args)
+
+
+threading.excepthook = _quiet_prefetch_exit
 
 
 def parse_quota(text):
@@ -556,13 +606,16 @@ class QbitBackend(Backend):
             for f in plan["files"]:
                 if cancel is not None and cancel.is_set():
                     return
-                local = dest_dir.joinpath(*f["rel"])
+                local = _local_path(dest_dir, f["rel"])
                 size = f["size"]
                 n = PULL_SEGMENTS if size and size >= SEGMENT_MIN else 1
+                resumed = local.with_suffix(local.suffix + ".part.map").exists()
+                if resumed:
+                    n = max(n, PULL_SEGMENTS)  # its ranges were cut for PULL_SEGMENTS streams
                 while len(conns) < n:
                     conns.append(self.remote.open_sftp())
-                if n == 1 and not local.with_suffix(local.suffix + ".part.map").exists():
-                    self._get(conns[0][1], f["remote"], local, size)
+                if n == 1 and not resumed:
+                    self._get(conns[0][1], f["remote"], local, size, cancel)
                 else:
                     self._get_segmented([c[1] for c in conns[:max(n, 1)]], f["remote"], local, size, cancel)
         finally:
@@ -622,9 +675,12 @@ class QbitBackend(Backend):
     # --- SFTP pull --------------------------------------------------------------------------------
 
     def _get_segmented(self, sftps, remote, local, size, cancel=None):
-        """remote -> local split into len(sftps) byte ranges pulled in parallel, written in place
-        (os.pwrite) into a preallocated <local>.part. Progress per range is kept in
-        <local>.part.map, so a restart resumes every range where it stopped."""
+        """remote -> local split into byte ranges pulled in parallel, one SFTP client per stream
+        (a client is never shared between threads), written in place (os.pwrite) into a
+        preallocated <local>.part. Progress per range is kept in <local>.part.map, saved only
+        after the data it claims is fsynced, so a restart -- even after a power cut -- resumes
+        every range where it stopped. A resumed map with more ranges than clients runs them in
+        turn. The first failing stream stops its siblings."""
         if local.exists() and local.stat().st_size == size:
             return
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -644,51 +700,77 @@ class QbitBackend(Backend):
             segs = [[i * step, min(size, (i + 1) * step), i * step] for i in range(n) if i * step < size]
             with open(tmp, "wb") as f:
                 f.truncate(size)  # sparse preallocation; ranges are filled in place
-            mapf.write_text(json.dumps({"size": size, "segs": segs}))
+            _save_map(mapf, size, segs)
         todo = [s for s in segs if s[2] < s[1]]
         done0 = sum(s[2] - s[0] for s in segs)
         if done0:
             log(f"    resuming {local.name} at {done0:,} of {size:,} B")
         lock = threading.Lock()
         errors = []
+        stop = threading.Event()  # set by the first failing stream
+        pending = list(todo)  # ranges no stream has taken yet
+        opened = []  # remote file handles, for _abandon after an abort
         fd = os.open(tmp, os.O_RDWR)
         t0 = time.time()
 
         def save():
             with lock:
-                mapf.write_text(json.dumps({"size": size, "segs": segs}))
+                os.fsync(fd)  # data first: the map must never claim bytes still in the page cache
+                _save_map(mapf, size, segs)
 
-        def worker(seg, sftp):
-            try:
-                with sftp.open(remote, "rb") as rf:
-                    rf.seek(seg[2])
-                    rf.prefetch(seg[1], max_concurrent_requests=PREFETCH_REQUESTS)  # arg = END offset
-                    since_save = 0
-                    while seg[2] < seg[1]:
-                        if cancel is not None and cancel.is_set():
-                            return
-                        chunk = rf.read(min(CHUNK, seg[1] - seg[2]))
-                        if not chunk:
-                            raise RuntimeError(f"short read at {seg[2]:,}")
-                        os.pwrite(fd, chunk, seg[2])
-                        seg[2] += len(chunk)
-                        since_save += len(chunk)
+        def aborted():
+            return stop.is_set() or (cancel is not None and cancel.is_set())
+
+        def pull_range(seg, sftp):
+            with sftp.open(remote, "rb") as rf:
+                opened.append(rf)
+                rsize = getattr(rf, "MAX_REQUEST_SIZE", READ_SIZE)
+                rf.seek(seg[2])
+                rf.prefetch(seg[1], max_concurrent_requests=PREFETCH_REQUESTS)  # arg = END offset
+                buf, since_save = bytearray(), 0
+                while seg[2] + len(buf) < seg[1] and not aborted():
+                    chunk = rf.read(min(rsize, seg[1] - seg[2] - len(buf)))
+                    if not chunk:
+                        raise RuntimeError(f"short read at {seg[2] + len(buf):,}")
+                    buf += chunk
+                    if len(buf) >= CHUNK or seg[2] + len(buf) >= seg[1]:
+                        os.pwrite(fd, buf, seg[2])
+                        seg[2] += len(buf)  # progress = bytes already written, never just read
+                        since_save += len(buf)
+                        buf.clear()
                         if since_save >= 64 * CHUNK:
                             save()
                             since_save = 0
+                if buf:  # stopped with bytes read but not yet written: keep them
+                    os.pwrite(fd, buf, seg[2])
+                    seg[2] += len(buf)
+
+        def worker(sftp):
+            try:
+                while not aborted():
+                    with lock:
+                        if not pending:
+                            return
+                        seg = pending.pop(0)
+                    pull_range(seg, sftp)
             except Exception as e:
                 errors.append(e)
+                stop.set()
 
+        streams = sftps[:max(1, min(len(sftps), len(todo)))]
         try:
-            threads = [threading.Thread(target=worker, args=(seg, sftps[i % len(sftps)]), daemon=True)
-                       for i, seg in enumerate(todo)]
+            threads = [threading.Thread(target=worker, args=(sftp,), daemon=True) for sftp in streams]
             for th in threads:
                 th.start()
             for th in threads:
                 th.join()
         finally:
-            os.close(fd)
-            save()
+            try:
+                save()
+            finally:
+                os.close(fd)
+            if aborted():
+                _abandon(sftps, opened)
         if errors:
             raise RuntimeError(f"{local.name}: {errors[0]}")
         if cancel is not None and cancel.is_set():
@@ -698,34 +780,50 @@ class QbitBackend(Backend):
         tmp.rename(local)
         mapf.unlink(missing_ok=True)
         secs = max(time.time() - t0, 1e-6)
-        log(f"    downloaded {local.name} ({size:,} bytes, {len(todo)} streams, {(size - done0) / secs / 1e6:.1f} MB/s)")
+        log(f"    downloaded {local.name} ({size:,} bytes, {len(streams)} streams, {(size - done0) / secs / 1e6:.1f} MB/s)")
 
-    def _get(self, sftp, remote, local, size):
-        """remote -> local via <local>.part, resuming at the .part's size; verified by size."""
+    def _get(self, sftp, remote, local, size, cancel=None):
+        """remote -> local via <local>.part, resuming at the .part's size; verified by size. On
+        cancel the .part stays for the next attempt to resume."""
         if size is None:
             size = sftp.stat(remote).st_size
         if local.exists() and local.stat().st_size == size:
             return  # fetched in full on an earlier pass
         local.parent.mkdir(parents=True, exist_ok=True)
         tmp = local.with_suffix(local.suffix + ".part")
-        off = tmp.stat().st_size if tmp.exists() else 0
-        if off > size:  # corrupt, not merely short -> don't resume onto it
-            tmp.unlink()
-            off = 0
+        off = 0
+        if tmp.exists():
+            st = tmp.stat()
+            off = st.st_size
+            # corrupt (longer than the file), or sparse -- a segmented pull's preallocated .part
+            # whose map is gone, where the size says nothing about what was written: never resume
+            if off > size or st.st_blocks * 512 < off:
+                tmp.unlink()
+                off = 0
         if off:
             log(f"    resuming {local.name} at {off:,} B")
         t0 = time.time()
         if off < size:
-            with sftp.open(remote, "rb") as rf, open(tmp, "ab") as out:
-                rf.seek(off)
-                # prefetch's argument is the file's SIZE (it reads from the current offset to it);
-                # the request cap bounds memory on the Jetson.
-                rf.prefetch(size, max_concurrent_requests=PREFETCH_REQUESTS)
-                while True:
-                    chunk = rf.read(CHUNK)
-                    if not chunk:
-                        break
-                    out.write(chunk)
+            opened = []
+            try:
+                with sftp.open(remote, "rb") as rf, open(tmp, "ab") as out:
+                    opened.append(rf)
+                    rsize = getattr(rf, "MAX_REQUEST_SIZE", READ_SIZE)
+                    rf.seek(off)
+                    # prefetch's argument is the file's SIZE (it reads from the current offset to
+                    # it); the request cap bounds memory on the Jetson.
+                    rf.prefetch(size, max_concurrent_requests=PREFETCH_REQUESTS)
+                    while not (cancel is not None and cancel.is_set()):
+                        chunk = rf.read(rsize)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+            except Exception:
+                _abandon([sftp], opened)
+                raise
+            if cancel is not None and cancel.is_set():
+                _abandon([sftp], opened)
+                return
         got = tmp.stat().st_size
         if got != size:
             raise RuntimeError(f"{local.name}: got {got:,} B, expected {size:,} B")

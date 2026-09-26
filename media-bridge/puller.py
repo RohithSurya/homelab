@@ -12,6 +12,7 @@ One job runs at a time (the home downlink is the shared resource); a job whose s
 the Jetson's disk (PULL_MIN_FREE_GB left over) waits instead of starting.
 """
 
+import json
 import os
 import queue
 import re
@@ -80,6 +81,7 @@ class Job:
         self.error = None
         self.started = self.finished = None
         self.bytes = 0
+        self.before = 0  # staged bytes when this run started (a resumed pull)
 
 
 _jobs = {}
@@ -132,11 +134,31 @@ def _free_bytes():
     return st.f_bavail * st.f_frsize
 
 
-def _staged_bytes(path):
+def _map_bytes(mapf):
     try:
-        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return sum(s[2] - s[0] for s in json.loads(mapf.read_text())["segs"])
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def _staged_bytes(path):
+    """Bytes actually pulled into a staging dir. A segmented pull preallocates <file>.part at full
+    size (sparse), so its st_size would read ~100% from the first second: count a .part from its
+    .part.map when it has one, else only the blocks really written."""
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            if not f.is_file() or f.name.endswith((".part.map", ".part.map.tmp")):
+                continue
+            st = f.stat()
+            if f.name.endswith(".part"):
+                got = _map_bytes(f.with_name(f.name + ".map"))
+                total += got if got is not None else min(st.st_size, st.st_blocks * 512)
+            else:
+                total += st.st_size
     except OSError:
-        return 0
+        return total
+    return total
 
 
 def _run(job):
@@ -149,16 +171,16 @@ def _run(job):
                 f"{PULL_MIN_FREE / 2**30:.0f} GiB free on the Jetson")
         if job.cancel.wait(60):
             raise Cancelled()
+    job.before = _staged_bytes(job.stage)  # already there from an interrupted pull
     job.status, job.started = "running", time.time()
-    before = _staged_bytes(job.stage)
     job.be.pull(job.rec, job.plan, job.stage, job.cancel)
     if job.cancel.is_set():
         raise Cancelled()
+    job.bytes = max(0, _staged_bytes(job.stage) - job.before)  # pulled by this run, before unrar
     if job.stage.exists():
         n = extract_archives(job.stage)
         if n:
             log(f"    extracted {n} RAR set(s) in '{job.rec.get('release_name')}'")
-    job.bytes = max(0, _staged_bytes(job.stage) - before)
 
 
 def _process(job):
