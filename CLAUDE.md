@@ -265,8 +265,10 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
 
 ### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
 
-**Status (2026-09-25):** live for **private** torrents (`BRIDGE_ROUTE=private:seedbox,public:seedr`). Rollout plan:
-public too once the P1 pull worker has parallel SFTP streams (single stream = 12 MB/s vs Seedr ~38); plan file
+**Status (2026-09-27):** live for **private** torrents (`BRIDGE_ROUTE=private:seedbox,public:seedr`). Public stays on
+Seedr: the box's **shared uplink**, not our client, caps pulls home — 32-40 MB/s evenings, **4 MB/s** at a busy hour
+(2026-09-26 04:20 EDT; a cached re-read was just as slow, so network, not disk; no PMSS throttle on the account),
+while the home line does ~127 MB/s from Helsinki. Research + numbers: plan file
 `~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`.
 
 - **Secrets come from Bitwarden Secrets Manager** (cloud, US), never `.env`: `vault.py` shells out to the
@@ -280,8 +282,15 @@ public too once the P1 pull worker has parallel SFTP streams (single stream = 12
   qBit key = `restrict,port-forwarding,permitopen="127.0.0.1:*",command="/bin/false"` (tunnel only).
   Host key pinned in `media-bridge/config/seedbox_known_hosts` (+ vault copy); unknown/changed = refuse.
 - **qBittorrent** listens on the box's `127.0.0.1:<~/.qbittorrentPort>` (37301 today; PMSS may move it —
-  re-read on connection errors), reached through a paramiko direct-tcpip tunnel + a local forwarder. Pulls: `PULL_SEGMENTS` (4)
-  parallel SFTP streams per file ≥ 64 MiB, each on its own SSH connection, resumable via `<file>.part.map`.
+  re-read on connection errors), reached through a paramiko direct-tcpip tunnel + a local forwarder.
+- **Pulls** (paramiko, one SSH connection per stream): big files (≥ 64 MiB) one at a time in `PULL_SEGMENTS` (2)
+  ranges, resumable via `<file>.part.map` (saved only after an fsync, atomically); small files
+  `PULL_PARALLEL_FILES` (4) at a time. Pull connections are tuned (`_sftp_transport`/`_sftp_client`/`_open_remote`):
+  16 MiB window (`SEEDBOX_SFTP_WINDOW_MB`; every SSH stack's 2 MiB default caps a stream at ~12 MB/s at 110 ms),
+  255 KiB requests (`SEEDBOX_SFTP_REQUEST`, **never above 261120** = OpenSSH's max read: a clamped reply makes
+  paramiko drop prefetch), AES-GCM preferred. Measured 2026-09-26: tuned = lftp+HPN-SSH speed (both hit the box
+  cap), 16 vs 34 CPU-s/GB; rclone/aria2 no better (aria2 needs the account password); **lftp `get1
+  --target-position` corrupts earlier-written ranges** — never use it to fill one file in several passes.
   Its WebUI password is its own random one; **a password change in the Pulsed panel resets it to the
   account password** (PMSS `changePw.php`) → the bridge stops at the FIRST refused login (qBittorrent bans
   127.0.0.1 after repeated failures, which also locks the user's WebUI) and ntfys.

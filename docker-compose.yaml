@@ -173,9 +173,13 @@ services:
       #     iptorrents is 48h only while the account is VIP (H&R-exempt until 2026-10-25): set it
       #     to 1.0|336h when VIP ends. private-default covers unknown trackers and stays strictest.
       - SEED_RULES=hd-space=48h,iptorrents=48h,torrenthaven=120h,retrotoon=72h,czteam=1.0|72h,private-default=336h
-      # --- pulls home (puller.py): parallel SFTP streams per big file (measured on the box: 1 -> 13,
-      #     4 -> 32, 8 -> 30 MB/s), and never start a pull that would leave less than this free here.
-      - PULL_SEGMENTS=4
+      # --- pulls home (puller.py): tuned SFTP (16 MiB window, 255 KiB requests, AES-GCM) fills the
+      #     box's shared uplink (~40 MB/s evenings) with 1-2 streams per big file; small files (scene
+      #     RAR volumes) go 4 at a time (11.7 -> 36.6 MB/s). Measured 2026-09-26. Never start a pull
+      #     that would leave less than PULL_MIN_FREE_GB free here.
+      - PULL_SEGMENTS=2
+      - PULL_PARALLEL_FILES=4
+      - SEEDBOX_SFTP_WINDOW_MB=16
       - PULL_MIN_FREE_GB=25
       # --- retry rules (user decisions 2026-09-25). Both start in DRY-RUN: they only log what they
       #     would do (`python -m bridgelog` / events table) until switched to false after review.

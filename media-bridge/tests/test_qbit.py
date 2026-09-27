@@ -486,6 +486,44 @@ class PullFixesTest(unittest.TestCase):
         (self.root / "home/u/data" / name).write_bytes(data)
         return {"files": [{"remote": f"/home/u/data/{name}", "rel": [name], "size": len(data)}]}
 
+    def small_files(self, n, size=5000):
+        files = []
+        for i in range(n):
+            data = os.urandom(size)
+            (self.root / "home/u/data" / f"r{i}.rar").write_bytes(data)
+            files.append(({"remote": f"/home/u/data/r{i}.rar", "rel": ["Rel", f"r{i}.rar"], "size": size}, data))
+        return {"files": [f for f, _ in files]}, files
+
+    def test_small_files_pulled_several_at_a_time(self):
+        q.READ_SIZE, q.SEGMENT_MIN = 1000, 10**9
+        saved, q.PULL_PARALLEL_FILES = q.PULL_PARALLEL_FILES, 3
+        plan, files = self.small_files(7)
+        try:
+            self.be.pull({"title": "T"}, plan, self.dest)
+        finally:
+            q.PULL_PARALLEL_FILES = saved
+        for f, data in files:
+            self.assertEqual(self.dest.joinpath(*f["rel"]).read_bytes(), data)
+        self.assertEqual(len(self.clients), 3, "one connection per parallel file")
+        self.assertTrue(all(c.reads for c in self.clients), "every connection did work")
+
+    def test_small_file_failure_stops_the_others_and_raises(self):
+        q.READ_SIZE, q.SEGMENT_MIN = 1000, 10**9
+        plan, files = self.small_files(8)
+        orig = self.be.remote.open_sftp
+
+        def open_sftp():
+            t, c = orig()
+            c.delay = 0.01
+            if len(self.clients) == 2:
+                c.fail_after = 1
+            return t, c
+        self.be.remote.open_sftp = open_sftp
+        with self.assertRaises(OSError):
+            self.be.pull({"title": "T"}, plan, self.dest)
+        done = [f for f, _ in files if self.dest.joinpath(*f["rel"]).exists()]
+        self.assertLess(len(done), len(files), "the rest were not pulled after the failure")
+
     def test_small_file_pull_honours_cancel_and_resumes(self):
         q.READ_SIZE, q.SEGMENT_MIN = 1000, 10**9  # single-stream _get
         data = bytes(range(250)) * 20
@@ -520,11 +558,13 @@ class PullFixesTest(unittest.TestCase):
     def test_reads_ask_paramiko_for_one_request_at_a_time(self):
         data = os.urandom(20_000)
         plan = self.remote_file("R.mkv", data)
-        CountingFile.MAX_REQUEST_SIZE = 512
+        CountingFile.MAX_REQUEST_SIZE = 32768  # paramiko's default; the pull raises it to SFTP_REQUEST
+        saved, q.SFTP_REQUEST = q.SFTP_REQUEST, 512
         try:
             self.be.pull({"title": "T"}, plan, self.dest)
         finally:
             del CountingFile.MAX_REQUEST_SIZE
+            q.SFTP_REQUEST = saved
         self.assertEqual((self.dest / "R.mkv").read_bytes(), data)
         self.assertLessEqual(max(r for c in self.clients for r in c.reads), 512)
 
@@ -665,20 +705,22 @@ class RealParamikoTest(unittest.TestCase):
             st.set_subsystem_handler("sftp", pk.SFTPServer, Files)
             st.start_server(event=threading.Event(), server=Server())
             self.servers.append(st)
-            ct = pk.Transport(a)
+            ct = q._sftp_transport(pk, a)  # the production tuning, over a real paramiko server
             ct.start_client(timeout=10)
             ct.auth_none("u")
-            return ct, pk.SFTPClient.from_transport(ct)
+            self.clients.append(ct)
+            return ct, q._sftp_client(pk, ct)
 
         self.be = q.QbitBackend()
         self.be.remote = FakeRemote(None, self.root)
+        self.clients = []
         self.be.remote.open_sftp = open_sftp
-        self.saved = (q.SEGMENT_MIN, q.PULL_SEGMENTS, q.PREFETCH_REQUESTS)
+        self.saved = (q.SEGMENT_MIN, q.PULL_SEGMENTS, q.PREFETCH_REQUESTS, q.SFTP_REQUEST)
         q.SEGMENT_MIN, q.PULL_SEGMENTS = 1 << 20, 4
         self.dest = self.tmp / "stage"
 
     def tearDown(self):
-        q.SEGMENT_MIN, q.PULL_SEGMENTS, q.PREFETCH_REQUESTS = self.saved
+        q.SEGMENT_MIN, q.PULL_SEGMENTS, q.PREFETCH_REQUESTS, q.SFTP_REQUEST = self.saved
         for st in self.servers:
             st.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -693,9 +735,21 @@ class RealParamikoTest(unittest.TestCase):
         plan = {"files": [{"remote": "/home/u/data/Real.mkv", "rel": ["Real.mkv"], "size": len(data)}]}
         self.be.pull({"title": "T"}, plan, self.dest)
         self.assertEqual((self.dest / "Real.mkv").read_bytes(), data)
+        ct = self.clients[0]
+        self.assertEqual(ct.local_cipher, q.SFTP_CIPHER, "the preferred cipher is negotiated")
+        self.assertEqual(ct.default_window_size, q.SFTP_WINDOW)
+
+    def test_big_requests_through_real_paramiko(self):
+        # 255 KiB requests (OpenSSH's max read) over many ranges, odd sizes included: byte-exact
+        data = os.urandom((5 << 20) + 12345)
+        (self.root / "home/u/data/Big.mkv").write_bytes(data)
+        plan = {"files": [{"remote": "/home/u/data/Big.mkv", "rel": ["Big.mkv"], "size": len(data)}]}
+        self.be.pull({"title": "T"}, plan, self.dest)
+        self.assertEqual((self.dest / "Big.mkv").read_bytes(), data)
 
     def test_cancelled_pull_leaves_no_prefetch_thread_spinning(self):
         q.PREFETCH_REQUESTS = 4  # few slots: the prefetch thread sits in its wait loop
+        q.SFTP_REQUEST = 32768  # small requests, so the pull is still running when the cancel lands
         self.delay = 0.02  # 32 requests per stream -> ~0.6 s, so the 0.3 s cancel lands mid-pull
         data = os.urandom(4 << 20)
         (self.root / "home/u/data/Slow.mkv").write_bytes(data)
