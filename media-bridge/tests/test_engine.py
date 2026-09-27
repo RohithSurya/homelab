@@ -573,6 +573,79 @@ class ImportFixTest(unittest.TestCase):
         self.assertFalse(bridge._watch_file().exists())
 
 
+class FollowModeTest(unittest.TestCase):
+    """Bridge side of follow mode: steps while downloading, the final pull waits for a running step."""
+    setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
+    drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop
+
+    def arm(self):
+        self.calls = []
+        saved = (bridge.FOLLOW, bridge.FOLLOW_INTERVAL, bridge.FOLLOW_MIN, Fake.follows)
+        bridge.FOLLOW, bridge.FOLLOW_INTERVAL, bridge.FOLLOW_MIN, Fake.follows = "all", 0, 0, True
+        bridge.FOLLOW_AT.clear()
+        FAKE.prepare_follow = lambda rec, stage: {"kind": "follow", "new_bytes": 1, "pieces": [1]}
+        orig = Fake.pull
+
+        def pull(be, rec, plan, dest, cancel=None):
+            if isinstance(plan, dict) and plan.get("kind") == "follow":
+                self.calls.append("step")
+                return {"verified": 3, "bad": 1, "bytes": 100, "left": 5}
+            self.calls.append("final")
+            return orig(be, rec, plan, dest, cancel)
+        Fake.pull = pull
+
+        def undo():
+            bridge.FOLLOW, bridge.FOLLOW_INTERVAL, bridge.FOLLOW_MIN, Fake.follows = saved
+            Fake.pull = orig
+            del FAKE.prepare_follow
+            while not puller._q.empty():  # never leak a queued job into the next test
+                puller._q.get_nowait()
+        self.addCleanup(undo)
+
+    def test_steps_while_downloading_then_final_pull(self):
+        self.arm()
+        self.drop("Follow Me 2026 1080p WEB")
+        self.loop()  # added, and already downloading -> a step is queued and run
+        self.loop()  # step result recorded, another step
+        self.assertEqual(self.calls, ["step", "step"])
+        self.assertEqual(self.rec("Follow Me 2026 1080p WEB")["followed"], 100)
+        FAKE.t["h-Follow Me 2026 1080p WEB"]["done"] = True
+        self.loop()  # DONE: the finished step is forgotten, the final pull runs
+        self.loop()  # delivered
+        self.assertEqual(self.calls[-1], "final")
+        self.assertTrue((bridge.DATA / "downloads" / "radarr" / "Follow Me 2026 1080p WEB" / "movie.mkv").exists())
+
+    def test_final_pull_waits_for_a_running_step(self):
+        self.arm()
+        FAKE.prepare_follow = lambda rec, stage: None  # nothing ready yet: no step on the first loop
+        self.drop("Wait For It 2026 1080p WEB")
+        self.loop()
+        rec = self.rec("Wait For It 2026 1080p WEB")
+        FAKE.t["h-Wait For It 2026 1080p WEB"]["done"] = True
+        job = puller.submit(FAKE, rec, {"kind": "follow"}, bridge.INCOMING / "radarr" / "x", kind="follow")
+        bridge.check_completions()  # DONE, but a step is still queued: no final pull yet
+        self.assertIs(puller.get(rec["tid"]), job)
+        puller.run_pending()
+        self.loop()  # step done -> final pull queued and run
+        self.loop()
+        self.assertEqual(self.calls, ["step", "final"])
+
+    def test_interval_is_honoured_across_loops(self):
+        self.arm()
+        bridge.FOLLOW_INTERVAL = 3600
+        self.drop("Slow Poke 2026 1080p WEB")
+        for _ in range(4):
+            self.loop()
+        self.assertEqual(self.calls, ["step"], "one check per FOLLOW_INTERVAL, though recs are re-read")
+
+    def test_off_by_default_and_private_only_when_private(self):
+        self.arm()
+        bridge.FOLLOW = "private"
+        self.drop("Public One 2026 1080p WEB")
+        self.loop()
+        self.loop()
+        self.assertEqual(self.calls, [], "public transfer, FOLLOW=private: no steps")
+
 class PublicTrackersTest(unittest.TestCase):
     setUp, tearDown = EngineTest.setUp, EngineTest.tearDown
     drop, recs, rec, save, loop = EngineTest.drop, EngineTest.recs, EngineTest.rec, EngineTest.save, EngineTest.loop

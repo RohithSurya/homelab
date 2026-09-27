@@ -39,6 +39,7 @@ import time
 import requests
 
 import vault
+from backends import follow
 from backends.base import (
     DONE,
     DOWNLOADING,
@@ -49,7 +50,7 @@ from backends.base import (
     Rejected,
 )
 from common import clog, ntfy
-from torrentfile import magnet_meta, torrent_meta
+from torrentfile import magnet_meta, parse_torrent, torrent_meta
 
 HOST = os.environ.get("SEEDBOX_SSH_HOST", "")
 SSH_PORT = int(os.environ.get("SEEDBOX_SSH_PORT", "22"))
@@ -84,6 +85,12 @@ SEGMENT_MIN = int(float(os.environ.get("PULL_SEGMENT_MIN_MB", "64")) * 1024**2) 
 # Small files (scene RAR volumes: dozens of ~50 MB files) this many at a time, one connection each:
 # per-file setup costs round trips, so one at a time ran at 11.7 MB/s vs 36.6 four at a time.
 PULL_PARALLEL_FILES = int(os.environ.get("PULL_PARALLEL_FILES", "4"))
+# Follow mode (backends/follow.py): at most this much per step, so another transfer's final pull
+# never waits long behind one; and at completion, re-read pieces that failed their hash (libtorrent
+# reported them before they reached disk) up to FOLLOW_PASSES times, FOLLOW_RETRY_WAIT s apart.
+FOLLOW_STEP = int(float(os.environ.get("FOLLOW_STEP_MB", "2048")) * 1024**2)
+FOLLOW_PASSES = int(os.environ.get("FOLLOW_PASSES", "3"))
+FOLLOW_RETRY_WAIT = float(os.environ.get("FOLLOW_RETRY_WAIT", "10"))
 QUOTA_REFRESH = 120
 DEFAULT_RULE = {"hours": 336.0, "ratio": None}  # a held rec that somehow lacks its rule
 CHUNK = 1 << 20  # pwrite batch
@@ -639,10 +646,130 @@ class QbitBackend(Backend):
             "size": sum(f.get("size", 0) for f in files),
         }
 
+    # --- follow mode (see backends/follow.py) ----------------------------------------------------
+
+    follows = True
+
+    def _follow_layout(self, h):
+        """(layout, piece hashes) from the torrent itself, or None if it can't be followed."""
+        r = self._api_soft("GET", "/torrents/export", params={"hash": h})
+        if r is None:
+            return None
+        _, info, _ = parse_torrent(r.content)
+        if b"pieces" not in info or b"piece length" not in info:
+            return None  # v2-only torrent: no v1 piece hashes to verify against
+        props = self._api("GET", "/torrents/properties", params={"hash": h}).json()
+        skip = {f["name"] for f in self._api("GET", "/torrents/files", params={"hash": h}).json()
+                if f.get("priority", 1) == 0}
+        return follow.layout(info, props["save_path"], skip), info[b"pieces"]
+
+    def _api_soft(self, method, path, **kw):
+        """_api, but None on a 404/409 (an endpoint this qBittorrent lacks, a vanished hash)."""
+        try:
+            return self._api(method, path, **kw)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (404, 409):
+                return None
+            raise
+
+    def prepare_follow(self, rec, stage):
+        h = (rec.get("torrent_hash") or "").lower()
+        if not h:
+            return None
+        st = follow.load(stage)
+        if st is not None and st.get("hash") != h:
+            st = None  # another torrent's leftovers: the step resets them
+        init = None
+        if st is None:
+            init = self._follow_layout(h)
+            if init is None:
+                return None
+            lay = init[0]
+            want = follow.needed(dict(lay))
+            verified = None
+        else:
+            lay, want, verified = st, follow.needed(st), st["verified"]
+        states = self._api("GET", "/torrents/pieceStates", params={"hash": h}).json()
+        new = [i for i, s in enumerate(states) if s == 2 and i in want and not (verified and verified[i])]
+        return {"kind": "follow", "hash": h, "init": init, "pieces": new,
+                "new_bytes": len(new) * lay["piece_len"]}
+
+    def _follow_fetch(self, st, stage, pieces, cancel):
+        conns = []
+        try:
+            for _ in range(max(1, PULL_SEGMENTS)):
+                conns.append(self.remote.open_sftp())
+            try:
+                return follow.fetch(st, stage, pieces, [c[1] for c in conns], _open_remote, PREFETCH_REQUESTS, cancel)
+            finally:
+                follow.save(stage, st)  # whatever was verified (and fsynced) counts, even on error
+        finally:
+            for t, sftp in conns:
+                for x in (sftp, t):
+                    try:
+                        x.close()
+                    except Exception:
+                        pass
+
+    def _follow_step(self, rec, plan, stage, cancel):
+        st = follow.load(stage)
+        if st is None or st.get("hash") != plan["hash"]:
+            if plan.get("init") is None:
+                return None
+            follow.discard(stage, st)
+            lay, hashes = plan["init"]
+            for f in lay["files"]:
+                if follow.writable(f):
+                    _local_path(stage, f["rel"])  # names come from the torrent: refuse escapes
+            st = follow.init(stage, plan["hash"], lay, hashes)
+        todo, size = [], 0
+        for i in plan["pieces"]:
+            if not st["verified"][i]:
+                todo.append(i)
+                size += st["piece_len"]
+                if size >= FOLLOW_STEP:
+                    break
+        if not todo:
+            return {"verified": 0, "bad": 0, "bytes": 0}
+        ok, bad, got = self._follow_fetch(st, stage, todo, cancel)
+        return {"verified": ok, "bad": bad, "bytes": got, "left": len(follow.missing(st))}
+
+    def _follow_finish(self, rec, st, stage, cancel):
+        """At completion: the pieces follow steps didn't get, then the final names."""
+        t0, got = time.time(), 0
+        for attempt in range(FOLLOW_PASSES):
+            todo = follow.missing(st)
+            if not todo or (cancel is not None and cancel.is_set()):
+                break
+            if attempt:
+                time.sleep(FOLLOW_RETRY_WAIT)  # hash failures: let the box flush those pieces
+            got += self._follow_fetch(st, stage, todo, cancel)[2]
+        if cancel is not None and cancel.is_set():
+            return
+        left = follow.missing(st)
+        if left:
+            raise RuntimeError(f"{len(left)} pieces failed verification after {FOLLOW_PASSES} passes")
+        follow.finalize(stage, st)
+        secs = max(time.time() - t0, 1e-6)
+        log(f"    follow: completed '{rec.get('title')}' with {got:,} bytes after the download ({got / secs / 1e6:.1f} MB/s)")
+
     def pull(self, rec, plan, dest_dir, cancel=None):
         """Pull worker thread: every file of the plan over SFTP. Big files one at a time, each in
         PULL_SEGMENTS parallel streams; small files PULL_PARALLEL_FILES at a time. Every stream
-        has its own SSH connection."""
+        has its own SSH connection. A follow step (plan["kind"] == "follow") pulls finished pieces
+        of a torrent that is still downloading; a final pull whose stage holds follow state only
+        fills in what the steps didn't get."""
+        if isinstance(plan, dict) and plan.get("kind") == "follow":
+            return self._follow_step(rec, plan, dest_dir, cancel)
+        st = follow.load(dest_dir)
+        if st is not None:
+            if st.get("hash") == (rec.get("torrent_hash") or "").lower():
+                try:
+                    return self._follow_finish(rec, st, dest_dir, cancel)
+                except Exception as e:
+                    # never let follow mode cost a delivery: drop what it pulled, pull normally
+                    log(f"    follow: finishing '{rec.get('title')}' failed ({e}); pulling it the normal way")
+            follow.discard(dest_dir, st)  # another torrent's leftovers, or a failed follow
         conns = []
 
         def streams(n):

@@ -291,6 +291,17 @@ while the home line does ~127 MB/s from Helsinki. Research + numbers: plan file
   paramiko drop prefetch), AES-GCM preferred. Measured 2026-09-26: tuned = lftp+HPN-SSH speed (both hit the box
   cap), 16 vs 34 CPU-s/GB; rclone/aria2 no better (aria2 needs the account password); **lftp `get1
   --target-position` corrupts earlier-written ranges** — never use it to fill one file in several passes.
+- **Follow mode** (`backends/follow.py`, `FOLLOW=off|private|all`, **off by default**): while a seedbox torrent
+  downloads, `maybe_follow` (bridge thread, every `FOLLOW_INTERVAL` 60 s, once `FOLLOW_MIN_MB` 128 are ready) queues
+  a `kind="follow"` puller job that copies qBittorrent's **finished pieces** (`/torrents/pieceStates`) as byte ranges,
+  SHA-1-checks each against the torrent itself (`/torrents/export` — exact layout incl. BEP 47 pad files, which
+  `/torrents/files` hides), and writes **only verified pieces** into sparse `<file>.part` in the stage dir, at most
+  `FOLLOW_STEP_MB` (2048) per step so other pulls never wait long. State: `.follow.json` (bitmap, saved after
+  fsync) + `.follow.hashes`. At DONE the final pull (it waits for a running step) fetches only the missing
+  pieces (`FOLLOW_PASSES` tries: libtorrent reports pieces before they reach disk — a hash failure, re-read later),
+  renames, delivers as usual; **any failure there discards the follow state and pulls normally**. No export (old
+  qBittorrent) or a v2-only torrent → normal pull. Measured with the prototype: home 8–29 s after the box
+  finished vs ~2 min for 4 GB; status page shows "home X GiB" for followed downloads.
   Its WebUI password is its own random one; **a password change in the Pulsed panel resets it to the
   account password** (PMSS `changePw.php`) → the bridge stops at the FIRST refused login (qBittorrent bans
   127.0.0.1 after repeated failures, which also locks the user's WebUI) and ntfys.

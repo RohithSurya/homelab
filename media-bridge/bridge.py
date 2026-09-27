@@ -133,6 +133,13 @@ IMPORT_WATCH_TTL = int(os.environ.get("IMPORT_WATCH_TTL", str(24 * 3600)))
 IMPORT_BLOCK_RE = re.compile(r"title mismatch|unknown (series|movie)", re.I)
 VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv")
 _import_checked_at = 0.0
+# Follow mode: while a torrent downloads on a backend that supports it (the seedbox), pull its
+# finished pieces every FOLLOW_INTERVAL s once FOLLOW_MIN_MB are ready, so it is home moments after
+# the box finishes (backends/follow.py). off | private | all (the seedbox only takes private today).
+FOLLOW = os.environ.get("FOLLOW", "off").lower()
+FOLLOW_INTERVAL = int(os.environ.get("FOLLOW_INTERVAL", "60"))
+FOLLOW_MIN = float(os.environ.get("FOLLOW_MIN_MB", "128")) * 1024**2
+FOLLOW_AT = {}  # tid -> last follow check (records are re-read from disk every loop)
 # A transfer its backend can't see (UNAVAILABLE) for this long is ntfy'd once.
 UNAVAILABLE_ALERT = int(os.environ.get("UNAVAILABLE_ALERT", "7200"))
 ARR = {
@@ -1151,7 +1158,8 @@ def check_one(be, sp, rec):
         if check_failfast(be, cat, rec, sp, prog, now):
             return
         check_slow(be, cat, rec, sp, prog, now)
-        return  # still in progress -> do NOT fetch yet
+        maybe_follow(be, cat, rec, sp)
+        return  # still in progress -> only finished pieces (follow mode), never the whole fetch
     if state == DONE:
         result = info
         # Deliver under the release name the *arr GRABBED, not the backend's name for the
@@ -1162,6 +1170,11 @@ def check_one(be, sp, rec):
         dest = DATA / "downloads" / cat / release
         stage = INCOMING / cat / release
         job = puller.get(rec["tid"])
+        if job is not None and job.kind == "follow":
+            if job.status in ("queued", "waiting_space", "running"):
+                return  # let the last follow step finish; the final pull builds on it
+            puller.forget(rec["tid"])
+            job = None
         if job is None:
             # hand the pull to the worker; this loop moves on (a 30 GB pull no longer blocks it)
             try:
@@ -1213,6 +1226,37 @@ def check_one(be, sp, rec):
         return
     be.log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
     handle_missing_result(be, cat, rec, sp)
+
+
+def maybe_follow(be, cat, rec, sp):
+    """Follow mode: queue one step (the finished pieces not yet home) when enough is ready."""
+    if FOLLOW == "off" or not be.follows or (FOLLOW == "private" and not rec.get("private")):
+        return
+    job = puller.get(rec["tid"])
+    if job is not None:
+        if job.status in ("queued", "waiting_space", "running"):
+            return
+        puller.forget(rec["tid"])
+        r = job.result if isinstance(job.result, dict) else {}
+        if job.status == "failed":
+            be.log(f"    follow step for '{rec['title']}' failed: {job.error}; next step retries")
+        elif r.get("verified") or r.get("bad"):
+            rec["followed"] = rec.get("followed", 0) + r.get("bytes", 0)
+            save(sp, rec)
+            ev.emit(rec, "follow_step", None, verified=r.get("verified"), bad=r.get("bad"),
+                    bytes=r.get("bytes"), left=r.get("left"))
+    now = time.time()
+    if now - FOLLOW_AT.get(rec["tid"], 0) < FOLLOW_INTERVAL:
+        return
+    FOLLOW_AT[rec["tid"]] = now  # losing it on a restart only means one early check
+    stage = INCOMING / cat / (rec.get("release_name") or rec["title"])
+    try:
+        plan = be.prepare_follow(rec, stage)
+    except Exception as e:
+        be.log(f"    can't plan a follow step for '{rec['title']}': {e}")
+        return
+    if plan and plan["new_bytes"] >= FOLLOW_MIN:
+        puller.submit(be, rec, plan, stage, rec.get("size"), kind="follow")
 
 
 def check_failfast(be, cat, rec, sp, prog, now):

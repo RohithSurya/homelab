@@ -38,6 +38,7 @@ class FakeQbit:
         self.adds, self.deleted, self.resumed = [], [], []
         self.logins = 0
         self.password = PASSWORD
+        self.export, self.pieces, self.props = {}, {}, {}  # follow mode
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -77,6 +78,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(ts), "application/json")
         if u.path == "/api/v2/torrents/files":
             return self._send(200, json.dumps(S.files.get(qs["hash"], [])), "application/json")
+        if u.path == "/api/v2/torrents/export" and qs["hash"] in S.export:
+            return self._send(200, S.export[qs["hash"]], "application/x-bittorrent")
+        if u.path == "/api/v2/torrents/pieceStates" and qs["hash"] in S.pieces:
+            return self._send(200, json.dumps(S.pieces[qs["hash"]]), "application/json")
+        if u.path == "/api/v2/torrents/properties" and qs["hash"] in S.props:
+            return self._send(200, json.dumps(S.props[qs["hash"]]), "application/json")
         self._send(404)
 
     def do_POST(self):

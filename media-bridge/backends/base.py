@@ -63,6 +63,9 @@ class Backend:
     # blackhole until space frees up (a seedbox that is merely busy seeding).
     full_retries = None
     # wording for the unfetchable-result log line and ntfy body
+    # Follow mode (pull finished pieces while the torrent still downloads): backends that can
+    # say which pieces are done and read byte ranges set this and implement prepare_follow.
+    follows = False
     fetch_fail_log = "fetch failing"
     fetch_fail_note = "reported it complete but its files could not be fetched"
 
@@ -99,6 +102,12 @@ class Backend:
         """Bridge thread: whatever the pull needs from the backend's API (e.g. the file list), so
         the pull worker never shares an API session with the bridge loop. Default: the result."""
         return result
+
+    def prepare_follow(self, rec, stage):
+        """Bridge thread, follow mode: a plan for one follow step (plan["kind"] == "follow",
+        plan["new_bytes"] = how much is newly ready), or None when there is nothing to do or the
+        transfer can't be followed. The step itself runs through pull() on the worker."""
+        return None
 
     def pull(self, rec, plan, dest_dir, cancel):
         """Pull worker thread: copy the finished transfer described by `plan` into dest_dir,

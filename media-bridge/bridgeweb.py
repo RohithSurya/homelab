@@ -22,6 +22,7 @@ import backends
 import bridge
 import bridgelog as ev
 import puller
+from backends import follow
 
 CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'"
 TZ = time.strftime("%Z")
@@ -135,6 +136,12 @@ def _transfer(rec):
         seeds = snap.get("num_complete", snap.get("seeders"))
         if seeds is not None:
             out["detail"] = f"swarm seeds {seeds}, connected {snap.get('num_seeds', snap.get('connected_to', '?'))}"
+        stage = bridge.INCOMING / rec["category"] / rel
+        if (stage / follow.STATE).exists():  # follow mode: finished pieces already copied home
+            got = puller._staged_bytes(stage)
+            out["followed_bytes"] = got
+            home = f"home {got / 2**30:.2f} GiB" + (f" of {rec['size'] / 2**30:.2f}" if rec.get("size") else "")
+            out["detail"] = f"{out['detail']}; {home}" if out.get("detail") else home
     return out
 
 

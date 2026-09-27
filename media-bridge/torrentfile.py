@@ -39,7 +39,11 @@ def _bdecode(data, i):
 
 def read_torrent(path):
     """(raw info-dict bytes, decoded info dict, tracker URLs) of a .torrent file."""
-    data = path.read_bytes()
+    return parse_torrent(path.read_bytes())
+
+
+def parse_torrent(data):
+    """read_torrent for .torrent bytes already in memory (e.g. qBittorrent's /torrents/export)."""
     if data[:1] != b"d":
         raise ValueError("not a bencoded dict")
     i = 1

@@ -74,8 +74,10 @@ def extract_archives(stage, unrar="unrar"):
 
 
 class Job:
-    def __init__(self, tid, be, rec, plan, stage, size):
+    def __init__(self, tid, be, rec, plan, stage, size, kind="pull"):
         self.tid, self.be, self.rec, self.plan, self.stage, self.size = tid, be, rec, plan, stage, size
+        self.kind = kind  # pull | follow (one step of pulling finished pieces while it downloads)
+        self.result = None  # what be.pull returned (a follow step's counts)
         self.cancel = threading.Event()
         self.status = "queued"  # queued | waiting_space | running | done | failed | cancelled
         self.error = None
@@ -93,12 +95,12 @@ def log(msg):
     clog("bridge", msg)
 
 
-def submit(be, rec, plan, stage, size=None):
+def submit(be, rec, plan, stage, size=None, kind="pull"):
     """Queue a pull (idempotent per transfer id). Returns the job."""
     with _lock:
         job = _jobs.get(rec["tid"])
         if job is None:
-            job = Job(rec["tid"], be, dict(rec), plan, stage, size)
+            job = Job(rec["tid"], be, dict(rec), plan, stage, size, kind)
             _jobs[rec["tid"]] = job
             _q.put(job)
         return job
@@ -173,11 +175,11 @@ def _run(job):
             raise Cancelled()
     job.before = _staged_bytes(job.stage)  # already there from an interrupted pull
     job.status, job.started = "running", time.time()
-    job.be.pull(job.rec, job.plan, job.stage, job.cancel)
+    job.result = job.be.pull(job.rec, job.plan, job.stage, job.cancel)
     if job.cancel.is_set():
         raise Cancelled()
     job.bytes = max(0, _staged_bytes(job.stage) - job.before)  # pulled by this run, before unrar
-    if job.stage.exists():
+    if job.kind == "pull" and job.stage.exists():  # a follow step's files are still partial
         n = extract_archives(job.stage)
         if n:
             log(f"    extracted {n} RAR set(s) in '{job.rec.get('release_name')}'")
