@@ -228,6 +228,8 @@ def _active(data="/data"):
     incoming = pathlib.Path(data) / "downloads" / ".incoming"
     rows = []
     for sp in sorted(state.glob("*.json")):
+        if sp.name.startswith("."):  # .import-watch.json is not a transfer
+            continue
         try:
             r = json.loads(sp.read_text())
         except (OSError, ValueError):

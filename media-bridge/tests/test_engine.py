@@ -190,6 +190,21 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("Real Steel 2011 1080p BluRay x264", self.recs())
         self.assertIn(("discard", "Real Steel 2011 1080p BluRay x264"), FAKE.calls)
 
+    def test_import_watch_file_is_not_a_transfer(self):
+        # pathlib's glob("*.json") matches dotfiles: .import-watch.json was loaded as a state,
+        # got a tid written into it, and crashed every loop on rec["title"] (2026-09-27)
+        bridge.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        watch = {"t1": {"category": "radarr", "release": "X", "dest": "/x", "keys": [], "tid": "t1",
+                        "at": 0, "tries": 0}}
+        bridge._watch_file().write_text(json.dumps(watch))
+        self.drop("Real Steel 2011 1080p BluRay x264")
+        self.loop()
+        FAKE.t["h-Real Steel 2011 1080p BluRay x264"]["done"] = True
+        self.loop()
+        self.loop()
+        self.assertTrue((self.tmp / "downloads/radarr/Real Steel 2011 1080p BluRay x264/movie.mkv").exists())
+        self.assertEqual(json.loads(bridge._watch_file().read_text()), watch, "watch file left untouched")
+
     def test_failed_fetch_never_touches_watch_folder(self):
         self.drop("Broken 2019 1080p WEB")
         self.loop()

@@ -34,7 +34,7 @@ from xml.sax.saxutils import escape
 
 import requests
 
-from common import clog, norm
+from common import clog, norm, ntfy
 
 # ---- config ----
 BASE = os.environ.get("MOVIERULZ_BASE", "").rstrip("/")  # required; set in .env (kept out of source)
@@ -67,6 +67,11 @@ ALIAS_REFRESH = int(os.environ.get("ALIAS_REFRESH", "900"))   # re-pull the Rada
 # Sonarr is the source of each show's year (see series_title). Reuses seedr's Sonarr credentials.
 SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
+# Stale-feed alert: ntfy (ops topic) when no NEW post has been seen for this many days -- the crawler
+# can run "successfully" while indexing nothing (a domain rotation went unnoticed for 10.7 days,
+# 2026-09-20 -> 09-30). Repeats at most every STALE_ALERT_REPEAT s until posts flow again.
+STALE_ALERT_DAYS = float(os.environ.get("MOVIERULZ_STALE_ALERT_DAYS", "4"))
+STALE_ALERT_REPEAT = float(os.environ.get("MOVIERULZ_STALE_ALERT_REPEAT", "86400"))
 
 # Best-effort language label parsed from the post slug (e.g. '...-telugu-7008.html' or
 # '...-telugu-dubbed-7112.html'). Functionally optional -- the feed matches by title, not language.
@@ -87,8 +92,11 @@ def log(msg):
 # Any internal post link, keyed on the trailing numeric id. Captures both URL schemes:
 #   Form A: /peddi-2026-dvdscr-telugu-7017.html
 #   Form B: /save-the-tigers-season-3-2026-telugu/movie-watch-online-free-7090.html
-_host = re.escape(urllib.parse.urlparse(BASE).netloc)
-POST_RE = re.compile(r'https?://' + _host + r'/[A-Za-z0-9/_-]+?-(\d+)\.html')
+# Any movierulz host, not just BASE's: the domain rotates (.solutions -> .institute, 2026-09) and the
+# old BASE keeps redirecting to the new one, so a BASE-only pattern matched ZERO post links and every
+# pass reported "0 posts" with no error for 10.7 days. crawl_once logs the new host when it moves.
+_HOST = r'(?:www\.)?\d*movierulz[a-z0-9-]*\.[a-z]{2,}(?:\.[a-z]{2,})?'
+POST_RE = re.compile(r'https?://(' + _HOST + r')/[A-Za-z0-9/_-]+?-(\d+)\.html', re.I)
 MAGNET_RE = re.compile(r'magnet:\?[^"\'<>\s]+')
 
 # Episode-range pack, e.g. "S02 EP (01-08)" -> indexed as multi-episode "S02E01-E08".
@@ -328,6 +336,8 @@ def crawl_once():
     with DB_LOCK:
         known_before = {r[0] for r in db().execute("SELECT post_id FROM posts").fetchall()}
     page, reached_end = 1, False
+    hosts = set()
+    seen_this_pass = set()
     while page <= MAX_PAGES:
         url = f"{BASE}{MOVIES_PATH}/page/{page}"
         status, html = fetch(url)
@@ -337,7 +347,8 @@ def crawl_once():
             break
         page_ids, seen_on_page = [], set()
         for mobj in POST_RE.finditer(html):
-            pid = int(mobj.group(1))
+            hosts.add(mobj.group(1).lower())
+            pid = int(mobj.group(2))
             if pid in seen_on_page:
                 continue
             seen_on_page.add(pid)
@@ -349,10 +360,15 @@ def crawl_once():
             if post_needs_fetch(pid):
                 total_releases += process_post(pid, purl, lang_from_slug(purl))
                 total_posts += 1
-        # incremental mode only: once a whole page is posts we already had before this pass, the rest
-        # downstream is older and already indexed -> stop.
-        if not backfilling and page >= MIN_PAGES and all(pid in known_before for pid, _ in page_ids):
+        # incremental mode only: once a whole page is posts we already had -- known before this pass, or
+        # seen on an earlier page of it -- the rest downstream is older and already indexed -> stop.
+        # "Earlier page" matters: every listing page carries a sidebar of the NEWEST posts, so with
+        # known_before alone any new post made every page look new and each pass walked all ~200
+        # pages (found 2026-09-30: page 100 had 19 of 36 ids first seen that pass).
+        if not backfilling and page >= MIN_PAGES and all(
+                pid in known_before or pid in seen_this_pass for pid, _ in page_ids):
             break
+        seen_this_pass.update(pid for pid, _ in page_ids)
         page += 1
     if backfilling and reached_end:
         set_meta("backfill_done", "1")
@@ -362,7 +378,42 @@ def crawl_once():
         with DB_LOCK:
             db().execute("DELETE FROM releases WHERE added_at < ?", (cutoff,))
             db().commit()
+    base_host = urllib.parse.urlparse(BASE).netloc.lower()
+    moved = sorted(h for h in hosts if h != base_host)
+    if moved:
+        log(f"domain moved: post links point at {', '.join(moved)} (MOVIERULZ_BASE is {base_host}; "
+            f"crawling through the redirect -- update MOVIERULZ_BASE in .env)")
+        set_meta("moved_to", ",".join(moved))
+    else:
+        set_meta("moved_to", "")
+    set_meta("last_pass", f"{page} page(s), {total_posts} posts fetched, {total_releases} releases")
     log(f"crawl done: scanned {page} page(s), {total_posts} posts fetched, {total_releases} releases indexed")
+
+
+def check_stale(now=None):
+    """ntfy when no new post has been seen for STALE_ALERT_DAYS (posts.scraped_at = first-seen), at
+    most every STALE_ALERT_REPEAT s; a fresh post resets it. Returns True if it alerted."""
+    now = now or time.time()
+    if STALE_ALERT_DAYS <= 0:
+        return False
+    with DB_LOCK:
+        newest = db().execute("SELECT max(scraped_at) FROM posts").fetchone()[0]
+    if newest is None or now - newest < STALE_ALERT_DAYS * 86400:
+        set_meta("stale_alert", 0)
+        return False
+    if now - float(get_meta("stale_alert") or 0) < STALE_ALERT_REPEAT:
+        return False
+    days = (now - newest) / 86400
+    moved = get_meta("moved_to") or ""
+    ntfy(f"movierulz: no new posts for {days:.1f} days",
+         f"MOVIERULZ_BASE={BASE}\n"
+         + (f"post links now point at {moved} -- update MOVIERULZ_BASE in .env and recreate media-bridge\n"
+            if moved else "check `docker compose logs flaresolverr` (ERR_NAME_NOT_RESOLVED = domain gone)\n")
+         + f"last pass: {get_meta('last_pass') or '?'}",
+         priority="high", tags="warning")
+    set_meta("stale_alert", now)
+    log(f"stale alert sent: newest post {days:.1f} days old")
+    return True
 
 
 def run_crawler():
@@ -376,6 +427,10 @@ def run_crawler():
             crawl_once()
         except Exception as e:
             log(f"crawl error: {e}")
+        try:
+            check_stale()
+        except Exception as e:
+            log(f"stale check error: {e}")
         time.sleep(CRAWL_INTERVAL)
 
 

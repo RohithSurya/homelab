@@ -40,6 +40,10 @@ services:
       - DNS_ADDRESS=9.9.9.9
       - DNS_UPSTREAM_RESOLVERS=quad9,google
       - TZ=Etc/UTC
+      # Built-in HTTP proxy (:8888) so off-VPN media-bridge can make plain requests from the VPN
+      # exit IP (tamilmv crawler: TAMILMV_HTTP_PROXY=http://gluetun:8888). NOT published on the
+      # host -- reachable only from docker networks via the `gluetun` hostname.
+      - HTTPPROXY=on
     ports:
       - 9696:9696                                # prowlarr UI (moved here from prowlarr)
       - 8000:8000                                # gluetun control/health API
@@ -229,14 +233,23 @@ services:
       - REQUEST_DELAY=3
       # --- tamilmv/tamilblasters scraper -> Torznab feed :8005 (replaces MediaFusion) ---
       # Seeds + per-language forum maps come from MediaFusion's upstream GitHub config (auto-tracks
-      # domain rotation); live domain resolved by following the seed's 301 redirect. Content pages
-      # fetched via the same FLARESOLVERR_URL as movierulz. Reuses FAKE_SEEDERS/REQUEST_DELAY above.
+      # domain rotation); live domain resolved by following the seed's 301 redirect. Pages, sitemap
+      # and .torrent attachments go plain HTTP through gluetun's proxy (VPN exit IP); FlareSolverr
+      # (FLARESOLVERR_URL) is the fallback on a CF challenge. Reuses FAKE_SEEDERS/REQUEST_DELAY above.
+      - TAMILMV_HTTP_PROXY=http://gluetun:8888
+      # Topic pages (every item's info link in Radarr/Sonarr, incl. '[DL-LINK]' direct links) use
+      # the Tailscale address, so they open at home and away (Radarr is reached the same way).
+      - TAMILMV_PUBLIC_URL=http://100.122.87.20:8005
+      # Backfill: topics of a listing page fetched in parallel (measured: 1 -> 1.62 s/topic,
+      # 3 -> 0.61, 4 -> 0.52 with request latency rising). Every topic problem -> JSONL log.
+      - TAMILMV_BACKFILL_WORKERS=3
+      - TAMILMV_ERRORS_LOG=/config/tamilmv_errors.jsonl
       - TAMILMV_CONFIG_URL=https://raw.githubusercontent.com/mhdzumair/MediaFusion/main/resources/json/scraper_config.json
       - TAMILMV_APIKEY=${TAMILMV_APIKEY}           # also the Torznab apikey entered in Prowlarr
       - TAMILMV_PORT=8005
       - TAMILMV_CONFIG_REFRESH=86400               # re-pull GitHub config daily
       - TAMILMV_CRAWL_INTERVAL=3600
-      - TAMILMV_MAX_PAGES=5                         # per-forum page cap (bounds each crawl pass)
+      - TAMILMV_MAX_PAGES=5                         # head walk: newest pages per forum each pass
       # Dead-site ntfy at most weekly (default daily). tamil_blasters has been a Cloudflare 522
       # behind its seed's redirect since 2026-08-23; a daily high-priority alert was just noise.
       # Recovery is still immediate: a successful resolve resets the timer.
@@ -282,8 +295,29 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
+  # ── home-egress: off-VPN HTTP proxy for IP-bound private-tracker sessions ─────────
+  # KrazyZone binds its login cookie to the IP you logged in from (the home IPv4); from
+  # the Proton exit IP it answers `Refresh: account-login.php` + deletes the cookie. So
+  # Prowlarr reaches ONLY those sites through this proxy (Prowlarr → Settings → Indexers →
+  # HTTP proxy 10.0.0.179:8006, tag `home-egress`, tag the indexer). Everything else stays
+  # on the VPN. Destination allowlist in home-egress/filter; clients limited to docker
+  # bridge sources (gluetun's netns), so LAN hosts can't use it. HTTP only — no BitTorrent.
+  home-egress:
+    build: ./home-egress
+    container_name: home-egress
+    ports:
+      - "8006:8888"                              # all interfaces (see media-bridge); never forward
+    volumes:
+      - ./home-egress:/etc/tinyproxy:ro          # tinyproxy.conf + filter; edit then `docker restart home-egress`
+    labels:
+      - 'wud.watch=false'
+      - 'updater.policy=never'
+      - "diun.enable=false"                        # locally-built image (no registry)
+    logging: *default-logging
+    restart: unless-stopped
+
   bazarr:
-    image: lscr.io/linuxserver/bazarr:v1.6.1-ls365   # pinned
+    image: lscr.io/linuxserver/bazarr:v1.6.2-ls366   # pinned
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+-ls\d+$$'
       - 'updater.policy=auto'

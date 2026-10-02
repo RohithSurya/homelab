@@ -30,7 +30,7 @@ docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun
 ```
 
 There is no build/lint tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its components as 8 supervised threads — 11 with daddylive re-enabled). To
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 10 supervised threads — 13 with daddylive re-enabled). To
 exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
 `unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
 blocks the user for it):
@@ -53,6 +53,13 @@ Consequences that drive most edits here:
   (or `docker compose down && up -d`). `media-bridge` and `jellyfin` are unaffected — and the
   `media-bridge` host-published feeds (movierulz Torznab `8002`, youtube grabber `8003`, tamilmv Torznab `8005`; daddylive `8004` is disabled) keep serving,
   since they are published on the host, not on gluetun.
+- **Recreate ≠ restart**: the dependents join gluetun by container ID (`container:<id>`), so after
+  gluetun is *recreated* (compose change, image bump) `docker restart` can't fix them — recreate them
+  too: `docker compose up -d --force-recreate --no-deps gluetun`, wait for healthy, then
+  `docker compose up -d --force-recreate --no-deps prowlarr flaresolverr sonarr radarr`.
+- **gluetun's built-in HTTP proxy** (`HTTPPROXY=on`, `:8888`, since 2026-09-30) lets off-VPN containers
+  make individual requests from the VPN exit IP via `http://gluetun:8888` (tamilmv crawler:
+  `TAMILMV_HTTP_PROXY`). Not published on the host — reachable only from docker networks.
 - **Cross-service URLs inside the netns**: containers sharing gluetun's namespace talk to the *arr
   apps via the hostname **`gluetun`** (e.g. `http://gluetun:7878`), NOT `radarr`/`sonarr` (which don't
   resolve). `media-bridge` (on the default bridge net) reaches the *arr apps AND FlareSolverr the same
@@ -437,6 +444,15 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   unset, the crawler disables itself but the Torznab feed still serves.
   **The domain rotates, and a dead one looks like a FlareSolverr fault, not a DNS one:** every page
   fetch fails with `500 Server Error ... /v1` from FlareSolverr, which reads as Cloudflare trouble.
+  **A rotation that still redirects is silent too** (`.solutions` → `.institute`, noticed 2026-09-30
+  after **10.7 days** of "scanned 1 page(s), 0 posts fetched" with no error): FlareSolverr follows the
+  301 and returns the new domain's listing, whose post links didn't match a `POST_RE` built from
+  BASE's host. `POST_RE` now matches **any `…movierulz.<tld>` host**, so the crawl keeps working through
+  the redirect and `crawl_once` logs `domain moved: post links point at <host> … update MOVIERULZ_BASE`
+  (meta `moved_to`). **Stale-feed ntfy** (`check_stale`, after every pass): when the newest post
+  (first-seen) is older than **`MOVIERULZ_STALE_ALERT_DAYS` (4)**, a high-priority push to the ops topic
+  names BASE, where it moved, and the last pass's result; it repeats at most daily
+  (`MOVIERULZ_STALE_ALERT_REPEAT`) and resets when posts flow again.
   Check `docker compose logs flaresolverr` for the real cause — `ERR_NAME_NOT_RESOLVED` means the
   domain is simply gone (`www.5movierulz.watch` went NXDOMAIN 2026-08-24 and the crawler indexed
   nothing for 11 days while FlareSolverr itself was healthy, still serving tamilmv fine). Fix is a
@@ -453,7 +469,10 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 - **Resumable backfill (`meta.backfill_done`):** until the catalogue has been fully walked once, *every*
   pass paginates to the real last page, so the long first backfill **survives restarts** (already-seen
   posts are skipped cheaply, making re-scans of early pages fast). On reaching the end it sets
-  `backfill_done=1` and switches to incremental: stop once a whole page is already-known, floored by
+  `backfill_done=1` and switches to incremental: stop once a whole page is already-known — known before
+  this pass **or seen on an earlier page of it** (every listing page repeats a sidebar of the NEWEST posts;
+  judged against "known before" alone, any new post made every page look new and each pass walked all
+  ~400 pages through FlareSolverr until 2026-09-30) — floored by
   `MIN_PAGES` (default 3, so a curated first page can't hide new posts sitting deeper) and capped by
   `MAX_PAGES` (1000, a safety net — the real stop is the last/empty page).
 - **Empty-post retry (`post_needs_fetch` + `posts.magnets`):** the site frequently publishes a movie's
@@ -537,8 +556,7 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
 - **Domain rotation (the key bit): seeds + per-language forum maps come from MediaFusion's UPSTREAM
   GitHub `scraper_config.json`** (`TAMILMV_CONFIG_URL`), refreshed daily and cached to
   `config/tamilmv_config.json`. The **live domain** is found by following the seed's 301 redirect
-  (`resolve_base`, plain HTTP — the redirect resolves at Cloudflare's edge, no FlareSolverr). Only the
-  **content pages** are CF-walled and go through the same `FLARESOLVERR_URL` as movierulz. Recovery
+  (`resolve_base`, plain HTTP — the redirect resolves at Cloudflare's edge, no FlareSolverr). Recovery
   ladder when a base dies: re-resolve → force a GitHub config refresh for a newer `homepage` → still
   dead → ntfy (then set `TAMILMV_SEED_OVERRIDE`/`TAMILBLASTERS_SEED_OVERRIDE` as an emergency manual pin).
   **The dead-site ntfy is rate-limited** to one push per `TAMILMV_DEAD_ALERT_INTERVAL` (default 86400s)
@@ -549,10 +567,120 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   `docker compose logs media-bridge` still shows the true state hourly.
 - **Config shapes differ**: tamilmv uses `supported_search_forums` (33 forums), tamil_blasters uses
   `catalogs` (28) — `_parse_site_cfg` normalizes both to `[(forum_path, language)]`.
-- **Crawl**: per site → `resolve_base` → for each forum `…/index.php?/forums/forum/<id>/page/<n>/` via
-  FlareSolverr, extract full topic URLs (`TOPIC_RE`, slug required so nav links are ignored), fetch each
-  topic, `MAGNET_RE` + `parse_magnet` (language from the forum map). Bounded per pass by
-  `TAMILMV_MAX_PAGES` (per-forum cap) + incremental all-known stop; empty-post retry as in movierulz.
+- **tamilblasters has been down since 2026-08-23** (last crawl; last new release 08-07): the seed
+  `1tamilblasters.wtf` 301s to `.garden` (home IP) / `.gripe` (VPN), and those and `.land` all answer
+  Cloudflare **522** = origin offline. `1tamilblasters.tech` is a **fake** (WordPress SEO clone: every
+  URL returns its homepage, no magnets, no `sitemap.php`) — never pin it. The Telegram "Tamil Blasters"
+  channel now posts an unrelated Instagram account, not domains. When a real domain appears, verify it
+  serves a known topic (e.g. `…/forums/topic/16655-…`) with magnets before pinning it.
+- **Archive everything, extract from the archive, serve only what is flagged** (rebuilt 2026-09-30, after
+  Seethamma Vakitlo Sirimalle Chettu — a 2023 topic on page ~10 of Telugu forum 25 — was never indexed
+  while Radarr burned 16 dead public grabs). Measured on 1tamilmv then: ~33k topics, 68 forums; the old
+  crawler read 5 pages per forum (3,010 topics), and the default **last-post** sort moves old topics
+  around, so neither "stop at a known page" nor any resume point was sound.
+  - **Every topic read is archived** (`archive_view`: title, canonical, breadcrumb + every post on the
+    topic's first page, gzipped ≈ 6 KB) in **`config/tamilmv_archive.db`** (separate from the feed DB;
+    ~200 MB for the whole site). `extract()` works on that HTML, so a parser fix is
+    **`docker exec media-bridge python -m tamilmv reparse`** — no re-crawl. `PARSER_V` bump = older-parsed
+    topics are re-extracted locally (`topic_action` → `reparse`) as the walk reaches them. `WALK_EPOCH` bump
+    = the backfill walks every forum from page 1 again (only needed when the archive lacks something, e.g.
+    v2 on 2026-09-30: the ~5k topics read before the archive existed).
+  - **Walking** — three layers, all listings sorted **`&sortby=start_date&sortdirection=desc`**
+    (`listing_url`) so new topics only ever appear on top:
+    1. **head walk** (`crawl_site` → `crawl_forum`, hourly, `tamilmv-crawler` thread): release forums,
+       pages 1..`TAMILMV_MAX_PAGES`, incremental; FlareSolverr fallback on a challenge;
+    2. **backfill** (`run_backfill`, its own **`tamilmv-backfill`** thread): **all 68 forums** (from the
+       sitemap, `discover_forums` → `forums` table) to their **`data-pages` count**, `TAMILMV_BACKFILL_CHUNK`
+       pages per step, continuously; order = config forums → `TAMILMV_EXTRA_FORUMS` → every other forum.
+       Progress in meta `walk:<site>:<forum id>` / `walkdone:…`; a resume re-reads one page. **Never stop
+       on "empty page"**: IPS answers a page past the end with page 1. **Plain HTTP only**: a CF
+       challenge / 429 / 5xx / proxy error raises `PlainUnavailable` → pause `TAMILMV_BACKFILL_PAUSE`
+       (1800 s) — it never falls back to FlareSolverr (a multi-day crawl would starve movierulz); a 404
+       (deleted topic) doesn't pause. Measured 1.7 s/topic → the whole site ≈ 16–18 h. Logs a progress
+       line every 10 min (`backfill tamilmv: N pages, M topics …, K of 68 forum(s) left`);
+    3. **sitemap** (`sitemap_sweep`, daily): refreshes the forum list; unseen topics within
+       `TAMILMV_SITEMAP_DAYS` are read. Verified against 962 listing-walked topics: none missing;
+    4. **audit** (`audit`, once per walk epoch, after every forum is `walkdone`): every topic in the
+       FULL sitemap (no window) that isn't archived, is gone, or has a pending attachment gets one more
+       try; what still fails is logged `audit_missing`.
+  - **Parallel backfill without gaps**: the topics of ONE listing page are fetched by
+    `TAMILMV_BACKFILL_WORKERS` (3) threads (`run_topics`; each thread its own requests session; a
+    worker inherits the caller's plain-only mode and log role); the walk position moves **only after
+    every topic of that page is processed**. A transient failure anywhere on the page (network /
+    challenge / 429 / 5xx → `PlainUnavailable`) stops the not-yet-started topics, leaves the position,
+    and the page is re-read after the pause (topics already done are no-ops then). A topic that simply
+    isn't there (404/410, or a 200 page without `<article>` — moved/hidden stubs redirect home) is
+    marked **`posts.gone`** and does NOT block the page. A `.torrent` attachment that fails to download
+    sets **`posts.pending`** → the topic is re-extracted from the archive on its next visit, which
+    retries only that download. Measured 2026-09-30 (20 pages, 3 workers): 0.65 s/topic, 499 of 499
+    listed topics archived or gone, 0 missing → the whole site ≈ 6–7 h.
+  - **Uniqueness**: a topic is **(site, topic id)** everywhere — never its URL (the domain rotates and
+    the slug changes as series grow; `posts.url` just keeps the latest). `posts` and the archive's
+    `pages` are keyed by it (the archive keeps the latest copy: `INSERT OR REPLACE`); `releases` by
+    **infohash** (one row per torrent; the first topic keeps it → stable pubDate) with every topic it
+    was posted in in **`release_topics`**; `weblinks` by (site, topic, URL) + a stable `lid` hash (a
+    topic's links are replaced as a set on each extract); `attachments` by (site, attachment id).
+    Listing pages are never stored — only the walk position.
+  - **Error log** (`log_error` → **`config/tamilmv_errors.jsonl`**, one JSON object per line, rotates
+    to `.1` at 50 MB; never raises): `ts, site, post_id, url, forum, thread (backfill/head/sitemap/
+    active/audit/manual), stage (listing/fetch/attachment/extract/audit), type, status, detail,
+    outcome (retry/gone/pending/recorded)`. Types: transient `network`/`challenge`/`rate_limited`/
+    `server_error` (retry), `not_found`/`no_article`/`http_other` (gone), `attachment_failed` (pending),
+    and one-off findings written once per topic (`logged` table): `not_torrent`, `private_torrent`,
+    `magnet_unparsed`, `magnet_skipped` (scope rules: single episode / Part), `empty` (served topic with
+    no torrent and no link — a likely parser gap), `extract_error` (parser crash; topic archived, fix
+    + `reparse`); `listing_failed`, `audit_missing`.
+  - **Commands** (`docker exec media-bridge python -m tamilmv …`): `errors [--type T] [--since 24h|7d]
+    [--unresolved]` (counts per type, latest examples, resolved vs unresolved against the DB);
+    `refetch <topic id | URL> …` (fetch now, re-archive, re-extract, print torrents/links — searchable
+    immediately; clears `gone`); `recrawl [--forum ID …] [--refetch]` (reset the walk + audit for all or
+    some forums; `--refetch` = every topic archived before now is downloaded again as the walk reaches
+    it); `reparse [site]` (re-extract the whole archive, no network); `links <words>`.
+  - **Serving** (`is_served`): topic override `posts.serve` > forum override `forums.serve` > automatic =
+    a **release forum** (upstream config map + `TAMILMV_EXTRA_FORUMS`: `38`/`60`/`13` DVD9-DVD5, never
+    mapped upstream, and `92-post-share-here` with language `auto` = read from the title). Everything is
+    extracted from every forum; unserved forums (songs, news…) just never reach the feed. To serve/hide
+    by hand: `UPDATE forums SET serve=1|0 WHERE forum_id='18'` or `UPDATE posts SET serve=… WHERE post_id=…`
+    in `config/tamilmv.db` (NULL = back to automatic) — takes effect on the next query, no restart.
+- **What a topic yields** (`extract`): (a) `magnet:` links; (b) **mangled `http://magnet?xt=…`** links
+  (2023-era posts — Seethamma's only magnet) rewritten to `magnet:?`; (c) **`.torrent` attachments**
+  (`attachment.php?id=…`, downloadable as a guest) → parsed with `torrentfile.parse_torrent` into a
+  magnet with `xl=` + trackers; skipped when a magnet on the page has the same `dn` (same torrent),
+  cached in `attachments` so a re-read never downloads twice, and a **private torrent is never turned
+  into a magnet**. In forum 25, 246 of 600 topics were attachment-only — invisible before. (d) **web
+  links** (shortener / file-host links: gplinks, tnlink, nowshort, gdlink, gdflix, cyberloom…) from the
+  **opening post only** (`first_post`; replies post links to other movies, share buttons sit after it)
+  into `weblinks`. tamilmv lists each file as `.torrent` + MAGNET + **"DIRECT LINK"** button: a generic
+  label takes the name/size of the torrent just above it and records its **btih** ("same file as
+  torrent X"). Every link is ad/captcha-gated (cyberloom → countdown page, nowshort → reCAPTCHA; the
+  final URL carries a short-lived token), so links are **never downloaded** and saving the gate page is
+  useless — the link itself stays valid.
+- **`[DL-LINK]` items + topic pages (how links reach Radarr/Sonarr)**: a search (never the empty-query
+  RSS) also returns up to `TAMILMV_LINKS_MAX` (50) links as **`[DL-LINK] <file name>`** items — Radarr and
+  Sonarr parse `DL-LINK` as the release group (title/year/quality/language intact; `[LINK]`/`[DDL]` could
+  collide with real groups). They are **never grabbed and never penalize**: **0 seeders** (the tamilmv
+  indexer's minimum is 1 → always rejected "Not enough seeders", but listed in Interactive Search), no
+  `magneturl`, and the download URL `/nograb/<lid>.torrent` answers **404** = "release no longer
+  available" (not an indexer failure, no blocklist). Every item's `<comments>` (= the **info link** Prowlarr
+  passes to Radarr/Sonarr — click the release title) is **`TAMILMV_PUBLIC_URL/t/<site>/<topic id>`**
+  (`#l<lid>` highlights the link): the direct links, the live tamilmv link (current domain from meta
+  `base:<site>`), the topic's torrents, and the **saved copy** of the posts. `TAMILMV_PUBLIC_URL` is the
+  **Tailscale address** `http://100.122.87.20:8005` (Radarr/Sonarr are used the same way at home and
+  away; the Jetson does not advertise `10.0.0.0/24`, so a LAN-IP link would break away from home). The
+  page is scraped content: `sanitize` strips scripts/iframes/handlers/`javascript:` and a strict CSP
+  (`default-src 'none'`, no images — they'd tell image hosts who is looking) makes script impossible.
+- **DVD Remux rewrite** (`served_title`): Radarr reads "DVD9"/"DVD5" as a raw disc image (quality DVD-R)
+  and rejects it ("Raw Bluray/DVD release") — every tamilmv DVD9 release, though they are single `.mkv`
+  remuxes. A DVD9/DVD5 torrent whose magnet `dn` ends in a video extension is served as **"DVD Remux"**
+  (Radarr: DVD quality, accepted); an ISO / VIDEO_TS torrent keeps "DVD9" and stays rejected (unimportable).
+- **Plain HTTP, FlareSolverr fallback**: pages, sitemap and attachments answer plain requests (no CF
+  challenge, 2026-09-30), ~10× cheaper than FlareSolverr. Plain requests go only through
+  **`TAMILMV_HTTP_PROXY`** (gluetun's built-in proxy → VPN exit IP); unset = plain HTTP off (FlareSolverr
+  only; no attachments, sitemap or backfill) — media-bridge is off the VPN and must not scrape these sites
+  from the home IP.
+- **Re-read rules** (`topic_action`): new topic / slug changed / never archived → fetch; the empty-post
+  retry window is anchored on the topic's **post date** (`posts.posted_at`), not first-seen, or the
+  backfill's thousands of old link-only topics would each be re-read every pass for days.
 - **Slug-change refetch (`post_needs_fetch(site, pid, url)` + `_slug`)**: unlike movierulz (one post per
   episode batch), tamilmv posts a running season as **one topic** and appends each new batch to it,
   retitling it as it grows (`S03 EP (01-04)` → `S03 EP (01-32)`) — and the listing URL's slug follows. A

@@ -62,6 +62,7 @@ def main():
     supervise("movierulz-crawler", movierulz.run_crawler)
     supervise("movierulz-torznab", movierulz.serve_torznab)
     supervise("tamilmv-crawler", tamilmv.run_crawler)
+    supervise("tamilmv-backfill", tamilmv.run_backfill)  # full walk of every forum, plain HTTP only
     supervise("tamilmv-torznab", tamilmv.serve_torznab)
     if DADDYLIVE_ENABLED:
         supervise("daddylive-refresher", daddylive.run_refresher)

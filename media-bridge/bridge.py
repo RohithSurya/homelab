@@ -318,9 +318,15 @@ def state_file(category, title):
     return STATE_DIR / f"{safe}.json"
 
 
+def state_paths():
+    # one file per transfer; dotfiles (.import-watch.json, .seen-*) are the bridge's own
+    # bookkeeping -- pathlib's glob matches them, unlike the shell's
+    return sorted(sp for sp in STATE_DIR.glob("*.json") if not sp.name.startswith("."))
+
+
 def load_records():
     records = []
-    for sp in sorted(STATE_DIR.glob("*.json")):
+    for sp in state_paths():
         try:
             records.append((sp, json.loads(sp.read_text())))
         except (OSError, ValueError) as e:
@@ -1083,7 +1089,7 @@ def process_new_magnets():
 
 
 def check_completions():
-    if not STATE_DIR.exists() or not any(STATE_DIR.glob("*.json")):
+    if not STATE_DIR.exists() or not state_paths():
         return
     records = load_records()
     for sp, rec in records:
