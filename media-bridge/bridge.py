@@ -131,6 +131,11 @@ IMPORT_FIX = os.environ.get("IMPORT_FIX", "on").lower() not in ("off", "false", 
 IMPORT_CHECK_INTERVAL = int(os.environ.get("IMPORT_CHECK_INTERVAL", "120"))
 IMPORT_WATCH_TTL = int(os.environ.get("IMPORT_WATCH_TTL", str(24 * 3600)))
 IMPORT_BLOCK_RE = re.compile(r"title mismatch|unknown (series|movie)", re.I)
+# Sonarr blocks importing an episode TVDB still titles "TBA", and re-checks only after its 12-hourly
+# series refresh. While a delivery is blocked for that, refresh the series every TBA_REFRESH_INTERVAL
+# so the import happens within the hour of TVDB getting the titles (0 = off). Never forced.
+TBA_REFRESH_INTERVAL = int(os.environ.get("TBA_REFRESH_INTERVAL", "3600"))
+TBA_RE = re.compile(r"TBA title", re.I)
 VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv")
 _import_checked_at = 0.0
 # Follow mode: while a torrent downloads on a backend that supports it (the seedbox), pull its
@@ -571,6 +576,16 @@ def check_imports():
         elif not IMPORT_BLOCK_RE.search(msgs) and not entry.get("noted"):
             entry["noted"] = True  # e.g. Sonarr's "TBA title, recently aired": it clears by itself
             ev.emit(ref, "import_blocked", None, reason=msgs[:200])
+        if (cat == "sonarr" and TBA_REFRESH_INTERVAL > 0 and q.get("seriesId")
+                and q.get("trackedDownloadState") == "importBlocked" and TBA_RE.search(msgs)
+                and now - entry.get("tba_refresh", entry["at"]) >= TBA_REFRESH_INTERVAL):
+            entry["tba_refresh"] = now  # first one an interval after delivery: the grab just followed a refresh
+            try:
+                arr_api(cat, "POST", "/command", body={"name": "RefreshSeries", "seriesId": q["seriesId"]})
+                ev.emit(ref, "tba_refresh", None, series=q["seriesId"])
+                log(f"[{cat}] '{entry['release']}' waits on a TBA title -> series refresh")
+            except Exception as e:
+                log(f"    (warn) TBA refresh failed for '{entry['release']}': {e}")
         if now - entry["at"] > IMPORT_WATCH_TTL:
             watch.pop(tid, None)
     try:

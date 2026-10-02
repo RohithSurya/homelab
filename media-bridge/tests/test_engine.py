@@ -575,6 +575,18 @@ class ImportFixTest(unittest.TestCase):
         self.assertEqual(self.posted, [])
         self.assertIn("t1", json.loads(bridge._watch_file().read_text()))
 
+    def test_tba_block_refreshes_the_series_hourly_never_forces(self):
+        self.setup_orig()
+        rel = "Heart Beat (2024) S03E37-E40 1080p"
+        q = dict(self.blocked(rel, "Episode has a TBA title and recently aired"), seriesId=17)
+        self.fake_arr([q], [])
+        self.watch("sonarr", rel, ["sonarr:episode:1"], at=time.time() - bridge.TBA_REFRESH_INTERVAL - 1)
+        bridge.check_imports()
+        self.assertEqual(self.posted, [{"name": "RefreshSeries", "seriesId": 17}])
+        bridge._import_checked_at = 0
+        bridge.check_imports()  # within the interval: no second refresh
+        self.assertEqual(len(self.posted), 1)
+
     def test_entry_dropped_once_gone_from_queue(self):
         self.setup_orig()
         self.fake_arr([], [])

@@ -59,6 +59,7 @@ from torrentfile import parse_torrent
 # are started separately by main.py, so the import has no side effects beyond that).
 from movierulz import (
     fetch, parse_magnet, search_terms, query_matches, series_title, torznab_category, error_xml,
+    nudge_sonarr, SONARR_NUDGE_DAYS,
     classify, normalize_title, MAGNET_RE, QUALITY_RE, SITE_PREFIX_RE,
 )
 
@@ -1527,6 +1528,14 @@ def crawl_site(site):
         f"sitemap: {sp} topics, {sr} releases; active series: {ap} re-read, {ar} new")
 
 
+def recent_series_titles():
+    """Served titles' source for nudge_sonarr: series releases indexed in the last SONARR_NUDGE_DAYS."""
+    with DB_LOCK:
+        rows = db().execute("SELECT DISTINCT title FROM releases WHERE kind='series' AND added_at > ?",
+                            (time.time() - SONARR_NUDGE_DAYS * 86400,)).fetchall()
+    return [r[0] for r in rows]
+
+
 def run_crawler():
     db()  # init schema
     adb()
@@ -1542,6 +1551,10 @@ def run_crawler():
                 crawl_site(site)
         except Exception as e:
             log(f"crawl error: {e}")
+        try:
+            nudge_sonarr(recent_series_titles())
+        except Exception as e:
+            log(f"sonarr nudge error: {e}")
         time.sleep(CRAWL_INTERVAL)
 
 

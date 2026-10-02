@@ -67,6 +67,12 @@ ALIAS_REFRESH = int(os.environ.get("ALIAS_REFRESH", "900"))   # re-pull the Rada
 # Sonarr is the source of each show's year (see series_title). Reuses seedr's Sonarr credentials.
 SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
+# Sonarr learns new episodes only at its 12-hourly series refresh, and it can't grab a release for
+# episodes it doesn't list. When the feed holds a recent series release (indexed within
+# SONARR_NUDGE_DAYS) with episodes Sonarr lacks, ask it to refresh that show now, at most every
+# SONARR_NUDGE_INTERVAL s per show (0 = off). See nudge_sonarr().
+SONARR_NUDGE_INTERVAL = int(os.environ.get("SONARR_NUDGE_INTERVAL", "3600"))
+SONARR_NUDGE_DAYS = float(os.environ.get("SONARR_NUDGE_DAYS", "3"))
 # Stale-feed alert: ntfy (ops topic) when no NEW post has been seen for this many days -- the crawler
 # can run "successfully" while indexing nothing (a domain rotation went unnoticed for 10.7 days,
 # 2026-09-20 -> 09-30). Repeats at most every STALE_ALERT_REPEAT s until posts flow again.
@@ -109,6 +115,8 @@ SERIES_HEAD_RE = re.compile(
     r'^(?P<base>.+?)(?:\s*[(\[]?\b(?:19|20)\d{2}\b[)\]]?)?(?P<rest>(?:\s+\d{3,4}p)?\s+S\d{1,2}E\d.*)$', re.I)
 # Other series markers (single ep "S04 EP09"/"S04E09", "S1P2"/"S1P-1-2", spelled-out
 # "Season 3") -> NOT mappable to Sonarr cleanly, so these releases are skipped.
+# The episodes a normalized series title covers: 'S03E37-E40' (or a lone 'S03E37').
+SERIES_EPS_RE = re.compile(r'\bS(\d{1,2})E(\d{1,3})(?:-E?(\d{1,3}))?', re.I)
 SERIES_ANY = re.compile(r'\bS\d{1,2}\s*(?:EP?\s*\d+|E\d+|P[\s\-\d])', re.I)
 SEASON_WORD = re.compile(r'\bSeason\s*\d+\b', re.I)
 
@@ -125,6 +133,8 @@ _ALIAS = {}            # unorm(title) -> [latin titles]; see _radarr_aliases()
 _ALIAS_TS = 0.0
 _ALIAS_LOCK = threading.Lock()
 _SERIES_YEAR = {}      # unorm(show title) -> Sonarr year (None if ambiguous); see _sonarr_years()
+_SERIES_ID = {}        # unorm(show title) -> Sonarr series id (None if ambiguous); same refresh
+_NUDGED = {}           # Sonarr series id -> when nudge_sonarr() last asked for a refresh
 _SERIES_YEAR_TS = 0.0
 # Separate lock for lazy init only: the crawler and torznab threads both call db() at startup, so the
 # init (incl. the one-shot ALTER migration below) must run exactly once. Not DB_LOCK -- callers like
@@ -431,6 +441,10 @@ def run_crawler():
             check_stale()
         except Exception as e:
             log(f"stale check error: {e}")
+        try:
+            nudge_sonarr(recent_series_titles())
+        except Exception as e:
+            log(f"sonarr nudge error: {e}")
         time.sleep(CRAWL_INTERVAL)
 
 
@@ -550,7 +564,7 @@ def _sonarr_years():
     """{unorm(show title): year} from Sonarr, refreshed every ALIAS_REFRESH. Best-effort, same
     contract as _radarr_aliases(): stale map on failure, timestamp stamped before the fetch.
     A title two library shows share maps to None (no rewrite -- we can't tell which one)."""
-    global _SERIES_YEAR, _SERIES_YEAR_TS
+    global _SERIES_YEAR, _SERIES_ID, _SERIES_YEAR_TS
     if not (SONARR_URL and SONARR_API_KEY):
         return _SERIES_YEAR
     with _ALIAS_LOCK:
@@ -565,7 +579,7 @@ def _sonarr_years():
     except Exception as e:
         log(f"sonarr year refresh failed: {e}")
         return _SERIES_YEAR
-    years = {}
+    years, ids = {}, {}
     for sh in shows:
         if not sh.get("year"):
             continue
@@ -573,8 +587,9 @@ def _sonarr_years():
         k = unorm(re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", sh.get("title") or ""))
         if k:
             years[k] = None if k in years and years[k] != sh["year"] else sh["year"]
+            ids[k] = None if k in ids else sh.get("id")
     with _ALIAS_LOCK:
-        _SERIES_YEAR = years
+        _SERIES_YEAR, _SERIES_ID = years, ids
     return years
 
 
@@ -590,6 +605,57 @@ def series_title(title):
         return title
     year = _sonarr_years().get(unorm(m["base"]))
     return f"{m['base']} ({year}){m['rest']}" if year else title
+
+
+def nudge_sonarr(titles):
+    """Ask Sonarr to refresh the shows whose recent releases cover episodes it doesn't list yet.
+
+    Sonarr only grabs episodes it knows, and it learns new ones at its scheduled series refresh
+    (every 12 h). Sites post a batch within hours of airing, so the release sat in the feed
+    until the next refresh (Heart Beat S03E37-E40: indexed 04:36, grabbed at the 07:07 refresh).
+    A refresh that adds already-aired episodes makes Sonarr search for them by itself, so the
+    refresh is all that's needed. `titles` = stored titles of recently indexed series releases.
+    Only shows in the Sonarr library, only when an episode is really missing, and at most one
+    refresh per show every SONARR_NUDGE_INTERVAL. Best-effort; returns the series ids refreshed."""
+    if SONARR_NUDGE_INTERVAL <= 0 or not (SONARR_URL and SONARR_API_KEY):
+        return []
+    _sonarr_years()
+    wanted = {}                                   # series id -> {(season, episode)}
+    for title in titles:
+        head, eps = SERIES_HEAD_RE.match(title), SERIES_EPS_RE.search(title)
+        sid = _SERIES_ID.get(unorm(head["base"])) if head and eps else None
+        if sid is None:
+            continue
+        first, last = int(eps.group(2)), int(eps.group(3) or eps.group(2))
+        wanted.setdefault(sid, set()).update((int(eps.group(1)), e) for e in range(first, last + 1))
+    done, now, hdr = [], time.time(), {"X-Api-Key": SONARR_API_KEY}
+    for sid, want in wanted.items():
+        if now - _NUDGED.get(sid, 0) < SONARR_NUDGE_INTERVAL:
+            continue
+        try:
+            r = requests.get(f"{SONARR_URL}/api/v3/episode", params={"seriesId": sid}, headers=hdr, timeout=30)
+            r.raise_for_status()
+            missing = want - {(e["seasonNumber"], e["episodeNumber"]) for e in r.json()}
+            if not missing:
+                continue
+            _NUDGED[sid] = now
+            requests.post(f"{SONARR_URL}/api/v3/command", json={"name": "RefreshSeries", "seriesId": sid},
+                          headers=hdr, timeout=30).raise_for_status()
+        except Exception as e:
+            log(f"sonarr nudge failed for series {sid}: {e}")
+            continue
+        done.append(sid)
+        s_, e_ = min(missing)
+        log(f"sonarr nudge: series {sid} lacks {len(missing)} episode(s) the feed has "
+            f"(from S{s_:02d}E{e_:02d}) -> RefreshSeries")
+    return done
+
+
+def recent_series_titles():
+    with DB_LOCK:
+        rows = db().execute("SELECT DISTINCT title FROM releases WHERE kind='series' AND added_at > ?",
+                            (time.time() - SONARR_NUDGE_DAYS * 86400,)).fetchall()
+    return [r[0] for r in rows]
 
 
 def search_terms(q):

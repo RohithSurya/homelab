@@ -262,6 +262,17 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   skipped). Up to 3 tries, 10 min apart. Other block reasons (TBA title, not an upgrade) are only logged
   (`import_blocked` event), never forced. The manualimport GET uses `folder=` only.
 
+- **Sonarr refresh nudges** (2026-10-02; Heart Beat S03E37-E40 took 28.5 h from airing to watchable with a
+  2-minute download, because Sonarr waited twice for its 12-hourly `Refresh Series`): (1) **grab side** —
+  `nudge_sonarr` (`movierulz.py`, run after every movierulz and tamilmv crawl pass): a series release indexed
+  in the last `SONARR_NUDGE_DAYS` (3) whose `SxxEa-Eb` covers episodes Sonarr doesn't list for a **library**
+  show → `RefreshSeries` for that show, at most every `SONARR_NUDGE_INTERVAL` (3600 s, in memory; 0 = off).
+  A refresh that adds already-aired episodes makes Sonarr search them itself. (2) **import side** —
+  `check_imports`: a delivery `importBlocked` for "TBA title" gets a `RefreshSeries` every
+  `TBA_REFRESH_INTERVAL` (3600 s, first one an hour after delivery; event `tba_refresh`) — still never
+  force-imported, so files get real names. If a site's episode numbering never matches TVDB, the nudge
+  repeats hourly until the release is 3 days old, then stops.
+
 - **Status page** (`bridgeweb.py`) on the youtube server: `http://10.0.0.179:8003/bridge` (HTML, 30s refresh),
   `/bridge/status.json`, `/bridge/transfer/<tid>` (timeline). Same process as the bridge, so it reads the
   pull worker's jobs and each backend's last poll snapshot — rendering never calls Seedr or the seedbox.

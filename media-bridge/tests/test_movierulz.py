@@ -114,5 +114,60 @@ class StaleAlert(Base):
         self.assertEqual(self.sent, [])
 
 
+class SonarrNudge(Base):
+    """nudge_sonarr: refresh a library show only when the feed has episodes Sonarr doesn't list."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls, self.episodes = [], {17: [(3, e) for e in range(1, 37)]}
+        test = self
+
+        class Resp:
+            def __init__(self, data):
+                self.data = data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.data
+
+        class FakeRequests:
+            @staticmethod
+            def get(url, params=None, **kw):
+                if url.endswith("/series"):
+                    return Resp([{"id": 17, "title": "Heart Beat", "year": 2024}])
+                return Resp([{"seasonNumber": s_, "episodeNumber": e} for s_, e in test.episodes[params["seriesId"]]])
+
+            @staticmethod
+            def post(url, json=None, **kw):
+                test.calls.append(json)
+                return Resp({})
+
+        self._req = (m.requests, m.SONARR_URL, m.SONARR_API_KEY)
+        m.requests, m.SONARR_URL, m.SONARR_API_KEY = FakeRequests, "http://sonarr", "k"
+        m._SERIES_YEAR_TS = 0
+        m._NUDGED.clear()
+
+    def tearDown(self):
+        m.requests, m.SONARR_URL, m.SONARR_API_KEY = self._req
+        m._SERIES_YEAR_TS = 0
+        super().tearDown()
+
+    def test_missing_episodes_refresh_once_per_interval(self):
+        titles = ["Heart Beat (2026) S03E37-E40 TRUE WEB-DL - 1080p", "Heart Beat (2026) S03E37-E40 TRUE WEB-DL - 720p"]
+        self.assertEqual(m.nudge_sonarr(titles), [17])
+        self.assertEqual(self.calls, [{"name": "RefreshSeries", "seriesId": 17}])
+        self.assertEqual(m.nudge_sonarr(titles), [])  # throttled
+        self.assertEqual(len(self.calls), 1)
+
+    def test_known_episodes_and_unknown_shows_do_nothing(self):
+        self.assertEqual(m.nudge_sonarr(["Heart Beat (2026) S03E33-E36 TRUE WEB-DL - 1080p",
+                                         "Some Other Show (2026) S01E01-E08 1080p",
+                                         "Karuppu (2026) Tamil 1080p"]), [])
+        self.assertEqual(self.calls, [])
+
+
+
 if __name__ == "__main__":
     unittest.main()
