@@ -83,7 +83,7 @@ EMPTY_RETRY_DAYS = float(os.environ.get("TAMILMV_EMPTY_RETRY_DAYS", "3"))
 # refresh_active_series). Re-read series topics that gained a release within ACTIVE_DAYS, each at
 # most once per ACTIVE_REREAD seconds. 0 days disables.
 ACTIVE_DAYS = float(os.environ.get("TAMILMV_ACTIVE_DAYS", "21"))
-ACTIVE_REREAD = float(os.environ.get("TAMILMV_ACTIVE_REREAD", "21600"))
+ACTIVE_REREAD = float(os.environ.get("TAMILMV_ACTIVE_REREAD", "10800"))
 # Cooldown between "domain dead" ntfy pushes for the SAME site. A dead seed fails on every crawl
 # pass, so an ungated alert fires ~24x/day forever and drowns the topic (it buried DIUN's daily
 # image-update batch until DIUN was moved to its own topic). Logs stay per-pass; only ntfy is

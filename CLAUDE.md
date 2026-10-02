@@ -704,7 +704,7 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   even while it grows — Heart Beat S03 went `ep-01-32 → ep-01-36` on page 2 of the web-series forum and
   a full pass fetched 0 topics (2026-09-23). So every pass also fetches, **directly by id**, each series
   topic that gained a release in the last `TAMILMV_ACTIVE_DAYS` (21), each at most every
-  `TAMILMV_ACTIVE_REREAD` s (21600). The stored slug still resolves on the current domain, and
+  `TAMILMV_ACTIVE_REREAD` s (10800; 21600 until 2026-10-02). The stored slug still resolves on the current domain, and
   `process_topic` adopts the page's `<link rel=canonical>` so `posts.url` learns the new name. ~19 topics;
   adds ~2-3 min of FlareSolverr per pass. Log line: `active series: N re-read, M new`.
 - **New episodes can still stall at Sonarr, correctly**: Sonarr only grabs episodes its TVDB list has.
