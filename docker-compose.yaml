@@ -152,11 +152,10 @@ services:
       # The old "never 0.0.0.0" rationale did NOT hold: a router forward targets a LAN IP,
       # and these were bound to precisely that LAN IP, so the forward would have reached
       # them anyway. What keeps them off the internet is the router forwarding only 443.
-      # These remain unauthenticated LAN control endpoints (see the /hls relay caveat in
-      # CLAUDE.md) — do not forward any of them.
+      # These remain unauthenticated LAN control endpoints — do not forward any of them.
       - "8002:8002"                              # movierulz Torznab feed
       - "8003:8003"                              # youtube grabber web form
-      - "8005:8005"                              # tamilmv/tamilblasters Torznab feed
+      - "8005:8005"                              # tamilmv Torznab feed
     environment:
       - TZ=America/New_York
       # --- blackhole bridge (bridge.py) + its download backends (backends/) ---
@@ -241,7 +240,7 @@ services:
       - MAX_PAGES=1000                             # safety cap; real stop is the last/empty page (~407)
       - FAKE_SEEDERS=50                            # movierulz exposes no seeders; satisfy *arr minimums
       - REQUEST_DELAY=3
-      # --- tamilmv/tamilblasters scraper -> Torznab feed :8005 (replaces MediaFusion) ---
+      # --- tamilmv scraper -> Torznab feed :8005 (replaces MediaFusion) ---
       # Seeds + per-language forum maps come from MediaFusion's upstream GitHub config (auto-tracks
       # domain rotation); live domain resolved by following the seed's 301 redirect. Pages, sitemap
       # and .torrent attachments go plain HTTP through gluetun's proxy (VPN exit IP); FlareSolverr
@@ -260,23 +259,11 @@ services:
       - TAMILMV_CONFIG_REFRESH=86400               # re-pull GitHub config daily
       - TAMILMV_CRAWL_INTERVAL=3600
       - TAMILMV_MAX_PAGES=5                         # head walk: newest pages per forum each pass
-      # Dead-site ntfy at most weekly (default daily). tamil_blasters has been a Cloudflare 522
-      # behind its seed's redirect since 2026-08-23; a daily high-priority alert was just noise.
-      # Recovery is still immediate: a successful resolve resets the timer.
+      # Dead-site ntfy at most weekly (default daily); a daily high-priority alert for a long outage
+      # is just noise. Recovery is still immediate: a successful resolve resets the timer.
       - TAMILMV_DEAD_ALERT_INTERVAL=604800
-      # Emergency overrides if a GitHub seed itself dies before upstream updates it:
+      # Emergency override if the GitHub seed itself dies before upstream updates it:
       # - TAMILMV_SEED_OVERRIDE=https://www.1tamilmv.<tld>
-      # - TAMILBLASTERS_SEED_OVERRIDE=https://1tamilblasters.<tld>
-      # --- daddylive resolver -> Jellyfin Live TV: DISABLED 2026-09-24 (code kept in media-bridge/daddylive.py).
-      #     To re-enable: set true, uncomment the vars below, re-add the "8004:8004" port, and re-add the
-      #     Jellyfin M3U tuner + XMLTV guide (see CLAUDE.md). ---
-      - DADDYLIVE_ENABLED=false
-      # - DLHD_BASE=${DLHD_BASE}                     # real dlhd site URL kept in .env, out of source
-      # - DADDYLIVE_PUBLIC_URL=http://10.0.0.179:8004 # fallback for the precheck thread only; request URLs derive from Host
-      # - DADDYLIVE_PORT=8004
-      # - DADDYLIVE_REFRESH=3600                      # re-pull the channel list hourly
-      # - DADDYLIVE_FAVORITES=54,51,60                # channel ids kept pre-resolved+validated (54 FOX, 51 ABC, 60 Sky F1)
-      # - DADDYLIVE_PRECHECK=240                      # re-test favorites (all players) every N seconds
       # --- youtube grabber (no-torrent fallback: pull a full-movie YouTube upload) ---
       - YOUTUBE_PORT=8003
       - DATA_HOST_PATH=/home/rosurya/media-server/data  # HOST path of ./data; sibling yt-dlp containers bind-mount by host path

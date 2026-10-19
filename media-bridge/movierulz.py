@@ -2,8 +2,8 @@
 """
 movierulz crawler -> Torznab feed for Prowlarr.
 
-Why this exists: the tamilmv/tamilblasters crawlers are compiled Rust spiders inside
-the MediaFusion image and can't be taught a new site. movierulz is a WordPress-style
+Why this exists: MediaFusion's tamil-site crawlers were compiled Rust spiders inside
+its image and can't be taught a new site. movierulz is a WordPress-style
 site, so we crawl it ourselves (through the existing FlareSolverr, since it's
 Cloudflare-protected) and expose a minimal Torznab feed that Prowlarr consumes as a
 generic Torznab indexer -- exactly how MediaFusion is wired in.
