@@ -33,22 +33,8 @@ def _abs(ts):
     return time.strftime("%a %m-%d %H:%M", time.localtime(ts)) + f" {TZ}"
 
 
-def _rel(ts):
-    d = ts - time.time()
-    s = ev._dur(abs(d))
-    return f"in {s}" if d >= 0 else f"{s} ago"
-
-
 def _when(ts):
-    return {"at": ts, "at_text": _abs(ts), "rel": _rel(ts)} if ts else None
-
-
-def _seed_margin_h():
-    try:
-        from backends import qbit
-        return qbit.SEED_MARGIN_HOURS
-    except Exception:
-        return 3
+    return {"at": ts, "at_text": _abs(ts), "rel": ev._ago(ts)} if ts else None
 
 
 def _snapshot(rec):
@@ -57,16 +43,15 @@ def _snapshot(rec):
     if be is None:
         return {}
     h = (rec.get("torrent_hash") or "").lower()
-    if hasattr(be, "torrents") and isinstance(be.torrents, dict) and h in be.torrents:
-        return be.torrents[h]
-    by_id = getattr(be, "torrents_by_id", {})
-    return by_id.get(rec.get("user_torrent_id")) or {}
+    return (getattr(be, "torrents", {}).get(h)
+            or getattr(be, "torrents_by_id", {}).get(rec.get("user_torrent_id")) or {})
 
 
 def _transfer(rec):
     now = time.time()
     snap = _snapshot(rec)
     rel = rec.get("release_name") or rec.get("title")
+    stage = bridge.INCOMING / rec.get("category", "") / (rel or "")
     out = {
         "tid": rec.get("tid"), "release": rel, "category": rec.get("category"),
         "backend": rec.get("backend", "seedr"), "private": bool(rec.get("private")),
@@ -76,13 +61,14 @@ def _transfer(rec):
     }
     if rec.get("held"):
         out["phase"] = "seeding_hold"
-        rule = rec.get("seed_rule") or {}
         if rec.get("hold_until"):
             out["eta"], out["detail"] = _when(rec["hold_until"]), "Seedr hold (fixed)"
         elif rec.get("no_deliver"):
             out["eta"], out["detail"] = _when(rec.get("hold_max_until")), f"undelivered partial ({rec.get('partial_reason')}), cap"
         elif snap:
-            need = (rule.get("hours", 336) + _seed_margin_h()) * 3600
+            from backends import qbit  # the seeding-time hold rule (hold_over) lives there
+            rule = rec.get("seed_rule") or qbit.DEFAULT_RULE
+            need = (rule["hours"] + qbit.SEED_MARGIN_HOURS) * 3600
             left = max(0, need - snap.get("seeding_time", 0))
             out["eta"] = _when(now + left)
             out["detail"] = (f"{rule.get('key', '?')}: seeded {snap.get('seeding_time', 0) / 3600:.1f}h of "
@@ -102,8 +88,7 @@ def _transfer(rec):
         out["phase"] = "pulling"
         job = puller.get(rec.get("tid") or "")
         size = rec.get("size")
-        stage = bridge.INCOMING / rec["category"] / rel
-        got = puller._staged_bytes(stage) if stage.exists() else 0
+        got = puller._staged_bytes(stage)
         out["progress"] = round(100 * got / size, 1) if size else None
         if job and job.status == "running" and job.started:
             spd = max(0, got - job.before) / max(now - job.started, 1)  # this run only, not a resume's head start
@@ -136,7 +121,6 @@ def _transfer(rec):
         seeds = snap.get("num_complete", snap.get("seeders"))
         if seeds is not None:
             out["detail"] = f"swarm seeds {seeds}, connected {snap.get('num_seeds', snap.get('connected_to', '?'))}"
-        stage = bridge.INCOMING / rec["category"] / rel
         if (stage / follow.STATE).exists():  # follow mode: finished pieces already copied home
             got = puller._staged_bytes(stage)
             out["followed_bytes"] = got
@@ -145,13 +129,20 @@ def _transfer(rec):
     return out
 
 
+def _events(db, where, since, limit):
+    return [{"when": _when(ts), "tid": tid, "type": type_, "release": release,
+             "detail": json.loads(detail) if detail else {}}
+            for ts, tid, type_, release, detail in db.execute(
+                f"SELECT ts, tid, type, release, detail FROM events WHERE ts > ? AND {where} "
+                "ORDER BY ts DESC LIMIT ?", (since, limit))]
+
+
 def status():
     now = time.time()
     active, holds = [], []
-    if bridge.STATE_DIR.exists():
-        for sp, rec in bridge.load_records():
-            t = _transfer(rec)
-            (holds if t["phase"] == "seeding_hold" else active).append(t)
+    for _, rec in bridge.load_records():
+        t = _transfer(rec)
+        (holds if t["phase"] == "seeding_hold" else active).append(t)
     waiting = []
     for cat in bridge.CATEGORIES:
         for f in sorted((bridge.DATA / "blackhole" / cat).glob("*")):
@@ -171,19 +162,9 @@ def status():
     recent, dry = [], []
     try:
         db = ev._db()
-        for ts, tid, type_, release, detail in db.execute(
-            "SELECT ts, tid, type, release, detail FROM events WHERE ts > ? AND type IN "
-            "('delivered','failed','hold_ended','gave_up','dropped','partial_kept') ORDER BY ts DESC LIMIT 60",
-            (now - 7 * 86400,),
-        ):
-            recent.append({"when": _when(ts), "tid": tid, "type": type_, "release": release,
-                           "detail": json.loads(detail) if detail else {}})
-        for ts, tid, type_, release, detail in db.execute(
-            "SELECT ts, tid, type, release, detail FROM events WHERE ts > ? AND type LIKE 'would_%' ORDER BY ts DESC LIMIT 40",
-            (now - 14 * 86400,),
-        ):
-            dry.append({"when": _when(ts), "tid": tid, "type": type_, "release": release,
-                        "detail": json.loads(detail) if detail else {}})
+        recent = _events(db, "type IN ('delivered','failed','hold_ended','gave_up','dropped','partial_kept')",
+                         now - 7 * 86400, 60)
+        dry = _events(db, "type LIKE 'would_%'", now - 14 * 86400, 40)
     except Exception:
         pass
     return {"generated_at": _when(now), "backends": be_rows, "active": active, "waiting": waiting,
@@ -211,8 +192,30 @@ th{background:#262626;color:#bbb}td,th{border-color:#2c2c2c}.pill{background:#33
 """
 
 
+EVENT_CLASS = {"delivered": "ok", "hold_ended": "ok", "failed": "bad", "gave_up": "bad", "dropped": "bad"}
+
+
+def _head(title, refresh=False):
+    """title: already escaped."""
+    return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            + ("<meta http-equiv=refresh content=30>" if refresh else "")
+            + f"<title>{title}</title><style>{STYLE}</style>")
+
+
 def _t(w):
     return f'{E(w["rel"])}<div class="muted">{E(w["at_text"])}</div>' if w else "&mdash;"
+
+
+def _link(x):
+    return f"<a href='/bridge/transfer/{E(x['tid'] or '')}'>{E(x['release'] or '')}</a>"
+
+
+def _kv(d, skip=()):
+    return ", ".join(f"{k}={v}" for k, v in d.items() if k not in skip)
+
+
+def _mode(dry_run):
+    return " (dry-run)" if dry_run else " LIVE"
 
 
 def _bar(p):
@@ -223,15 +226,15 @@ def _bar(p):
 
 def page():
     s = status()
-    out = [f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-           f"<meta http-equiv=refresh content=30><title>Download bridge</title><style>{STYLE}</style>",
+    out = [_head("Download bridge", refresh=True),
            f"<h1>Download bridge</h1><div class=muted>updated {E(s['generated_at']['at_text'])} &middot; "
            "refreshes every 30s &middot; <a href=/bridge/status.json>status.json</a></div>"]
     pills = []
     for b in s["backends"]:
         q = f" &middot; {b['quota_used_gib']}/{b['quota_gib']} GiB" if "quota_gib" in b else ""
         br = f" &middot; auto-fail paused {E(b['breaker_until']['rel'])}" if b.get("breaker_until") else ""
-        pills.append(f"<span class='pill {'ok' if b['up'] else 'bad'}'>{E(b['name'])}: {'up' if b['up'] else 'DOWN'}{q}{br}</span>")
+        cls, word = ("ok", "up") if b["up"] else ("bad", "DOWN")
+        pills.append(f"<span class='pill {cls}'>{E(b['name'])}: {word}{q}{br}</span>")
     out.append("<p>" + " ".join(pills) + "</p>")
 
     out.append(f"<h2>In progress ({len(s['active'])})</h2>")
@@ -242,7 +245,7 @@ def page():
             flags = "".join(f" <span class='pill warn'>{E(f.split('_')[0])}</span>" for f in t["flags"])
             sp = f" &middot; {t['speed_mb_s']} MB/s" if t.get("speed_mb_s") else ""
             out.append(
-                f"<tr><td><a href='/bridge/transfer/{E(t['tid'] or '')}'>{E(t['release'])}</a>"
+                f"<tr><td>{_link(t)}"
                 f"<div class=muted>{E(t['category'])} &middot; {E(t['backend'])}"
                 f"{' &middot; private: ' + E(t['tracker_rule'] or '') if t['private'] else ''}{flags}</div></td>"
                 f"<td>{E(t['phase'])}<div class=muted>{E(t['detail'] or '')}{sp}</div></td>"
@@ -263,7 +266,7 @@ def page():
     if s["holds"]:
         out.append("<table><tr><th>Release</th><th>Rule / progress</th><th>Ends</th></tr>")
         for t in s["holds"]:
-            out.append(f"<tr><td><a href='/bridge/transfer/{E(t['tid'] or '')}'>{E(t['release'])}</a>"
+            out.append(f"<tr><td>{_link(t)}"
                        f"<div class=muted>{E(t['backend'])}</div></td><td>{E(t['detail'] or '')}</td><td>{_t(t['eta'])}</td></tr>")
         out.append("</table>")
     else:
@@ -277,24 +280,24 @@ def page():
             if r["type"] == "delivered":
                 txt = f"{d.get('bytes', 0) / 1e9:.2f} GB in {ev._dur(d.get('secs', 0))} ({d.get('mb_s')} MB/s)"
             else:
-                txt = ", ".join(f"{k}={v}" for k, v in d.items() if k not in ("keys",))
-            cls = "ok" if r["type"] in ("delivered", "hold_ended") else "bad" if r["type"] in ("failed", "gave_up", "dropped") else "warn"
+                txt = _kv(d, skip=("keys",))
+            cls = EVENT_CLASS.get(r["type"], "warn")
             out.append(f"<tr><td>{_t(r['when'])}</td><td><span class='pill {cls}'>{E(r['type'])}</span></td>"
-                       f"<td><a href='/bridge/transfer/{E(r['tid'] or '')}'>{E(r['release'] or '')}</a></td><td class=muted>{E(txt)}</td></tr>")
+                       f"<td>{_link(r)}</td><td class=muted>{E(txt)}</td></tr>")
         out.append("</table>")
     else:
         out.append("<p class=muted>nothing yet</p>")
 
     rules = s["rules"]
     out.append("<h2>Rule decisions (dry-run)</h2><p class=muted>"
-               f"slow rule: {E(rules['slow'])}{' (dry-run)' if rules['slow_dry_run'] else ' LIVE'} &middot; "
-               f"fail-fast: {E(rules['failfast'])}{' (dry-run)' if rules['failfast_dry_run'] else ' LIVE'} &middot; "
-               f"give up after {rules['give_up_after']}{' (dry-run)' if rules['give_up_dry_run'] else ' LIVE'}</p>")
+               f"slow rule: {E(rules['slow'])}{_mode(rules['slow_dry_run'])} &middot; "
+               f"fail-fast: {E(rules['failfast'])}{_mode(rules['failfast_dry_run'])} &middot; "
+               f"give up after {rules['give_up_after']}{_mode(rules['give_up_dry_run'])}</p>")
     if s["dry_run"]:
         out.append("<table><tr><th>When</th><th>Would</th><th>Release</th><th>Why</th></tr>")
         for r in s["dry_run"]:
             out.append(f"<tr><td>{_t(r['when'])}</td><td>{E(r['type'].replace('would_', ''))}</td>"
-                       f"<td><a href='/bridge/transfer/{E(r['tid'] or '')}'>{E(r['release'] or '')}</a></td>"
+                       f"<td>{_link(r)}</td>"
                        f"<td class=muted>{E(str(r['detail'].get('reason', r['detail'])))}</td></tr>")
         out.append("</table>")
     else:
@@ -304,19 +307,16 @@ def page():
 
 def timeline_page(tid):
     rows = ev._db().execute(
-        "SELECT ts, type, phase, release, backend, detail FROM events WHERE tid=? ORDER BY ts", (tid,)).fetchall()
-    title = rows[0][3] if rows else tid
-    out = [f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-           f"<title>{E(title or '')}</title><style>{STYLE}</style><p><a href=/bridge>&larr; bridge</a></p>"
-           f"<h1>{E(title or '')}</h1>"]
+        "SELECT ts, type, phase, release, detail FROM events WHERE tid=? ORDER BY ts", (tid,)).fetchall()
+    title = E((rows[0][3] if rows else tid) or "")
+    out = [_head(title), f"<p><a href=/bridge>&larr; bridge</a></p><h1>{title}</h1>"]
     if not rows:
         out.append("<p class=muted>no events</p>")
     else:
         out.append("<table><tr><th>When</th><th>Event</th><th>Phase</th><th>Detail</th></tr>")
-        for ts, type_, phase, release, backend, detail in rows:
-            d = json.loads(detail) if detail else {}
-            txt = ", ".join(f"{k}={v}" for k, v in d.items())
-            out.append(f"<tr><td>{E(_abs(ts))}<div class=muted>{E(_rel(ts))}</div></td><td>{E(type_)}</td>"
+        for ts, type_, phase, _, detail in rows:
+            txt = _kv(json.loads(detail) if detail else {})
+            out.append(f"<tr><td>{E(_abs(ts))}<div class=muted>{E(ev._ago(ts))}</div></td><td>{E(type_)}</td>"
                        f"<td>{E(phase or '')}</td><td class=muted>{E(txt)}</td></tr>")
         out.append("</table>")
     return "".join(out)
