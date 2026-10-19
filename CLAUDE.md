@@ -440,8 +440,7 @@ set permanently near-empty and **silently stop all reaping**. Any new Jellyfin a
 ### movierulz component (`media-bridge/movierulz.py`)
 
 A crawler thread + a stdlib Torznab HTTP server (`:8002`, host-published) that makes 5movierulz a
-generic Torznab indexer for Prowlarr — MediaFusion's tamil-site spiders were compiled into its
-image and couldn't be taught a new site, so we scrape this one ourselves.
+generic Torznab indexer for Prowlarr (no public indexer carries the site).
 
 - **Crawler** (`run_crawler` → `crawl_once`, every `CRAWL_INTERVAL`, default hourly): paginates the
   **master `/movies` listing** (`MOVIERULZ_MOVIES_PATH`) newest-first. One master source deliberately
@@ -506,9 +505,8 @@ image and couldn't be taught a new site, so we scrape this one ourselves.
   mapped series (or none).
 - **Torznab server** (`serve_torznab`): `t=caps` advertises movie + tv search; `t=search/movie/tvsearch`
   validate `MOVIERULZ_APIKEY` (Torznab error 100 on mismatch) and substring-match stored titles. Every
-  `<item>` MUST carry a `<pubDate>` (Prowlarr drops items without it — the same bug the custom
-  `mediafusion-api` binary patches) and emits a configurable `FAKE_SEEDERS` (movierulz exposes no
-  seeders) so Radarr/Sonarr minimum-seeders doesn't filter everything.
+  `<item>` MUST carry a `<pubDate>` (Prowlarr drops items without it) and emits a configurable
+  `FAKE_SEEDERS` (movierulz exposes no seeders) so Radarr/Sonarr minimum-seeders doesn't filter everything.
 - **Prowlarr wiring**: add as a generic Torznab indexer, `apiPath=/api`, apiKey `= MOVIERULZ_APIKEY`,
   baseUrl **`http://10.0.0.179:8002/torznab`** — the reserved Ethernet IP, NOT `media-bridge:8002`.
   Prowlarr lives in gluetun's netns, and gluetun resolves DNS itself (`DNS_ADDRESS=9.9.9.9`), not via
@@ -558,17 +556,16 @@ image and couldn't be taught a new site, so we scrape this one ourselves.
 
 A crawler thread + a stdlib Torznab HTTP server (`:8005`, host-published) that scrapes **tamilmv**
 (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + episode-range packs) into a Torznab feed for
-Prowlarr. **This replaced the retired MediaFusion 4-container stack** (postgres + redis
-+ Rust api/worker), whose compiled tamil spiders were the only part worth keeping — and whose ext.to
-scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSolverr continuously.
+Prowlarr.
 
 - **Same pattern as movierulz**, and reuses its stateless helpers by import (`fetch`, `parse_magnet`,
   `classify`, `normalize_title`, `title_matches`, `torznab_category`, `error_xml`, `MAGNET_RE`). Own
   sqlite `media-bridge/config/tamilmv.db` (`posts` keyed by `(site, post_id)` — a leftover of the
   two-site days, see below; `releases` keyed by btih). Own Torznab server on `:8005` (server title
   `tamilmv`, apikey `TAMILMV_APIKEY`, every `<item>` carries `<pubDate>` + `FAKE_SEEDERS`).
-- **Domain rotation (the key bit): seeds + per-language forum maps come from MediaFusion's UPSTREAM
-  GitHub `scraper_config.json`** (`TAMILMV_CONFIG_URL`), refreshed daily and cached to
+- **Domain rotation (the key bit): seeds + per-language forum maps come from a public GitHub data
+  file, `scraper_config.json` in the mhdzumair/MediaFusion repo** (`TAMILMV_CONFIG_URL`; only this
+  file is used — nothing of MediaFusion itself runs here), refreshed daily and cached to
   `config/tamilmv_config.json`. The **live domain** is found by following the seed's 301 redirect
   (`resolve_base`, plain HTTP — the redirect resolves at Cloudflare's edge, no FlareSolverr). Recovery
   ladder when a base dies: re-resolve → force a GitHub config refresh for a newer `homepage` → still

@@ -2,11 +2,10 @@
 """
 tamilmv crawler -> Torznab feed for Prowlarr (host :8005).
 
-Why this exists: this IPBoard forum (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies +
-web-series) was previously scraped by a compiled Rust spider inside the MediaFusion image. We
-retired that whole 4-container stack; this reimplements the scraper ourselves -- the same
-pattern as movierulz.py -- and drops MediaFusion. (tamilblasters, the second site MediaFusion
-covered, was dead from 2026-08-23 and was removed on 2026-10-19.)
+Why this exists: no public indexer carries this IPBoard forum (Tamil/Telugu/Hindi/Malayalam/
+Kannada/English movies + web-series), so we scrape it ourselves -- the same pattern as
+movierulz.py. (tamilblasters, a second site, was dead from 2026-08-23 and was removed on
+2026-10-19.)
 
 Design: ARCHIVE everything, EXTRACT from the archive, SERVE only what is flagged served.
   * run_crawler()   -- hourly head walk of the release forums (newest topics, by START date),
@@ -23,7 +22,7 @@ Design: ARCHIVE everything, EXTRACT from the archive, SERVE only what is flagged
                        topic pages (/t/<site>/<id>) that items link to, and /nograb (always 404).
 
 Domain rotation: tamilmv changes domains often. The seed domain AND the per-forum
-maps come from MediaFusion's UPSTREAM GitHub scraper_config.json (TAMILMV_CONFIG_URL), refreshed
+maps come from a public GitHub data file, scraper_config.json (TAMILMV_CONFIG_URL), refreshed
 periodically and cached locally. The live domain is found by following the seed's 301 redirect.
 
 Fetching: the IPS pages, sitemap and attachments answer plain HTTP (no CF challenge, measured
