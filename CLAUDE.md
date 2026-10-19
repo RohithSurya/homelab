@@ -30,7 +30,7 @@ docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun
 ```
 
 There is no build/lint tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its components as 10 supervised threads — 13 with daddylive re-enabled). To
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 11 supervised threads — 14 with daddylive re-enabled; 2 are pull workers). To
 exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
 `unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
 blocks the user for it):
@@ -219,11 +219,13 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   cancelled on stall/supersede — it's failed in the *arr (re-grab) but kept seeding as an undelivered
   hold (`no_deliver`), capped at `PARTIAL_HOLD` (7d). Trackers count partial snatches as H&R.
 
-- **Pull worker** (`puller.py`, thread `bridge-puller`): on `DONE` the bridge calls `be.prepare_fetch`
+- **Pull workers** (`puller.py`, threads `bridge-puller-N`): on `DONE` the bridge calls `be.prepare_fetch`
   (API calls stay on the bridge thread) and queues a job; the worker runs `be.pull` with connections of
   its own and writes only inside its `.incoming` stage dir; the bridge delivers + releases/holds when it
-  sees the job done. So a long pull no longer freezes the loop. One job at a time; a job that would leave
-  < `PULL_MIN_FREE_GB` on the Jetson waits (`waiting_space`, never counted as a fetch failure). Supersede
+  sees the job done. So a long pull no longer freezes the loop. **`PULL_WORKERS` (2) jobs at once** (since
+  2026-10-17: a 9 GB movie and its follow steps sat behind a 35 GB remux) — they share the box's uplink, so
+  total speed is unchanged, only who waits. A job that would leave < `PULL_MIN_FREE_GB` on the Jetson,
+  counting what the other running pulls still have to write, waits (`waiting_space`, never counted as a fetch failure). Supersede
   cancels a running pull (the worker removes its own stage); `cleanup_local_partial` skips busy stages.
   Seedr uses a per-thread requests session. `puller.run_pending()` runs jobs synchronously (tests).
   **Scene RARs**: after a pull the worker extracts every RAR set in the stage (`extract_archives`: `.rar`+`.rNN`
@@ -525,7 +527,7 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 - **Query resolution (`search_terms` + `unorm`) — alias-aware, and never "match everything":**
   Radarr searches a movie's **alternate titles**, which for Indian films are **native-script**
   (`கருப்பு`) — and it strips the vowel signs first (`கருப்பு` → `கர பப`). Two consequences, both
-  handled here and shared with tamilmv (which imports `search_terms`/`query_matches`):
+  handled here and shared with tamilmv (which imports `search_terms`/`match_rank`/`page`):
   - `norm()` keeps only `[a-z0-9]`, so a native-script query collapsed to `""` → zero tokens →
     `all([])` is **True** → the query matched the **whole catalogue** and each *arr search got 100
     unrelated releases (they showed up as ~300 `Unknown Movie` rejections per search). A query that
@@ -538,6 +540,14 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
     *Veerabhadrudu*, a name no Radarr query ever contains. A trailing year in the query is carried
     onto the alias terms. Radarr then maps the `Veerabhadrudu …` release back to Karuppu on its own,
     since `VeeraBhadrudu` is in its alternate titles — no title rewriting needed on our side.
+  - **Short aliases and paging** (2026-10-16, Athadu): Radarr lists *He* as an alternate title of
+    *Athadu*, and the token `he` substring-matched nearly every title, so the 100-item page was all
+    unrelated releases and Athadu itself never made it in. Query words of ≤ 2 chars must now be a
+    whole title word (`title_matches`); the query's own title is ranked ahead of alias-only matches
+    (`match_rank`); and both feeds honour Torznab `offset`/`limit` (`page_args`). Before that, a
+    full page made Prowlarr page on (offsets 0–900, the same 100 items each time, ~30 s a scan) until
+    it timed the indexer out (`tamilmv server is currently unavailable … Http request timed out`).
+    Collapsed titles are cached (`_title_key`), so only the first search after a restart is slow.
 - **Radarr-side settings these feeds depend on** (runtime config in the gitignored `radarr/`, so it is
   not version-controlled — re-apply after a Radarr rebuild):
   - `Settings → Indexers → Whitelisted Hardcoded Subs = esub,esubs,msub,msubs`. Every release on these
@@ -721,7 +731,7 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   **`http://10.0.0.179:8005/torznab`** (LAN IP, not `media-bridge:8005` — container names don't resolve in
   gluetun's netns; see movierulz's Prowlarr wiring). Querying it hits the local sqlite only (no CF), so keeping RSS
   enabled on this indexer is cheap — the CF cost is entirely in the background crawler.
-- **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`query_matches`,
+- **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`match_rank`,
   so the alias expansion and the "never match everything" guard described above apply here too.
 
 ### daddylive component (`media-bridge/daddylive.py`) — DISABLED 2026-09-24

@@ -168,6 +168,49 @@ class SonarrNudge(Base):
         self.assertEqual(self.calls, [])
 
 
+class Search(Base):
+    """Query matching + paging: a short alias must not match the whole catalogue, the query's own
+    title outranks alias matches, and offset/limit are honoured (Athadu, 2026-10-16)."""
+
+    def setUp(self):
+        super().setUp()
+        self._alias = (m._ALIAS, m._ALIAS_TS, m.RADARR_URL)
+        m.RADARR_URL = ""   # _radarr_aliases() then returns m._ALIAS as is
+        m._ALIAS = {"athadu": ["Athadu", "He", "Nandhu", "The Target"]}
+
+    def tearDown(self):
+        m._ALIAS, m._ALIAS_TS, m.RADARR_URL = self._alias
+        super().tearDown()
+
+    def add(self, i, title, added):
+        m.upsert_release({"btih": f"{i:040x}", "post_id": str(i), "title": title, "kind": "movie",
+                          "season": None, "language": "telugu", "year": 2005, "quality": "480p",
+                          "size": 1, "magnet": f"magnet:?xt=urn:btih:{i:040x}", "added_at": added})
+
+    def test_short_words_must_be_whole_title_words(self):
+        self.assertFalse(m.title_matches("He 2005", "The Heart (2005) Telugu 1080p"))
+        self.assertTrue(m.title_matches("He 2005", "He (2005) Telugu 1080p"))
+        self.assertTrue(m.title_matches("Kill Bill Vol 2", "Kill.Bill.Vol.2.2004.1080p"))
+        self.assertTrue(m.title_matches("Athadu 2005", "ATHADU (2005) Telugu - DVD9 - 480p"))
+
+    def test_query_title_ranks_first_and_pages_are_honoured(self):
+        self.add(1, "ATHADU (2005) Telugu - DVD9 - UNTOUCHED - 480p", added=1)
+        for i in range(2, 152):   # newer releases matching only the alias 'The Target 2005'
+            self.add(i, f"The Target {i} (2005) Hindi 720p", added=i)
+        self.assertEqual(m.search_terms("Athadu 2005")[0], "Athadu 2005")
+        first = m.query_releases("search", "Athadu 2005", "", [])
+        self.assertEqual(len(first), 100)
+        self.assertEqual(first[0]["title"], "ATHADU (2005) Telugu - DVD9 - UNTOUCHED - 480p")
+        rest = m.query_releases("search", "Athadu 2005", "", [], offset=100, limit=100)
+        self.assertEqual(len(rest), 51)
+        self.assertEqual(m.query_releases("search", "Athadu 2005", "", [], offset=200), [])
+        self.assertFalse({r["btih"] for r in first} & {r["btih"] for r in rest})
+
+    def test_page_args(self):
+        self.assertEqual(m.page_args({}), (0, 100))
+        self.assertEqual(m.page_args({"offset": ["300"], "limit": ["50"]}), (300, 50))
+        self.assertEqual(m.page_args({"offset": ["x"], "limit": ["1000"]}), (0, 100))
+
 
 if __name__ == "__main__":
     unittest.main()

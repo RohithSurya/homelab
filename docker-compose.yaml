@@ -162,7 +162,10 @@ services:
       # --- blackhole bridge (bridge.py) + its download backends (backends/) ---
       # Which backend runs each blackhole drop, first match wins: <private|public|*>:<backend>.
       # e.g. private:seedbox,public:seedr. The *arr apps are unaffected by any choice here.
-      - BRIDGE_ROUTE=private:seedbox,public:seedr   # 2026-09-25: private trackers -> Pulsed seedbox (per-tracker seed rules), public -> Seedr
+      # 2026-10-06: public moved to the seedbox too while Seedr's TLS certificate is expired (every
+      # Seedr call fails verification). Public results are deleted from the box right after delivery.
+      # Back to Seedr: private:seedbox,public:seedr
+      - BRIDGE_ROUTE=private:seedbox,public:seedbox # 2026-09-25: private trackers -> Pulsed seedbox (per-tracker seed rules)
       # --- Seedr backend ---
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
@@ -185,6 +188,13 @@ services:
       - PULL_PARALLEL_FILES=4
       - SEEDBOX_SFTP_WINDOW_MB=16
       - PULL_MIN_FREE_GB=25
+      # Pulls running at once: a small movie or a follow step no longer waits behind a 30 GB pull.
+      # They share the box's uplink, so total speed is the same -- only who waits changes.
+      - PULL_WORKERS=2
+      # Follow mode (backends/follow.py): while a seedbox torrent downloads, copy its finished,
+      # SHA-1-verified pieces home every FOLLOW_INTERVAL s, so the final pull only fetches the rest.
+      # off|private|all; enabled 2026-10-16 for everything (public routes to the seedbox too now).
+      - FOLLOW=all
       # --- retry rules (user decisions 2026-09-25). Both start in DRY-RUN: they only log what they
       #     would do (`python -m bridgelog` / events table) until switched to false after review.
       - SLOW_RULE=public                            # public|all|off: <5% after 2h, or projected ETA > 24h
@@ -317,7 +327,7 @@ services:
     restart: unless-stopped
 
   bazarr:
-    image: lscr.io/linuxserver/bazarr:v1.6.2-ls366   # pinned
+    image: lscr.io/linuxserver/bazarr:v1.6.2-ls368   # pinned
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+-ls\d+$$'
       - 'updater.policy=auto'
@@ -343,7 +353,7 @@ services:
   jellyfin:
     # Pinned to the immutable dated build, not the floating "12.0": 12.0's DB migrations are
     # one-way (see above), so a surprise move is the one thing to avoid here.
-    image: jellyfin/jellyfin:12.1.20260915-010956
+    image: jellyfin/jellyfin:12.2.20261005-225228
     container_name: jellyfin
     network_mode: host                           # LAN/DLNA discovery + reachable on Tailscale IP
     user: "1000:1000"                            # official image ignores PUID/PGID; keeps files owned by the *arr user

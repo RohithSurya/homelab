@@ -8,8 +8,10 @@ Ownership, to keep the two threads from racing:
     (the atomic rename into the watch folder) and releases/holds;
   - this worker only writes inside its job's staging dir (downloads/.incoming/<cat>/<release>)
     and deletes that dir itself when a job is cancelled. The bridge's cleanup skips busy dirs.
-One job runs at a time (the home downlink is the shared resource); a job whose size wouldn't fit
-the Jetson's disk (PULL_MIN_FREE_GB left over) waits instead of starting.
+PULL_WORKERS jobs run at once (default 2), so a small movie or a follow step never waits behind a
+30 GB pull. They share the seedbox's uplink, so the total speed doesn't change -- only who waits.
+A job whose size wouldn't fit the Jetson's disk (PULL_MIN_FREE_GB left over, counting what the other
+running pulls still have to write) waits instead of starting.
 """
 
 import json
@@ -25,6 +27,7 @@ from common import clog
 
 PULL_MIN_FREE = float(os.environ.get("PULL_MIN_FREE_GB", "25")) * 1024**3
 DATA_ROOT = os.environ.get("PULL_DATA_ROOT", "/data")
+WORKERS = max(1, int(os.environ.get("PULL_WORKERS", "2")))
 
 
 class Cancelled(Exception):
@@ -89,6 +92,7 @@ class Job:
 _jobs = {}
 _lock = threading.Lock()
 _q = queue.Queue()
+_space = threading.Lock()  # one disk-guard decision at a time, so two jobs can't both claim the same room
 
 
 def log(msg):
@@ -163,18 +167,35 @@ def _staged_bytes(path):
     return total
 
 
+def _still_needed(job):
+    return max(0, (job.size or 0) - _staged_bytes(job.stage))
+
+
+def _others_need(job):
+    """Bytes the other running pulls still have to write (the disk will lose them too)."""
+    with _lock:
+        running = [j for j in _jobs.values() if j is not job and j.status == "running"]
+    return sum(_still_needed(j) for j in running)
+
+
 def _run(job):
-    # disk guard: the part still to be written must leave PULL_MIN_FREE on the Jetson
-    need = max(0, (job.size or 0) - _staged_bytes(job.stage))
-    while _free_bytes() - need < PULL_MIN_FREE:
+    # disk guard: the part still to be written -- plus what the other running pulls still have to
+    # write -- must leave PULL_MIN_FREE on the Jetson
+    while True:
+        with _space:
+            need = _still_needed(job)
+            others = _others_need(job)
+            if _free_bytes() - need - others >= PULL_MIN_FREE:
+                job.before = _staged_bytes(job.stage)  # already there from an interrupted pull
+                job.status, job.started = "running", time.time()
+                break
         if job.status != "waiting_space":
             job.status = "waiting_space"
-            log(f"    pull of '{job.rec.get('release_name')}' waits: {need / 2**30:.1f} GiB wouldn't leave "
+            busy = f" (+{others / 2**30:.1f} GiB for running pulls)" if others else ""
+            log(f"    pull of '{job.rec.get('release_name')}' waits: {need / 2**30:.1f} GiB{busy} wouldn't leave "
                 f"{PULL_MIN_FREE / 2**30:.0f} GiB free on the Jetson")
         if job.cancel.wait(60):
             raise Cancelled()
-    job.before = _staged_bytes(job.stage)  # already there from an interrupted pull
-    job.status, job.started = "running", time.time()
     job.result = job.be.pull(job.rec, job.plan, job.stage, job.cancel)
     if job.cancel.is_set():
         raise Cancelled()
@@ -204,7 +225,7 @@ def _process(job):
 
 
 def run_worker():
-    log("pull worker started")
+    log(f"pull worker started ({threading.current_thread().name}, {WORKERS} at a time)")
     while True:
         _process(_q.get())
 

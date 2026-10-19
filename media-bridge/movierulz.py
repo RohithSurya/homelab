@@ -22,6 +22,7 @@ through FlareSolverr (which is inside the VPN), reached at FLARESOLVERR_URL
 """
 import datetime
 import email.utils
+import functools
 import os
 import re
 import sqlite3
@@ -491,14 +492,27 @@ def _collapse(s):
     return re.sub(r"(.)\1+", r"\1", norm(s))
 
 
+SHORT_TOKEN = 2   # query words this short must be a whole title word, not a substring
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _title_key(title):
+    """(collapsed title, its collapsed words) -- cached: every search scans the whole catalogue
+    once per term, and re-collapsing ~50k titles per term made a search take 10-30 s."""
+    return _collapse(title), frozenset(_collapse(w) for w in re.split(r"\W+", title or ""))
+
+
 def title_matches(q, title):
     """True if every word of the query (collapsed) appears in the collapsed title.
     Token-based + dup-collapse tolerates word order, spacing, and doubled letters --
-    the *arr still re-parse and filter results, so we can afford to be generous."""
-    ct = _collapse(title)
+    the *arr still re-parse and filter results, so we can afford to be generous.
+    A word of <= SHORT_TOKEN chars must be a whole title word: as a substring it matches nearly
+    everything -- Athadu's Radarr alias 'He' hit every title containing 'the'/'heart', filled
+    the 100-item page with unrelated releases and pushed Athadu itself out (2026-10-16)."""
+    ct, words = _title_key(title)
     toks = [_collapse(w) for w in q.split()]
     toks = [w for w in toks if w]
-    return all(w in ct for w in toks)
+    return all((w in words) if len(w) <= SHORT_TOKEN else (w in ct) for w in toks)
 
 
 def unorm(s):
@@ -676,24 +690,48 @@ def search_terms(q):
     ym = re.search(r"\b(?:19|20)\d{2}$", q)
     base, year = (q[:ym.start()].strip(), ym.group(0)) if ym else (q, "")
     aliases = _radarr_aliases().get(unorm(base)) or []
-    terms = [f"{t} {year}".strip() for t in aliases]
-    if norm(base):          # latin query: keep it, so unknown-to-Radarr searches still work
-        terms.append(q)
+    # the query itself comes FIRST (when latin, so unknown-to-Radarr searches still work):
+    # match_rank() orders results by the first term they match
+    terms = [q] if norm(base) else []
+    terms += [f"{t} {year}".strip() for t in aliases]
     return list(dict.fromkeys(terms))
 
 
-def query_matches(terms, title):
-    """True if the release title matches any resolved search term (None = no text filter)."""
+def match_rank(terms, title):
+    """Index of the first resolved search term the title matches (0 for no text filter), or
+    None. Results are ordered by it, so the query's own title outranks alias-only matches."""
     if terms is None:
-        return True
-    return any(title_matches(t, title) for t in terms)
+        return 0
+    return next((i for i, t in enumerate(terms) if title_matches(t, title)), None)
 
 
-def query_releases(t, q, season, cats):
-    """Select releases matching the search. Returns list of sqlite rows."""
+PAGE_MAX = 100   # matches caps_xml's <limits max>
+
+
+def page_args(qs):
+    """(offset, limit) of a Torznab request. Honouring them matters: Prowlarr pages on while a
+    page comes back full, and a server that ignores offset returns the same full page every time
+    -- Prowlarr walked offsets 0..900, ten slow scans per search, and timed the indexer out."""
+    def num(key, default):
+        try:
+            return max(0, int(qs.get(key, [default])[0]))
+        except (TypeError, ValueError):
+            return default
+    return num("offset", 0), min(num("limit", PAGE_MAX) or PAGE_MAX, PAGE_MAX)
+
+
+def page(ranked, offset=0, limit=PAGE_MAX):
+    """[(rank, row)] in newest-first order -> one page of rows, best rank first (stable sort, so
+    newest-first holds within a rank)."""
+    ranked = sorted(ranked, key=lambda x: x[0])
+    return [r for _, r in ranked[offset:offset + limit]]
+
+
+def query_releases(t, q, season, cats, offset=0, limit=PAGE_MAX):
+    """Select releases matching the search. Returns one page of sqlite rows."""
     with DB_LOCK:
         # scan the whole catalogue (no LIMIT) so old back-catalog stays searchable; the token
-        # matcher below is cheap and results are capped to 100.
+        # matcher below is cheap and results are paged (offset/limit, at most 100).
         rows = db().execute("SELECT * FROM releases ORDER BY added_at DESC").fetchall()
     terms = search_terms(q)
     out = []
@@ -711,12 +749,13 @@ def query_releases(t, q, season, cats):
                 continue
         # text filter (dup-collapsing, token-based -> matches transliteration variants),
         # widened to the movie's Radarr alternate titles
-        if not query_matches(terms, r["title"]):
+        rank = match_rank(terms, r["title"])
+        if rank is None:
             continue
         if season and r["kind"] == "series" and r["season"] and int(season) != r["season"]:
             continue
-        out.append(r)
-    return out[:100]
+        out.append((rank, r))
+    return page(out, offset, limit)
 
 
 def results_xml(rows):
@@ -792,7 +831,7 @@ class Handler(BaseHTTPRequestHandler):
         for c in qs.get("cat", []):
             cats += [int(x) for x in c.split(",") if x.strip().isdigit()]
         try:
-            rows = query_releases(t, q, season, cats)
+            rows = query_releases(t, q, season, cats, *page_args(qs))
             self._send(results_xml(rows))
         except Exception as e:
             log(f"torznab query error: {e}")

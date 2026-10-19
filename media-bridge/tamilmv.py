@@ -58,7 +58,8 @@ from torrentfile import parse_torrent
 # Reuse movierulz's stateless helpers (importing movierulz only builds its regexes; its threads
 # are started separately by main.py, so the import has no side effects beyond that).
 from movierulz import (
-    fetch, parse_magnet, search_terms, query_matches, series_title, torznab_category, error_xml,
+    fetch, parse_magnet, search_terms, match_rank, page, page_args, PAGE_MAX, series_title,
+    torznab_category, error_xml,
     nudge_sonarr, SONARR_NUDGE_DAYS,
     classify, normalize_title, MAGNET_RE, QUALITY_RE, SITE_PREFIX_RE,
 )
@@ -1666,7 +1667,7 @@ def _wanted(t, kind, row_cats, cats, season, row_season):
     return True
 
 
-def query_releases(t, q, season, cats):
+def query_releases(t, q, season, cats, offset=0, limit=PAGE_MAX):
     rows = _served_rows(
         "SELECT r.*, p.forum AS pforum, p.serve AS pserve FROM releases r "
         "LEFT JOIN posts p ON p.site = r.site AND p.post_id = r.post_id ORDER BY r.added_at DESC")
@@ -1676,15 +1677,17 @@ def query_releases(t, q, season, cats):
         fam = 5000 if r["kind"] == "series" else 2000
         if not _wanted(t, r["kind"], (fam, torznab_category(r)), cats, season, r["season"]):
             continue
-        if not query_matches(terms, r["title"]):
+        rank = match_rank(terms, r["title"])
+        if rank is None:
             continue
-        out.append(r)
-    return out[:100]
+        out.append((rank, r))
+    return page(out, offset, limit)
 
 
-def query_links(t, q, season, cats):
-    """Served direct-download links matching a SEARCH (never the empty-query RSS feed)."""
-    if not (q or "").strip():
+def query_links(t, q, season, cats, offset=0):
+    """Served direct-download links matching a SEARCH (never the empty-query RSS feed), on the
+    first page only -- later pages would repeat them."""
+    if not (q or "").strip() or offset:
         return []
     rows = _served_rows(
         "SELECT w.*, p.forum AS pforum, p.serve AS pserve FROM weblinks w "
@@ -1696,10 +1699,11 @@ def query_links(t, q, season, cats):
         fam = 5000 if r["kind"] == "series" else 2000
         if not _wanted(t, r["kind"], (fam, torznab_category(r)), cats, season, r["season"]):
             continue
-        if not query_matches(terms, r["title"] or ""):
+        rank = match_rank(terms, r["title"] or "")
+        if rank is None:
             continue
-        out.append(r)
-    return out[:LINKS_MAX]
+        out.append((rank, r))
+    return page(out, 0, LINKS_MAX)
 
 
 DVD_DISC_RE = re.compile(r"\bDVD\s?-?\s?[59]\b", re.I)
@@ -1945,9 +1949,10 @@ class Handler(BaseHTTPRequestHandler):
         cats = []
         for c in qs.get("cat", []):
             cats += [int(x) for x in c.split(",") if x.strip().isdigit()]
+        offset, limit = page_args(qs)
         try:
-            rows = query_releases(t, q, season, cats)
-            links = query_links(t, q, season, cats)
+            rows = query_releases(t, q, season, cats, offset, limit)
+            links = query_links(t, q, season, cats, offset)
             self._send(results_xml(rows, links, self._feed_base()))
         except Exception as e:
             log(f"torznab query error: {e!r}")

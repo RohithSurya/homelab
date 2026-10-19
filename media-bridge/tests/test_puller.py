@@ -133,6 +133,72 @@ class PullerTest(unittest.TestCase):
 FREE_BYTES = puller._free_bytes
 
 
+class GatedBackend:
+    """pull() blocks until released, so a test can hold jobs 'running'."""
+
+    def __init__(self):
+        self.go = threading.Event()
+
+    def pull(self, rec, plan, dest, cancel):
+        dest.mkdir(parents=True, exist_ok=True)
+        self.go.wait(5)
+        (dest / "f.mkv").write_bytes(b"x" * 10)
+
+
+class ParallelTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        puller._jobs.clear()
+        while not puller._q.empty():
+            puller._q.get_nowait()
+        puller.DATA_ROOT = str(self.tmp)
+        puller.PULL_MIN_FREE = 0
+
+    def tearDown(self):
+        puller._free_bytes = FREE_BYTES
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def worker(self):
+        t = threading.Thread(target=lambda: puller._process(puller._q.get(timeout=5)), daemon=True)
+        t.start()
+        return t
+
+    def wait_for(self, job, status):
+        for _ in range(250):
+            if job.status == status:
+                return
+            time.sleep(0.02)
+        self.fail(f"{job.tid} is {job.status}, not {status}")
+
+    def test_two_jobs_run_side_by_side(self):
+        be = GatedBackend()
+        big = puller.submit(be, {"tid": "big", "release_name": "Big"}, {}, self.tmp / "big", 10)
+        small = puller.submit(be, {"tid": "small", "release_name": "Small"}, {}, self.tmp / "small", 10)
+        threads = [self.worker(), self.worker()]
+        self.wait_for(big, "running")
+        self.wait_for(small, "running")  # the second one didn't queue behind the first
+        be.go.set()
+        for t in threads:
+            t.join(5)
+        self.assertEqual((big.status, small.status), ("done", "done"))
+
+    def test_disk_guard_counts_what_running_pulls_still_need(self):
+        puller._free_bytes = lambda: 100 << 20
+        puller.PULL_MIN_FREE = 60 << 20
+        be = GatedBackend()
+        a = puller.submit(be, {"tid": "a", "release_name": "A"}, {}, self.tmp / "a", 30 << 20)
+        ta = self.worker()
+        self.wait_for(a, "running")  # 100 - 30 >= 60: fits on its own
+        b = puller.submit(be, {"tid": "b", "release_name": "B"}, {}, self.tmp / "b", 20 << 20)
+        tb = self.worker()
+        self.wait_for(b, "waiting_space")  # alone 100 - 20 would fit, but A still needs 30 of it
+        puller.cancel("b")
+        be.go.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertEqual((a.status, b.status), ("done", "cancelled"))
+
+
 class ExtractTest(unittest.TestCase):
     """RAR extraction with a fake unrar (real archives need the non-free rar tool to create)."""
 
