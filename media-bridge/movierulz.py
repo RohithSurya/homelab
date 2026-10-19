@@ -2,19 +2,17 @@
 """
 movierulz crawler -> Torznab feed for Prowlarr.
 
-Why this exists: MediaFusion's tamil-site crawlers were compiled Rust spiders inside
-its image and can't be taught a new site. movierulz is a WordPress-style
-site, so we crawl it ourselves (through the existing FlareSolverr, since it's
-Cloudflare-protected) and expose a minimal Torznab feed that Prowlarr consumes as a
-generic Torznab indexer -- exactly how MediaFusion is wired in.
+Why this exists: no public indexer carries movierulz, a WordPress-style site, so we crawl it
+ourselves (through the existing FlareSolverr, since it's Cloudflare-protected) and expose a
+minimal Torznab feed that Prowlarr consumes as a generic Torznab indexer.
 
 Two threads (started from main.py):
-  * run_crawler()   -- periodically crawls all-language category pages via FlareSolverr,
-                       extracts magnets, parses/classifies, upserts into sqlite.
+  * run_crawler()   -- periodically crawls the master /movies listing (every language) via
+                       FlareSolverr, extracts magnets, parses/classifies, upserts into sqlite.
   * serve_torznab() -- stdlib HTTP server answering t=caps / search / movie / tvsearch.
 
-Scope: all languages; MOVIES + full-season packs only. Single-episode and "Part"
-releases are skipped (no clean Sonarr mapping).
+Scope: all languages; MOVIES + episode-range packs (served as multi-episode SxxEa-Eb) only.
+Single-episode and "Part" releases are skipped (no clean Sonarr mapping).
 
 Network: this runs OFF the VPN (default bridge net). All site fetching is proxied
 through FlareSolverr (which is inside the VPN), reached at FLARESOLVERR_URL

@@ -240,8 +240,8 @@ services:
       - MAX_PAGES=1000                             # safety cap; real stop is the last/empty page (~407)
       - FAKE_SEEDERS=50                            # movierulz exposes no seeders; satisfy *arr minimums
       - REQUEST_DELAY=3
-      # --- tamilmv scraper -> Torznab feed :8005 (replaces MediaFusion) ---
-      # Seeds + per-language forum maps come from MediaFusion's upstream GitHub config (auto-tracks
+      # --- tamilmv scraper -> Torznab feed :8005 ---
+      # Seeds + per-language forum maps come from a public GitHub data file (auto-tracks
       # domain rotation); live domain resolved by following the seed's 301 redirect. Pages, sitemap
       # and .torrent attachments go plain HTTP through gluetun's proxy (VPN exit IP); FlareSolverr
       # (FLARESOLVERR_URL) is the fallback on a CF challenge. Reuses FAKE_SEEDERS/REQUEST_DELAY above.

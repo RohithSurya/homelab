@@ -9,7 +9,7 @@ one container (all off-VPN, on the default bridge network):
                PULL_WORKERS puller threads pull finished transfers home in the background.
   * reaper   -- Jellyfin "watched movie" -> Radarr reaper   (6h)
   * movierulz-- 5movierulz crawler + Torznab feed for Prowlarr (crawl ~1h, HTTP server)
-  * tamilmv  -- tamilmv forum crawler + Torznab feed :8005 (replaces MediaFusion)
+  * tamilmv  -- tamilmv forum crawler + Torznab feed :8005
   * youtube  -- web form (:8003) + worker: pull a YouTube full-movie into a Radarr movie
                folder via a disposable yt-dlp+ffmpeg container (no-torrent fallback)
 
