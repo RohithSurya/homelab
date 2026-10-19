@@ -12,3 +12,8 @@ fail2ban/db/
 
 # Compose backups
 docker-compose.yaml.bak.*
+
+# CrowdSec generated config (holds local + central API credentials) and its
+# decisions database. acquis.d/ and bouncer/ are the tracked parts.
+crowdsec/config/
+crowdsec/data/

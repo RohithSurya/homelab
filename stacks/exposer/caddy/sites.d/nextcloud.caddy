@@ -1,4 +1,6 @@
-# Nextcloud — standalone stack in ~/next-cloud, publishes :8080.
+# Nextcloud — standalone stack in ~/next-cloud, publishes :8081.
+# NOT 8080: zigbee2mqtt (bedroom-agent) is network_mode: host and its frontend
+# defaults to :8080, so it claims that port first and Nextcloud fails to bind.
 nextcloud.rosurya.duckdns.org {
 	import security_headers
 	# Nextcloud service-discovery redirects.
@@ -6,5 +8,5 @@ nextcloud.rosurya.duckdns.org {
 	redir /.well-known/caldav /remote.php/dav 301
 	redir /.well-known/webfinger /index.php/.well-known/webfinger 301
 	redir /.well-known/nodeinfo /index.php/.well-known/nodeinfo 301
-	reverse_proxy 127.0.0.1:8080
+	reverse_proxy 127.0.0.1:8081
 }

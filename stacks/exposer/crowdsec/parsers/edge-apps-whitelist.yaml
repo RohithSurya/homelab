@@ -1,0 +1,12 @@
+# The Immich and Home Assistant apps produce bursts of harmless 404s (thumbnails
+# of deleted assets, the iOS config probe). Without this, crowdsecurity/http-probing
+# reads such a burst as a scan and bans a real, logged-in user — a replay of two
+# months of Caddy logs caught exactly that. Hub whitelists exist for Jellyfin and
+# Nextcloud (installed via PARSERS in docker-compose.yaml) but not for these two.
+name: local/edge-apps-whitelist
+description: "Ignore expected 404s from the Immich and Home Assistant apps"
+whitelist:
+  reason: "expected app 404s (Immich assets, Home Assistant iOS config)"
+  expression:
+    - evt.Meta.service == 'http' && evt.Meta.http_status == '404' && evt.Meta.target_fqdn == 'immich.rosurya.duckdns.org' && evt.Meta.http_path startsWith '/api/assets/'
+    - evt.Meta.service == 'http' && evt.Meta.http_status == '404' && evt.Meta.target_fqdn == 'ha.rosurya.duckdns.org' && evt.Meta.http_path startsWith '/api/ios/config'

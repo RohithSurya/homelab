@@ -24,7 +24,7 @@ services:
   # TLS: automatic Let's Encrypt. Port 80 is blocked by Comcast, so issuance
   # happens over TLS-ALPN-01 on :443 (Caddy falls back to it automatically).
   caddy:
-    image: caddy:2.11.4                           # pinned: step versions deliberately (see ~/updater)
+    image: caddy:2.11.7                           # pinned: step versions deliberately (see ~/updater)
     container_name: caddy
     network_mode: host                           # reach every backend on 127.0.0.1; own host :80/:443
     labels:
@@ -92,5 +92,69 @@ services:
       - ./caddy/logs:/var/log/caddy:ro                              # caddy access log (immich jail)
       - /home/rosurya/media-server/jellyfin/config/log:/var/log/jellyfin:ro
       - /home/rosurya/next-cloud/data:/var/log/nextcloud:ro         # nextcloud.log (dir, read-only)
+      # HA's whole config dir, read-only. Mounting just home-assistant.log does NOT
+      # work: HA rotates it to .log.1 on every restart, replacing the inode, which
+      # would pin a single-file bind mount to the stale one.
+      - /home/rosurya/bedroom-agent/infra/home-automation/ha_config:/var/log/homeassistant:ro
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ── CrowdSec: behaviour detection + community IP blocklist ───────────────────
+  # Complements fail2ban rather than replacing it: fail2ban bans on failed LOGINS
+  # read from each app's own log; CrowdSec reads Caddy's access logs for scans,
+  # probes and CVE attempts, and pulls the community blocklist of known-bad IPs.
+  # This container only DECIDES. crowdsec-bouncer below is what drops packets.
+  #
+  # On a normal bridge network (it needs no host access). Its API is published on
+  # loopback only so the host-net bouncer can reach it — on 8089, not the default
+  # 8080, which zigbee2mqtt already owns.
+  crowdsec:
+    image: crowdsecurity/crowdsec:v1.8.1         # pinned
+    container_name: crowdsec
+    labels:
+      - 'wud.tag.include=^v\d+\.\d+\.\d+$$'
+      - 'updater.policy=approve'
+    ports:
+      - "127.0.0.1:8089:8080"
+    environment:
+      - TZ=America/New_York
+      - COLLECTIONS=crowdsecurity/caddy
+      # Stop normal app traffic (404 bursts, long polls) reading as a scan.
+      - PARSERS=crowdsecurity/jellyfin-whitelist crowdsecurity/nextcloud-whitelist
+      - BOUNCER_KEY_firewall=${CROWDSEC_BOUNCER_KEY}
+    volumes:
+      - ./crowdsec/config:/etc/crowdsec                    # generated config + API credentials (gitignored)
+      - ./crowdsec/data:/var/lib/crowdsec/data             # decisions db, hub data (gitignored)
+      - ./crowdsec/acquis.d:/etc/crowdsec/acquis.d:ro      # which logs to read (tracked)
+      - ./crowdsec/parsers/edge-apps-whitelist.yaml:/etc/crowdsec/parsers/s02-enrich/edge-apps-whitelist.yaml:ro
+      - ./caddy/logs:/var/log/caddy:ro
+    healthcheck:
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Enforces crowdsec's decisions: one ipset-backed DROP rule on the host's INPUT
+  # chain, same reason as fail2ban for host net + NET_ADMIN. Built locally because
+  # CrowdSec ships this bouncer as a release binary only (see the Dockerfile).
+  # Stopping this container removes its rule and ipsets, i.e. unblocks everything.
+  crowdsec-bouncer:
+    build: ./crowdsec/bouncer
+    image: crowdsec-firewall-bouncer-local:v0.0.36
+    container_name: crowdsec-bouncer
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - CROWDSEC_BOUNCER_KEY=${CROWDSEC_BOUNCER_KEY}
+    volumes:
+      - ./crowdsec/bouncer/crowdsec-firewall-bouncer.yaml:/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml:ro
+    depends_on:
+      crowdsec:
+        condition: service_healthy
     logging: *default-logging
     restart: unless-stopped

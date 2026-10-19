@@ -1,0 +1,7 @@
+# Every Caddy access log written by the (access_log) snippet. Caddy is the
+# internet-facing edge, so "client_ip" in these lines is the real client IP.
+# A vhost without `import access_log <name>` is invisible to CrowdSec.
+filenames:
+  - /var/log/caddy/*.log
+labels:
+  type: caddy
