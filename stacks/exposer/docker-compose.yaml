@@ -1,0 +1,96 @@
+---
+# The public edge for every self-hosted stack on this box.
+#
+# Owns host :80/:443, TLS (Let's Encrypt), dynamic DNS, and brute-force bans.
+# Deliberately SEPARATE from the application stacks (../media-server, ../immich,
+# ../next-cloud) so that restarting any one of them never takes the others — or
+# TLS — offline, and so exposing a new service means adding a file to
+# caddy/sites.d/ rather than editing an application's compose file.
+#
+# Caddy runs network_mode: host and proxies to backends on 127.0.0.1. This is not
+# incidental: Jellyfin is host-net (LAN/DLNA discovery) and so can never join a
+# user-defined bridge network. Loopback is the one model that works for all
+# backends uniformly, and it keeps the application stacks unaware of this one.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ── Caddy: TLS terminator + reverse proxy ────────────────────────────────────
+  # Vhosts live one-per-file in caddy/sites.d/ (imported by caddy/Caddyfile).
+  # TLS: automatic Let's Encrypt. Port 80 is blocked by Comcast, so issuance
+  # happens over TLS-ALPN-01 on :443 (Caddy falls back to it automatically).
+  caddy:
+    image: caddy:2.11.4                           # pinned: step versions deliberately (see ~/updater)
+    container_name: caddy
+    network_mode: host                           # reach every backend on 127.0.0.1; own host :80/:443
+    labels:
+      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
+      - 'updater.policy=approve'
+      # autoheal lives in the media-server stack but matches by LABEL across all
+      # compose projects, so it still restarts this container when it goes unhealthy.
+      - "autoheal=true"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/sites.d:/etc/caddy/sites.d:ro     # one .caddy file per exposed service
+      - ./caddy/data:/data                        # Let's Encrypt certs + ACME account (KEEP: losing this re-issues)
+      - ./caddy/config:/config                    # caddy's autosaved JSON config
+      - ./caddy/logs:/var/log/caddy               # access logs (the fail2ban immich jail tails these)
+    healthcheck:                                  # caddy admin API (localhost:2019) = process alive
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Keeps rosurya.duckdns.org pointed at the current (dynamic) Comcast WAN IP.
+  # Every vhost is a subdomain of it, so this is edge infrastructure, not app config.
+  duckdns:
+    image: lscr.io/linuxserver/duckdns:b9e2cafd-ls153   # pinned (lsio uses git-sha versions, not semver)
+    labels:
+      - 'wud.tag.include=^[0-9a-f]{8}-ls\d+$$'
+      - 'wud.tag.transform=^[0-9a-f]{8}-ls(\d+)$$ => 0.0.$$1'
+      - 'updater.policy=auto'
+    container_name: duckdns
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+      - SUBDOMAINS=rosurya
+      - TOKEN=${DUCKDNS_TOKEN}
+      - UPDATE_IP=ipv4
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ── fail2ban: brute-force blocker for the public logins ──────────────────────
+  # Runs in the host net ns with NET_ADMIN so its iptables bans take effect on the
+  # host's INPUT chain, where inbound :443 actually lands.
+  #
+  # It reads logs from three different stacks. The Caddy access log is local (a
+  # sibling directory); the Jellyfin and Nextcloud logs are absolute host paths
+  # into the other stacks' state dirs. All three are read-only — this is the only
+  # remaining coupling to the application stacks, and it is inherent to the job.
+  fail2ban:
+    container_name: fail2ban
+    image: crazymax/fail2ban:1.1.1                # pinned
+    labels:
+      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
+      - 'updater.policy=approve'
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - TZ=America/New_York
+    volumes:
+      - ./fail2ban:/data                                            # jail.d/ filter.d/ + f2b state db
+      - ./caddy/logs:/var/log/caddy:ro                              # caddy access log (immich jail)
+      - /home/rosurya/media-server/jellyfin/config/log:/var/log/jellyfin:ro
+      - /home/rosurya/next-cloud/data:/var/log/nextcloud:ro         # nextcloud.log (dir, read-only)
+    logging: *default-logging
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+# Jellyfin — media-server stack, network_mode: host on :8096.
+# Access log (real client IP + negotiated protocol) so remote-streaming problems are
+# diagnosable: h3 vs h2, status codes, bytes served, and where a stream cuts out.
+jellyfin.rosurya.duckdns.org {
+	import security_headers
+	import access_log jellyfin
+	reverse_proxy 127.0.0.1:8096
+}
