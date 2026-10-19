@@ -1,3 +1,5 @@
+name: media-server   # pinned: container/volume names must not depend on the checkout folder
+
 ---
 # Per-service log rotation (mirrors the global default in /etc/docker/daemon.json,
 # but applies immediately to services that carry it, without a daemon restart).
@@ -104,7 +106,7 @@ services:
       - TZ=America/New_York
     volumes:
       - ./sonarr/config:/config
-      - ./data:/data                             # single root -> hardlink imports
+      - ${DATA_ROOT:-./data}:/data               # single root -> hardlink imports
     depends_on:
       gluetun:
         condition: service_healthy
@@ -126,7 +128,7 @@ services:
       - TZ=America/New_York
     volumes:
       - ./radarr/config:/config
-      - ./data:/data
+      - ${DATA_ROOT:-./data}:/data
     depends_on:
       gluetun:
         condition: service_healthy
@@ -248,7 +250,7 @@ services:
       - TAMILMV_HTTP_PROXY=http://gluetun:8888
       # Topic pages (every item's info link in Radarr/Sonarr, incl. '[DL-LINK]' direct links) use
       # the Tailscale address, so they open at home and away (Radarr is reached the same way).
-      - TAMILMV_PUBLIC_URL=http://100.122.87.20:8005
+      - TAMILMV_PUBLIC_URL=${TAMILMV_PUBLIC_URL:-http://100.122.87.20:8005}
       # Backfill: topics of a listing page fetched in parallel (measured: 1 -> 1.62 s/topic,
       # 3 -> 0.61, 4 -> 0.52 with request latency rising). Every topic problem -> JSONL log.
       - TAMILMV_BACKFILL_WORKERS=3
@@ -266,16 +268,16 @@ services:
       # - TAMILMV_SEED_OVERRIDE=https://www.1tamilmv.<tld>
       # --- youtube grabber (no-torrent fallback: pull a full-movie YouTube upload) ---
       - YOUTUBE_PORT=8003
-      - DATA_HOST_PATH=/home/rosurya/media-server/data  # HOST path of ./data; sibling yt-dlp containers bind-mount by host path
+      - DATA_HOST_PATH=${DATA_HOST_PATH:-/home/rosurya/media-server/data}  # HOST path of ./data; sibling yt-dlp containers bind-mount by host path
       # yt-dlp :latest is NOT self-updating (docker only fetches an absent image), and a stale
       # yt-dlp = every YouTube download dying with HTTP 403 partway in. Re-pull this often.
       - YTDLP_PULL_INTERVAL=21600
     volumes:
-      - ./data:/data
+      - ${DATA_ROOT:-./data}:/data
       - ./media-bridge/config:/config             # sqlite DB of scraped releases
       - /var/run/docker.sock:/var/run/docker.sock # spawn+remove disposable yt-dlp containers
     group_add:
-      - "994"                                     # host 'docker' group gid -> uid 1000 can use the socket
+      - "${DOCKER_GID:-994}"                      # host 'docker' group gid -> uid 1000 can use the socket
     extra_hosts:
       - "host.docker.internal:host-gateway"       # reach host-network Jellyfin (8096)
     labels:
@@ -327,7 +329,7 @@ services:
       - TZ=America/New_York
     volumes:
       - ./bazarr/config:/config
-      - ./data:/data                             # same root as sonarr/radarr -> 1:1 path mapping
+      - ${DATA_ROOT:-./data}:/data               # same root as sonarr/radarr -> 1:1 path mapping
     restart: unless-stopped
 
   # Official image (this install ran lscr.io/linuxserver/jellyfin until 2026-08-27).
@@ -357,7 +359,7 @@ services:
       - JELLYFIN_LOG_DIR=/config/log             # exposer's fail2ban tails this by absolute path
     volumes:
       - ./jellyfin/config:/config
-      - ./data/media:/data/media:ro
+      - ${DATA_ROOT:-./data}/media:/data/media:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8096/health"]
       interval: 30s
@@ -395,7 +397,7 @@ services:
     container_name: diun
     command: serve
     group_add:
-      - "994"                                     # host 'docker' gid -> read /var/run/docker.sock
+      - "${DOCKER_GID:-994}"                      # host 'docker' gid -> read /var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./diun/data:/data                          # bolt db of seen image digests

@@ -1,0 +1,11 @@
+# Prod overrides: Intel Quick Sync for video transcoding, OpenVINO (Intel GPU) for machine learning.
+services:
+  immich-server:
+    devices:
+      - /dev/dri:/dev/dri
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-v3}-openvino
+    devices:
+      - /dev/dri:/dev/dri
+    device_cgroup_rules:
+      - "c 189:* rmw"

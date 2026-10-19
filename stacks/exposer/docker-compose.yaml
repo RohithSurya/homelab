@@ -1,4 +1,5 @@
 ---
+name: exposer
 # The public edge for every self-hosted stack on this box.
 #
 # Owns host :80/:443, TLS (Let's Encrypt), dynamic DNS, and brute-force bans.
