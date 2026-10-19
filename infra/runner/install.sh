@@ -19,7 +19,10 @@ tok_file=$HOME/.config/homelab/bws_token        # this machine's Bitwarden machi
 [ -f "$tok_file" ] && mounts+=(-v "$tok_file:/run/secrets/bws_token:ro")
 
 docker build -q -t homelab-runner:latest . >/dev/null
-docker rm -f gh-runner >/dev/null 2>&1 || true
+# stop gracefully: a killed runner leaves its session on GitHub for minutes, and jobs queued
+# meanwhile get stuck on it
+docker stop -t 60 gh-runner >/dev/null 2>&1 || true
+docker rm gh-runner >/dev/null 2>&1 || true
 docker run -d --name gh-runner --restart unless-stopped --network host \
   -e RUNNER_URL=https://github.com/RohithSurya/homelab -e RUNNER_NAME="$host" -e RUNNER_LABELS="$labels" \
   -e RUNNER_TOKEN="$token" -e RUN_AS_UID="$(id -u)" -e DOCKER_GID="$(getent group docker | cut -d: -f3)" \

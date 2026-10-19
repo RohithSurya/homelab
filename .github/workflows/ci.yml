@@ -2,10 +2,9 @@ name: ci
 # Every branch push and PR: the checks a change must pass before it may deploy.
 # Runs on the Jetson (dev) runner. Never touches a running stack, needs no secrets.
 on:
-  push:
-    branches-ignore: [main]      # main is checked by deploy.yml, which calls this workflow
-  pull_request:
-  workflow_call:
+  pull_request:                  # once per PR (a push trigger as well would run everything twice)
+  workflow_call:                 # deploy.yml runs these first on every merge to main
+  workflow_dispatch:             # by hand, on any branch
 
 permissions:
   contents: read
