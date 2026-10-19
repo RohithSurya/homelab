@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-tamilmv / tamilblasters crawler -> Torznab feed for Prowlarr (host :8005).
+tamilmv crawler -> Torznab feed for Prowlarr (host :8005).
 
-Why this exists: these two IPBoard forums (Tamil/Telugu/Hindi/Malayalam/Kannada/English
-movies + web-series) were previously scraped by the compiled Rust spiders inside the
-MediaFusion image. We retired that whole 4-container stack; this reimplements just the two
-tamil scrapers ourselves -- the same pattern as movierulz.py -- and drops MediaFusion.
+Why this exists: this IPBoard forum (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies +
+web-series) was previously scraped by a compiled Rust spider inside the MediaFusion image. We
+retired that whole 4-container stack; this reimplements the scraper ourselves -- the same
+pattern as movierulz.py -- and drops MediaFusion. (tamilblasters, the second site MediaFusion
+covered, was dead from 2026-08-23 and was removed on 2026-10-19.)
 
 Design: ARCHIVE everything, EXTRACT from the archive, SERVE only what is flagged served.
   * run_crawler()   -- hourly head walk of the release forums (newest topics, by START date),
@@ -21,7 +22,7 @@ Design: ARCHIVE everything, EXTRACT from the archive, SERVE only what is flagged
                        torrents + flagged '[DL-LINK]' items from SERVED forums/topics only, the
                        topic pages (/t/<site>/<id>) that items link to, and /nograb (always 404).
 
-Domain rotation: tamilmv/tamilblasters change domains often. The seed domains AND the per-forum
+Domain rotation: tamilmv changes domains often. The seed domain AND the per-forum
 maps come from MediaFusion's UPSTREAM GitHub scraper_config.json (TAMILMV_CONFIG_URL), refreshed
 periodically and cached locally. The live domain is found by following the seed's 301 redirect.
 
@@ -34,6 +35,7 @@ the backfill are skipped (media-bridge is off the VPN; it never fetches these si
 Scope: MOVIES + full-season packs only (single episodes / "Part" forms are skipped) -- the
 classify()/normalize_title() guards are reused verbatim from movierulz.
 """
+
 import datetime
 import email.utils
 import gzip
@@ -55,13 +57,27 @@ import requests
 
 from common import clog, ntfy
 from torrentfile import parse_torrent
+
 # Reuse movierulz's stateless helpers (importing movierulz only builds its regexes; its threads
 # are started separately by main.py, so the import has no side effects beyond that).
 from movierulz import (
-    fetch, parse_magnet, search_terms, match_rank, page, page_args, PAGE_MAX, series_title,
-    torznab_category, error_xml,
-    nudge_sonarr, SONARR_NUDGE_DAYS,
-    classify, normalize_title, MAGNET_RE, QUALITY_RE, SITE_PREFIX_RE,
+    fetch,
+    parse_magnet,
+    search_terms,
+    match_rank,
+    page,
+    page_args,
+    PAGE_MAX,
+    series_title,
+    torznab_category,
+    error_xml,
+    nudge_sonarr,
+    SONARR_NUDGE_DAYS,
+    classify,
+    normalize_title,
+    MAGNET_RE,
+    QUALITY_RE,
+    SITE_PREFIX_RE,
 )
 
 # ---- config ----
@@ -70,13 +86,19 @@ CONFIG_URL = os.environ.get(
     "https://raw.githubusercontent.com/mhdzumair/MediaFusion/main/resources/json/scraper_config.json",
 )
 CONFIG_CACHE = os.environ.get("TAMILMV_CONFIG_CACHE", "/config/tamilmv_config.json")
-CONFIG_REFRESH = int(os.environ.get("TAMILMV_CONFIG_REFRESH", "86400"))  # re-pull GitHub config daily
+CONFIG_REFRESH = int(
+    os.environ.get("TAMILMV_CONFIG_REFRESH", "86400")
+)  # re-pull GitHub config daily
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://gluetun:8191").rstrip("/")
 APIKEY = os.environ.get("TAMILMV_APIKEY", "")
 PORT = int(os.environ.get("TAMILMV_PORT", "8005"))
 CRAWL_INTERVAL = int(os.environ.get("TAMILMV_CRAWL_INTERVAL", "3600"))
-MAX_PAGES = int(os.environ.get("TAMILMV_MAX_PAGES", "5"))   # head walk: newest pages per forum
-MIN_PAGES = int(os.environ.get("TAMILMV_MIN_PAGES", "1"))   # scan at least this many pages per forum
+MAX_PAGES = int(
+    os.environ.get("TAMILMV_MAX_PAGES", "5")
+)  # head walk: newest pages per forum
+MIN_PAGES = int(
+    os.environ.get("TAMILMV_MIN_PAGES", "1")
+)  # scan at least this many pages per forum
 FAKE_SEEDERS = int(os.environ.get("FAKE_SEEDERS", "50"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "3"))
 EMPTY_RETRY_DAYS = float(os.environ.get("TAMILMV_EMPTY_RETRY_DAYS", "3"))
@@ -118,11 +140,16 @@ SITEMAP_DAYS = float(os.environ.get("TAMILMV_SITEMAP_DAYS", "30"))
 EXTRA_FORUMS = os.environ.get(
     "TAMILMV_EXTRA_FORUMS",
     "tamilmv:38-dvd9-dvd5=malayalam,tamilmv:60-dvd9-dvd5=hindi,tamilmv:13-dvd9-dvd5=tamil,"
-    "tamilmv:92-post-share-here=auto")
+    "tamilmv:92-post-share-here=auto",
+)
 # Where a browser reaches this server: the '[DL-LINK]' items and every release link their topic
 # page here (Radarr/Sonarr "info" link). The Tailscale address works at home and away.
-PUBLIC_URL = os.environ.get("TAMILMV_PUBLIC_URL", "http://100.122.87.20:8005").rstrip("/")
-LINKS_MAX = int(os.environ.get("TAMILMV_LINKS_MAX", "50"))   # '[DL-LINK]' items per search
+PUBLIC_URL = os.environ.get("TAMILMV_PUBLIC_URL", "http://100.122.87.20:8005").rstrip(
+    "/"
+)
+LINKS_MAX = int(
+    os.environ.get("TAMILMV_LINKS_MAX", "50")
+)  # '[DL-LINK]' items per search
 # Title flag of a direct-download item. Radarr/Sonarr parse '[DL-LINK]' as the release group (title,
 # year, quality, language unaffected), and no real group is called that.
 LINK_FLAG = "[DL-LINK]"
@@ -133,19 +160,22 @@ PARSER_V = 3
 # existed must be read once more).
 WALK_EPOCH = 2
 
-# The two sites we handle, mapped to their key in the upstream config. Per-site seed overrides
-# (for emergencies when the GitHub seed itself dies) come from *_SEED_OVERRIDE env vars.
+# The site we handle, mapped to its key in the upstream config, with its seed override (for
+# emergencies when the GitHub seed itself dies). Only these sites are crawled AND served: rows of
+# a removed site (tamil_blasters, 2026-10-19) stay in the DBs but never reach the feed.
 SITES = {
     "tamilmv": os.environ.get("TAMILMV_SEED_OVERRIDE", ""),
-    "tamil_blasters": os.environ.get("TAMILBLASTERS_SEED_OVERRIDE", ""),
 }
-UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 # Full topic URL (with slug) on a forum listing, keyed on the numeric topic id. A descriptive slug
 # (>=1 letter) is required so pinned nav links like '/topic/183-0/' are ignored.
 TOPIC_RE = re.compile(
-    r'https?://[^"\'<>\s]*?/index\.php\?/forums/topic/(\d+)-([a-z0-9][^"\'<>\s]*)', re.I)
+    r'https?://[^"\'<>\s]*?/index\.php\?/forums/topic/(\d+)-([a-z0-9][^"\'<>\s]*)', re.I
+)
 
 # module-level parsed config: {site: {"homepage": str, "forums": [(forum_path, language), ...]}}
 CONFIG = {}
@@ -158,24 +188,14 @@ def log(msg):
 
 # ---- GitHub config (seeds + forum maps) ----
 def _parse_site_cfg(raw):
-    """Normalize a site block from scraper_config.json into {homepage, forums:[(path,lang)]}.
-    Handles BOTH shapes: tamilmv uses 'supported_search_forums' ({path:{language,media_type}});
-    tamil_blasters uses 'catalogs' ({language:{mediatype: path | [paths]}})."""
+    """Normalize a site block from scraper_config.json into {homepage, forums:[(path,lang)]}
+    (tamilmv's 'supported_search_forums': {path:{language,media_type}})."""
     homepage = (raw.get("homepage") or "").rstrip("/")
     forums = []
     ssf = raw.get("supported_search_forums")
     if isinstance(ssf, dict):
         for path, meta in ssf.items():
             forums.append((path, (meta or {}).get("language", "unknown")))
-    cats = raw.get("catalogs")
-    if isinstance(cats, dict):
-        for lang, groups in cats.items():
-            if not isinstance(groups, dict):
-                continue
-            for val in groups.values():
-                for path in (val if isinstance(val, list) else [val]):
-                    if isinstance(path, str) and path:
-                        forums.append((path, lang))
     # de-dupe (path, lang) while preserving order
     seen, uniq = set(), []
     for f in forums:
@@ -209,8 +229,12 @@ def load_config(force=False):
             raw = None
     if raw is None:
         if not CONFIG:
-            ntfy("tamilmv: no config", "GitHub fetch and cache both failed; crawler idle",
-                 priority="high", tags="warning")
+            ntfy(
+                "tamilmv: no config",
+                "GitHub fetch and cache both failed; crawler idle",
+                priority="high",
+                tags="warning",
+            )
         return bool(CONFIG)
     CONFIG = {site: _parse_site_cfg(raw.get(site, {})) for site in SITES}
     CONFIG_TS = time.time()
@@ -271,7 +295,11 @@ def fetch_error_type(status, text=""):
         return "rate_limited"
     if status >= 500:
         return "server_error"
-    if status in (403, 503) or "Just a moment" in (text or "")[:4000] or "challenge-platform" in (text or "")[:8000]:
+    if (
+        status in (403, 503)
+        or "Just a moment" in (text or "")[:4000]
+        or "challenge-platform" in (text or "")[:8000]
+    ):
         return "challenge"
     if status in (404, 410):
         return "not_found"
@@ -288,7 +316,11 @@ class PlainUnavailable(Exception):
 
 
 def _challenged(status, text):
-    return status in (403, 503) or "Just a moment" in text[:4000] or "challenge-platform" in text[:8000]
+    return (
+        status in (403, 503)
+        or "Just a moment" in text[:4000]
+        or "challenge-platform" in text[:8000]
+    )
 
 
 def fetch_plain(url, binary=False):
@@ -345,9 +377,8 @@ def site_base(site):
     A live base is remembered in meta 'base:<site>' (topic pages link the live domain from it).
 
     The dead-site ntfy is rate-limited to one push per DEAD_ALERT_INTERVAL per site, and the
-    timer is RESET to 0 on every successful resolve. That gives transition semantics like
-    daddylive's precheck: a site that recovers and then dies again alerts immediately instead
-    of waiting out a window opened by the previous outage."""
+    timer is RESET to 0 on every successful resolve, so a site that recovers and then dies
+    again alerts immediately instead of waiting out a window opened by the previous outage."""
     key = f"dead_alert:{site}"
     seed = SITES.get(site) or CONFIG.get(site, {}).get("homepage")
     base = resolve_base(seed)
@@ -366,9 +397,12 @@ def site_base(site):
     log(f"  {site}: seed {seed2!r} still dead after config refresh")
     last = float(get_meta(key) or 0)
     if time.time() - last >= DEAD_ALERT_INTERVAL:
-        ntfy(f"tamilmv: {site} domain dead",
-             f"seed {seed2!r} no longer redirects; update *_SEED_OVERRIDE or wait for upstream config",
-             priority="high", tags="warning")
+        ntfy(
+            f"tamilmv: {site} domain dead",
+            f"seed {seed2!r} no longer redirects; update *_SEED_OVERRIDE or wait for upstream config",
+            priority="high",
+            tags="warning",
+        )
         set_meta(key, time.time())
     return base
 
@@ -478,14 +512,33 @@ def db():
             """
         )
         # posts.serve: per-topic override of the forum's serve flag (NULL = follow the forum).
-        _add_columns(conn, "posts", (("forum", "TEXT"), ("posted_at", "REAL"),
-                                     ("parsed_v", "INTEGER DEFAULT 0"), ("title", "TEXT"),
-                                     ("serve", "INTEGER"), ("gone", "INTEGER DEFAULT 0"),
-                                     ("pending", "INTEGER DEFAULT 0"), ("last_error", "TEXT")))
+        _add_columns(
+            conn,
+            "posts",
+            (
+                ("forum", "TEXT"),
+                ("posted_at", "REAL"),
+                ("parsed_v", "INTEGER DEFAULT 0"),
+                ("title", "TEXT"),
+                ("serve", "INTEGER"),
+                ("gone", "INTEGER DEFAULT 0"),
+                ("pending", "INTEGER DEFAULT 0"),
+                ("last_error", "TEXT"),
+            ),
+        )
         _add_columns(conn, "attachments", (("size", "INTEGER"),))
-        _add_columns(conn, "weblinks", (("lid", "TEXT"), ("btih", "TEXT"), ("title", "TEXT"),
-                                        ("kind", "TEXT"), ("season", "INTEGER"),
-                                        ("quality", "TEXT")))
+        _add_columns(
+            conn,
+            "weblinks",
+            (
+                ("lid", "TEXT"),
+                ("btih", "TEXT"),
+                ("title", "TEXT"),
+                ("kind", "TEXT"),
+                ("season", "INTEGER"),
+                ("quality", "TEXT"),
+            ),
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wl_lid ON weblinks(lid)")
         conn.commit()
         _conn = conn
@@ -500,7 +553,9 @@ def get_meta(key):
 
 def set_meta(key, value):
     with DB_LOCK:
-        db().execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", (key, str(value)))
+        db().execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", (key, str(value))
+        )
         db().commit()
 
 
@@ -529,55 +584,108 @@ def adb():
 
 def archive_put(site, post_id, url, page):
     with ARCH_LOCK:
-        adb().execute("INSERT OR REPLACE INTO pages(site, post_id, url, html, saved_at) VALUES (?,?,?,?,?)",
-                      (site, post_id, url, gzip.compress(page.encode("utf-8")), time.time()))
+        adb().execute(
+            "INSERT OR REPLACE INTO pages(site, post_id, url, html, saved_at) VALUES (?,?,?,?,?)",
+            (site, post_id, url, gzip.compress(page.encode("utf-8")), time.time()),
+        )
         adb().commit()
 
 
 def archive_get(site, post_id):
     """(url, html, saved_at) or None."""
     with ARCH_LOCK:
-        row = adb().execute("SELECT url, html, saved_at FROM pages WHERE site=? AND post_id=?",
-                            (site, post_id)).fetchone()
+        row = (
+            adb()
+            .execute(
+                "SELECT url, html, saved_at FROM pages WHERE site=? AND post_id=?",
+                (site, post_id),
+            )
+            .fetchone()
+        )
     if not row:
         return None
-    return row["url"], gzip.decompress(row["html"]).decode("utf-8", "replace"), row["saved_at"]
+    return (
+        row["url"],
+        gzip.decompress(row["html"]).decode("utf-8", "replace"),
+        row["saved_at"],
+    )
 
 
 def archive_saved_at(site, post_id):
     with ARCH_LOCK:
-        row = adb().execute("SELECT saved_at FROM pages WHERE site=? AND post_id=?", (site, post_id)).fetchone()
+        row = (
+            adb()
+            .execute(
+                "SELECT saved_at FROM pages WHERE site=? AND post_id=?", (site, post_id)
+            )
+            .fetchone()
+        )
     return row[0] if row else None
 
 
 def archived(site, post_id):
     with ARCH_LOCK:
-        return adb().execute("SELECT 1 FROM pages WHERE site=? AND post_id=?",
-                             (site, post_id)).fetchone() is not None
+        return (
+            adb()
+            .execute("SELECT 1 FROM pages WHERE site=? AND post_id=?", (site, post_id))
+            .fetchone()
+            is not None
+        )
 
 
 # ---- error log (JSONL) ----
 _ERR_LOCK = threading.Lock()
-ONE_OFF = {"not_torrent", "private_torrent", "magnet_unparsed", "magnet_skipped", "empty", "extract_error"}
+ONE_OFF = {
+    "not_torrent",
+    "private_torrent",
+    "magnet_unparsed",
+    "magnet_skipped",
+    "empty",
+    "extract_error",
+}
 
 
-def log_error(site, post_id, typ, stage, outcome, url=None, status=None, detail="", forum=None,
-              dedupe_key=None, **extra):
+def log_error(
+    site,
+    post_id,
+    typ,
+    stage,
+    outcome,
+    url=None,
+    status=None,
+    detail="",
+    forum=None,
+    dedupe_key=None,
+    **extra,
+):
     """Append one JSON line to ERRORS_PATH. One-off findings (ONE_OFF types) are written once per
     (topic, type, dedupe_key); fetch failures are events and are written every time. Never raises:
     the log must not break the crawl."""
     try:
         if typ in ONE_OFF and post_id is not None:
             with DB_LOCK:
-                cur = db().execute("INSERT OR IGNORE INTO logged(site, post_id, type, key) VALUES (?,?,?,?)",
-                                   (site, post_id, typ, str(dedupe_key or "")))
+                cur = db().execute(
+                    "INSERT OR IGNORE INTO logged(site, post_id, type, key) VALUES (?,?,?,?)",
+                    (site, post_id, typ, str(dedupe_key or "")),
+                )
                 db().commit()
             if cur.rowcount == 0:
                 return
-        rec = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-               "site": site, "post_id": post_id, "url": url, "forum": forum,
-               "thread": getattr(_CTX, "role", "head"), "stage": stage, "type": typ, "status": status,
-               "detail": (detail or "")[:500], "outcome": outcome}
+        rec = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "site": site,
+            "post_id": post_id,
+            "url": url,
+            "forum": forum,
+            "thread": getattr(_CTX, "role", "head"),
+            "stage": stage,
+            "type": typ,
+            "status": status,
+            "detail": (detail or "")[:500],
+            "outcome": outcome,
+        }
         rec.update(extra)
         line = json.dumps(rec, ensure_ascii=False) + "\n"
         with _ERR_LOCK:
@@ -597,8 +705,12 @@ def log_error(site, post_id, typ, stage, outcome, url=None, status=None, detail=
 def forum_overrides():
     """{(site, forum id): 0/1} manual forum serve overrides."""
     with DB_LOCK:
-        return {(r["site"], r["forum_id"]): r["serve"] for r in
-                db().execute("SELECT site, forum_id, serve FROM forums WHERE serve IS NOT NULL")}
+        return {
+            (r["site"], r["forum_id"]): r["serve"]
+            for r in db().execute(
+                "SELECT site, forum_id, serve FROM forums WHERE serve IS NOT NULL"
+            )
+        }
 
 
 def is_served(site, forum, post_serve, overrides=None, released=None):
@@ -621,16 +733,23 @@ def upsert_forums(site, entries):
     """entries: [(forum id, path)] from the sitemap; new rows get serve NULL (automatic)."""
     with DB_LOCK:
         for fid, path in entries:
-            db().execute("INSERT INTO forums(site, forum_id, path, serve, seen_at) VALUES (?,?,?,NULL,?) "
-                         "ON CONFLICT(site, forum_id) DO UPDATE SET path=excluded.path, "
-                         "seen_at=excluded.seen_at", (site, fid, path, time.time()))
+            db().execute(
+                "INSERT INTO forums(site, forum_id, path, serve, seen_at) VALUES (?,?,?,NULL,?) "
+                "ON CONFLICT(site, forum_id) DO UPDATE SET path=excluded.path, "
+                "seen_at=excluded.seen_at",
+                (site, fid, path, time.time()),
+            )
         db().commit()
 
 
 def known_forums(site):
     with DB_LOCK:
-        return [(r["forum_id"], r["path"]) for r in
-                db().execute("SELECT forum_id, path FROM forums WHERE site=?", (site,))]
+        return [
+            (r["forum_id"], r["path"])
+            for r in db().execute(
+                "SELECT forum_id, path FROM forums WHERE site=?", (site,)
+            )
+        ]
 
 
 def forum_language(site, forum):
@@ -645,7 +764,9 @@ def backfill_order(site):
         if forum_id(path) not in seen:
             seen.add(forum_id(path))
             out.append((path, lang))
-    for fid, path in sorted(known_forums(site), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+    for fid, path in sorted(
+        known_forums(site), key=lambda x: int(x[0]) if x[0].isdigit() else 0
+    ):
         if fid not in seen:
             seen.add(fid)
             out.append((path, "auto"))
@@ -675,9 +796,15 @@ def topic_action(site, post_id, url=None):
     thousands of years-old link-only topics, and anchoring on first-seen re-read each of them every
     pass for days."""
     with DB_LOCK:
-        row = db().execute(
-            "SELECT scraped_at, magnets, url, posted_at, parsed_v, gone, pending FROM posts "
-            "WHERE site=? AND post_id=?", (site, post_id)).fetchone()
+        row = (
+            db()
+            .execute(
+                "SELECT scraped_at, magnets, url, posted_at, parsed_v, gone, pending FROM posts "
+                "WHERE site=? AND post_id=?",
+                (site, post_id),
+            )
+            .fetchone()
+        )
     if row is None:
         return "fetch"
     if url and _slug(url) and _slug(url) != _slug(row["url"]):
@@ -687,8 +814,12 @@ def topic_action(site, post_id, url=None):
     saved = archive_saved_at(site, post_id)
     if saved is None or saved < float(get_meta(f"refetch_before:{site}") or 0):
         return "fetch"
-    retry = (row["magnets"] or 0) == 0 and EMPTY_RETRY_DAYS > 0 and (
-        time.time() - (row["posted_at"] or row["scraped_at"] or 0)) < EMPTY_RETRY_DAYS * 86400
+    retry = (
+        (row["magnets"] or 0) == 0
+        and EMPTY_RETRY_DAYS > 0
+        and (time.time() - (row["posted_at"] or row["scraped_at"] or 0))
+        < EMPTY_RETRY_DAYS * 86400
+    )
     if retry:
         return "fetch"
     if row["pending"] or (row["parsed_v"] or 0) < PARSER_V:
@@ -700,7 +831,9 @@ def post_needs_fetch(site, post_id, url=None):
     return topic_action(site, post_id, url) == "fetch"
 
 
-def mark_post(site, post_id, url, magnets, forum=None, posted_at=None, title=None, pending=0):
+def mark_post(
+    site, post_id, url, magnets, forum=None, posted_at=None, title=None, pending=0
+):
     """A successful read. INSERT OR IGNORE keeps scraped_at as the stable first-seen time; magnets
     (torrents found on the page: magnets + .torrent attachments) only ratchets up (never down). url
     is always refreshed: it is what topic_action compares the next listing's slug against. Clears
@@ -708,13 +841,26 @@ def mark_post(site, post_id, url, magnets, forum=None, posted_at=None, title=Non
     with DB_LOCK:
         db().execute(
             "INSERT OR IGNORE INTO posts(site, post_id, url, scraped_at, magnets) VALUES (?,?,?,?,?)",
-            (site, post_id, url, time.time(), magnets))
+            (site, post_id, url, time.time(), magnets),
+        )
         db().execute(
             "UPDATE posts SET url=?, parsed_v=?, forum=coalesce(?, forum), posted_at=coalesce(?, posted_at), "
             "title=coalesce(?, title), gone=0, pending=?, last_error=NULL WHERE site=? AND post_id=?",
-            (url, PARSER_V, forum, posted_at, title or None, 1 if pending else 0, site, post_id))
-        db().execute("UPDATE posts SET magnets=? WHERE site=? AND post_id=? AND magnets<?",
-                     (magnets, site, post_id, magnets))
+            (
+                url,
+                PARSER_V,
+                forum,
+                posted_at,
+                title or None,
+                1 if pending else 0,
+                site,
+                post_id,
+            ),
+        )
+        db().execute(
+            "UPDATE posts SET magnets=? WHERE site=? AND post_id=? AND magnets<?",
+            (magnets, site, post_id, magnets),
+        )
         db().commit()
 
 
@@ -723,8 +869,12 @@ def mark_gone(site, post_id, url, typ):
     with DB_LOCK:
         db().execute(
             "INSERT OR IGNORE INTO posts(site, post_id, url, scraped_at, magnets) VALUES (?,?,?,?,0)",
-            (site, post_id, url, time.time()))
-        db().execute("UPDATE posts SET gone=1, last_error=? WHERE site=? AND post_id=?", (typ, site, post_id))
+            (site, post_id, url, time.time()),
+        )
+        db().execute(
+            "UPDATE posts SET gone=1, last_error=? WHERE site=? AND post_id=?",
+            (typ, site, post_id),
+        )
         db().commit()
 
 
@@ -732,14 +882,17 @@ def upsert_release(rec):
     """One row per infohash (the first topic keeps it: stable pubDate); every topic it appears in
     goes to release_topics."""
     with DB_LOCK:
-        db().execute("INSERT OR IGNORE INTO release_topics(btih, site, post_id) VALUES (?,?,?)",
-                     (rec["btih"], rec["site"], rec["post_id"]))
+        db().execute(
+            "INSERT OR IGNORE INTO release_topics(btih, site, post_id) VALUES (?,?,?)",
+            (rec["btih"], rec["site"], rec["post_id"]),
+        )
         # OR IGNORE keeps the original added_at -> stable pubDate for Prowlarr.
         db().execute(
             """INSERT OR IGNORE INTO releases
                (btih, site, post_id, title, kind, season, language, year, quality, size, magnet, added_at)
                VALUES (:btih,:site,:post_id,:title,:kind,:season,:language,:year,:quality,:size,:magnet,:added_at)""",
-            rec)
+            rec,
+        )
         db().commit()
 
 
@@ -752,48 +905,99 @@ def replace_weblinks(site, post_id, links, topic, language):
     old set is replaced. found_at is kept for links seen before (stable pubDate)."""
     with DB_LOCK:
         c = db()
-        old = {r["url"]: r["found_at"] for r in
-               c.execute("SELECT url, found_at FROM weblinks WHERE site=? AND post_id=?", (site, post_id))}
+        old = {
+            r["url"]: r["found_at"]
+            for r in c.execute(
+                "SELECT url, found_at FROM weblinks WHERE site=? AND post_id=?",
+                (site, post_id),
+            )
+        }
         c.execute("DELETE FROM weblinks WHERE site=? AND post_id=?", (site, post_id))
         for ln in links:
             c.execute(
                 "INSERT OR IGNORE INTO weblinks(site, post_id, url, host, label, size, topic, language, "
                 "found_at, lid, btih, title, kind, season, quality) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (site, post_id, ln["url"], ln["host"], ln["label"], ln["size"], topic, language,
-                 old.get(ln["url"], time.time()), link_id(site, post_id, ln["url"]), ln.get("btih"),
-                 ln.get("title"), ln.get("kind"), ln.get("season"), ln.get("quality")))
+                (
+                    site,
+                    post_id,
+                    ln["url"],
+                    ln["host"],
+                    ln["label"],
+                    ln["size"],
+                    topic,
+                    language,
+                    old.get(ln["url"], time.time()),
+                    link_id(site, post_id, ln["url"]),
+                    ln.get("btih"),
+                    ln.get("title"),
+                    ln.get("kind"),
+                    ln.get("season"),
+                    ln.get("quality"),
+                ),
+            )
         c.commit()
 
 
 # ---- topic parsing (pure functions; tests feed them synthetic IPS markup) ----
 CANONICAL_RE = re.compile(
     r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)'
-    r'|<link[^>]+href=["\']([^"\']+)["\'][^>]*rel=["\']canonical', re.I)
+    r'|<link[^>]+href=["\']([^"\']+)["\'][^>]*rel=["\']canonical',
+    re.I,
+)
 # Posts from ~2023 carry magnets the forum mangled into links: 'http://magnet?xt=urn:btih:...'.
 MANGLED_MAGNET_RE = re.compile(r'https?://magnet/?\?(xt=urn:btih:[^"\'<>\s]+)', re.I)
 ARTICLE_RE = re.compile(r"<article\b", re.I)
 ARTICLE_BLOCK_RE = re.compile(r"<article\b.*?</article>", re.I | re.S)
 TIME_RE = re.compile(r'<time[^>]+datetime=["\']([^"\']+)["\']', re.I)
-OG_TITLE_RE = re.compile(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']*)["\']', re.I)
+OG_TITLE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']*)["\']', re.I
+)
 BREADCRUMB_RE = re.compile(r'data-role=["\']breadcrumbList["\'](.*?)</ul>', re.I | re.S)
-FORUM_LINK_RE = re.compile(r'/forums/forum/(\d+)-', re.I)
-ANCHOR_RE = re.compile(r'<a\s([^>]*)>(.*?)</a>', re.I | re.S)
+FORUM_LINK_RE = re.compile(r"/forums/forum/(\d+)-", re.I)
+ANCHOR_RE = re.compile(r"<a\s([^>]*)>(.*?)</a>", re.I | re.S)
 HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.I)
-ATTACH_RE = re.compile(r'attachment\.php\?id=(\d+)', re.I)
-TAG_RE = re.compile(r'<[^>]+>')
-FILE_SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB)\b', re.I)
-VIDEO_EXT_RE = re.compile(r'\.(mkv|mp4|avi|m4v)\b', re.I)
-YEAR_WORD_RE = re.compile(r'\b(19|20)\d{2}\b')
+ATTACH_RE = re.compile(r"attachment\.php\?id=(\d+)", re.I)
+TAG_RE = re.compile(r"<[^>]+>")
+FILE_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(GB|MB)\b", re.I)
+VIDEO_EXT_RE = re.compile(r"\.(mkv|mp4|avi|m4v)\b", re.I)
+YEAR_WORD_RE = re.compile(r"\b(19|20)\d{2}\b")
 # Hosts in a post that are never a download: image hosts (screenshots), socials, the forum
 # software's own credits, ads. Anything else linked from the opening post is kept as a web link.
 NOT_DOWNLOAD_HOSTS = (
-    "imageride.", "imgbb.", "ibb.co", "imgur.", "postimg.", "pixhost.", "imagebam.", "tmdb.org",
-    "themoviedb.", "imdb.com", "t.me", "telegram.", "instagram.", "facebook.", "twitter.", "x.com",
-    "whatsapp.", "youtube.", "youtu.be", "invisioncommunity.", "ipbmafia.", "streamdady.",
-    "llvpn.", "gmpg.org", "wikipedia.", "google.com", "reddit.", "linkedin.", "pinterest.",
+    "imageride.",
+    "imgbb.",
+    "ibb.co",
+    "imgur.",
+    "postimg.",
+    "pixhost.",
+    "imagebam.",
+    "tmdb.org",
+    "themoviedb.",
+    "imdb.com",
+    "t.me",
+    "telegram.",
+    "instagram.",
+    "facebook.",
+    "twitter.",
+    "x.com",
+    "whatsapp.",
+    "youtube.",
+    "youtu.be",
+    "invisioncommunity.",
+    "ipbmafia.",
+    "streamdady.",
+    "llvpn.",
+    "gmpg.org",
+    "wikipedia.",
+    "google.com",
+    "reddit.",
+    "linkedin.",
+    "pinterest.",
     "tumblr.",
 )
-LANG_WORD_RE = re.compile(r"\b(tamil|telugu|malayalam|kannada|hindi|bengali|marathi|punjabi|english)\b", re.I)
+LANG_WORD_RE = re.compile(
+    r"\b(tamil|telugu|malayalam|kannada|hindi|bengali|marathi|punjabi|english)\b", re.I
+)
 
 
 def _text(fragment):
@@ -807,7 +1011,7 @@ def first_post(page):
     if not m:
         return ""
     end = page.find("</article>", m.start())
-    return page[m.start():end if end > 0 else len(page)]
+    return page[m.start() : end if end > 0 else len(page)]
 
 
 def topic_forum(page):
@@ -822,7 +1026,9 @@ def topic_posted_at(page):
     if not m:
         return None
     try:
-        return datetime.datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).timestamp()
+        return datetime.datetime.fromisoformat(
+            m.group(1).replace("Z", "+00:00")
+        ).timestamp()
     except ValueError:
         return None
 
@@ -845,16 +1051,24 @@ def archive_view(page):
     canon = m and (m.group(1) or m.group(2))
     b = BREADCRUMB_RE.search(page)
     q = htmlmod.escape
-    return (f'<meta property="og:title" content="{q(title)}">\n'
-            + (f'<link rel="canonical" href="{q(canon)}">\n' if canon else "")
-            + (f'<nav><ul data-role="breadcrumbList">{b.group(1)}</ul></nav>\n' if b else "")
-            + "\n".join(ARTICLE_BLOCK_RE.findall(page)))
+    return (
+        f'<meta property="og:title" content="{q(title)}">\n'
+        + (f'<link rel="canonical" href="{q(canon)}">\n' if canon else "")
+        + (
+            f'<nav><ul data-role="breadcrumbList">{b.group(1)}</ul></nav>\n'
+            if b
+            else ""
+        )
+        + "\n".join(ARTICLE_BLOCK_RE.findall(page))
+    )
 
 
 def find_magnets(page):
     """Every magnet on the page, the mangled 'http://magnet?xt=' form rewritten to 'magnet:?'; one
     per infohash, page order."""
-    found = MAGNET_RE.findall(page) + ["magnet:?" + m for m in MANGLED_MAGNET_RE.findall(page)]
+    found = MAGNET_RE.findall(page) + [
+        "magnet:?" + m for m in MANGLED_MAGNET_RE.findall(page)
+    ]
     out, seen = [], set()
     for m in found:
         m = htmlmod.unescape(m)
@@ -875,7 +1089,9 @@ def _magnet_names(magnets):
     names = set()
     for m in magnets:
         dn = re.search(r"[?&]dn=([^&]+)", m)
-        if dn:   # '+' is a space in some magnets and a literal (DD+5.1) in others: keep both
+        if (
+            dn
+        ):  # '+' is a space in some magnets and a literal (DD+5.1) in others: keep both
             names.add(urllib.parse.unquote(dn.group(1)).strip().lower())
             names.add(urllib.parse.unquote_plus(dn.group(1)).strip().lower())
     return names
@@ -885,7 +1101,11 @@ def _magnet_meta(magnet):
     """(btih lowercased hex or as given, dn, size or 0)."""
     bt = re.search(r"btih:([0-9a-zA-Z]+)", magnet)
     xl = re.search(r"[?&]xl=(\d+)", magnet)
-    return (bt.group(1).lower() if bt else ""), _dn(magnet), (int(xl.group(1)) if xl else 0)
+    return (
+        (bt.group(1).lower() if bt else ""),
+        _dn(magnet),
+        (int(xl.group(1)) if xl else 0),
+    )
 
 
 def find_torrent_attachments(page):
@@ -899,7 +1119,8 @@ def find_torrent_attachments(page):
         m = ATTACH_RE.search(url)
         name = _text(inner)
         is_torrent = name.lower().endswith(".torrent") or re.search(
-            r'data-fileext=["\']torrent', attrs, re.I)
+            r'data-fileext=["\']torrent', attrs, re.I
+        )
         if m and is_torrent and m.group(1) not in seen:
             seen.add(m.group(1))
             out.append((int(m.group(1)), url, name))
@@ -923,7 +1144,10 @@ def magnet_from_torrent_bytes(data):
     name = (info.get(b"name") or b"").decode("utf-8", "replace")
     q = urllib.parse.quote
     parts = [f"xt=urn:btih:{btih}", f"dn={q(name, safe='')}", f"xl={size}"]
-    parts += [f"tr={q(t.decode('utf-8', 'replace'), safe='')}" for t in dict.fromkeys(trackers)]
+    parts += [
+        f"tr={q(t.decode('utf-8', 'replace'), safe='')}"
+        for t in dict.fromkeys(trackers)
+    ]
     return btih, "magnet:?" + "&".join(parts)
 
 
@@ -937,8 +1161,12 @@ def _size_bytes(text):
 
 def _generic_label(label):
     """'DIRECT LINK', 'Download', 'Click here', 'G-Drive'...: says nothing about the file."""
-    return (len(label) <= 30 and not FILE_SIZE_RE.search(label) and not VIDEO_EXT_RE.search(label)
-            and not YEAR_WORD_RE.search(label))
+    return (
+        len(label) <= 30
+        and not FILE_SIZE_RE.search(label)
+        and not VIDEO_EXT_RE.search(label)
+        and not YEAR_WORD_RE.search(label)
+    )
 
 
 def find_weblinks(page, own_host, att_map=None):
@@ -953,7 +1181,7 @@ def find_weblinks(page, own_host, att_map=None):
     post = first_post(page)
     out, seen = [], set()
     prev_end = 0
-    last = None          # (name, btih, size) of the most recent torrent in the post
+    last = None  # (name, btih, size) of the most recent torrent in the post
     for m in ANCHOR_RE.finditer(post):
         ctx_start, prev_end = max(prev_end, m.start() - 600), m.end()
         attrs, inner = m.group(1), m.group(2)
@@ -963,7 +1191,9 @@ def find_weblinks(page, own_host, att_map=None):
         url = htmlmod.unescape(href.group(1)).strip()
         mangled = MANGLED_MAGNET_RE.match(url)
         if url.lower().startswith("magnet:") or mangled:
-            bt, dn, size = _magnet_meta("magnet:?" + mangled.group(1) if mangled else url)
+            bt, dn, size = _magnet_meta(
+                "magnet:?" + mangled.group(1) if mangled else url
+            )
             last = (dn, bt, size)
             continue
         att = ATTACH_RE.search(url)
@@ -971,27 +1201,44 @@ def find_weblinks(page, own_host, att_map=None):
             name = _text(inner)
             if name.lower().endswith(".torrent"):
                 bt, size = att_map.get(int(att.group(1)), ("", 0))
-                last = (name[:-len(".torrent")].strip(), bt, size)
+                last = (name[: -len(".torrent")].strip(), bt, size)
             continue
         host = (urlparse(url).hostname or "").lower()
-        if (not url.lower().startswith(("http://", "https://")) or not host or url in seen
-                or host == own_host or host.endswith("." + own_host)
-                or any(h in host for h in NOT_DOWNLOAD_HOSTS)
-                or re.search(r"<img\b", inner, re.I)):
+        if (
+            not url.lower().startswith(("http://", "https://"))
+            or not host
+            or url in seen
+            or host == own_host
+            or host.endswith("." + own_host)
+            or any(h in host for h in NOT_DOWNLOAD_HOSTS)
+            or re.search(r"<img\b", inner, re.I)
+        ):
             continue
         seen.add(url)
         label = _text(inner)
         btih = None
         size = 0
-        if label and not label.startswith(("http://", "https://")) and _generic_label(label) and last:
+        if (
+            label
+            and not label.startswith(("http://", "https://"))
+            and _generic_label(label)
+            and last
+        ):
             label, btih, size = last[0], (last[1] or None), last[2]
         elif not label or label == url or label.startswith(("http://", "https://")):
-            ctx = post[ctx_start:m.start()]
+            ctx = post[ctx_start : m.start()]
             if ">" in ctx and ("<" not in ctx or ctx.index(">") < ctx.index("<")):
-                ctx = ctx[ctx.index(">") + 1:]          # cut into the middle of a tag
+                ctx = ctx[ctx.index(">") + 1 :]  # cut into the middle of a tag
             label = _text(ctx)[-200:]
-        out.append({"url": url, "host": host, "label": label, "size": size or _size_bytes(label),
-                    "btih": btih})
+        out.append(
+            {
+                "url": url,
+                "host": host,
+                "label": label,
+                "size": size or _size_bytes(label),
+                "btih": btih,
+            }
+        )
     return out
 
 
@@ -1001,14 +1248,18 @@ def link_title(label, topic):
     s = (label or "").strip()
     m = VIDEO_EXT_RE.search(s)
     if m:
-        s = s[:m.start()]
-        tok = re.search(r"(\S{12,})$", s)        # 'Raja Rani (2014) 1080p - Raja.Rani.2014.1080p...'
+        s = s[: m.start()]
+        tok = re.search(
+            r"(\S{12,})$", s
+        )  # 'Raja Rani (2014) 1080p - Raja.Rani.2014.1080p...'
         if tok and tok.group(1).count(".") >= 3:
             s = tok.group(1)
     elif not YEAR_WORD_RE.search(s):
         s = topic or s
     s = SITE_PREFIX_RE.sub("", s)
-    s = re.sub(r"^\s*(?:\d+\)\s*|@\S+\s+-\s+)", "", s)   # '1) Title', '@Uploader - Title'
+    s = re.sub(
+        r"^\s*(?:\d+\)\s*|@\S+\s+-\s+)", "", s
+    )  # '1) Title', '@Uploader - Title'
     return s.strip(" -|:")
 
 
@@ -1017,8 +1268,12 @@ def annotate_link(link, topic):
     title = link_title(link["label"], topic)
     kind, season = classify(title)
     qm = QUALITY_RE.search(title) or QUALITY_RE.search(link["label"] or "")
-    link.update(title=normalize_title(title, kind) if kind != "skip" else title, kind=kind,
-                season=season, quality=qm.group(1).lower() if qm else "")
+    link.update(
+        title=normalize_title(title, kind) if kind != "skip" else title,
+        kind=kind,
+        season=season,
+        quality=qm.group(1).lower() if qm else "",
+    )
     return link
 
 
@@ -1026,20 +1281,34 @@ def annotate_link(link, topic):
 def _attachment_map(site, post_id):
     """{att_id: (btih, size)} of this topic's downloaded attachments."""
     with DB_LOCK:
-        return {r["att_id"]: (r["btih"] or "", r["size"] or 0) for r in db().execute(
-            "SELECT att_id, btih, size FROM attachments WHERE site=? AND post_id=?", (site, post_id))}
+        return {
+            r["att_id"]: (r["btih"] or "", r["size"] or 0)
+            for r in db().execute(
+                "SELECT att_id, btih, size FROM attachments WHERE site=? AND post_id=?",
+                (site, post_id),
+            )
+        }
 
 
 def _attachment_known(site, att_id):
     with DB_LOCK:
-        return db().execute("SELECT 1 FROM attachments WHERE site=? AND att_id=?",
-                            (site, att_id)).fetchone() is not None
+        return (
+            db()
+            .execute(
+                "SELECT 1 FROM attachments WHERE site=? AND att_id=?", (site, att_id)
+            )
+            .fetchone()
+            is not None
+        )
 
 
 def _record_attachment(site, att_id, post_id, btih, name, size=0):
     with DB_LOCK:
-        db().execute("INSERT OR REPLACE INTO attachments(site, att_id, post_id, btih, name, fetched_at, size) "
-                     "VALUES (?,?,?,?,?,?,?)", (site, att_id, post_id, btih, name, time.time(), size))
+        db().execute(
+            "INSERT OR REPLACE INTO attachments(site, att_id, post_id, btih, name, fetched_at, size) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (site, att_id, post_id, btih, name, time.time(), size),
+        )
         db().commit()
 
 
@@ -1080,22 +1349,43 @@ def extract(site, post_id, url, page, language=None):
         else:
             bt, dn, _ = _magnet_meta(mg)
             valid = re.fullmatch(r"[0-9a-f]{40}|[0-9a-z]{32}", bt or "")
-            log_error(site, post_id, "magnet_skipped" if valid else "magnet_unparsed", "extract",
-                      "recorded", url, detail=(dn or mg)[:300], forum=forum, dedupe_key=bt or mg[:80])
+            log_error(
+                site,
+                post_id,
+                "magnet_skipped" if valid else "magnet_unparsed",
+                "extract",
+                "recorded",
+                url,
+                detail=(dn or mg)[:300],
+                forum=forum,
+                dedupe_key=bt or mg[:80],
+            )
 
     names = _magnet_names(magnets)
     attachments = find_torrent_attachments(page)
     pending = 0
     for att_id, att_url, att_name in attachments:
-        if att_name.lower()[:-len(".torrent")].strip() in names or _attachment_known(site, att_id):
+        if att_name.lower()[: -len(".torrent")].strip() in names or _attachment_known(
+            site, att_id
+        ):
             continue
         st, data = fetch_plain(att_url, binary=True)
         if st != 200 or not data:
             # plain HTTP off, or a transient error: the topic stays 'pending' and is re-extracted
             # (from the archive) on its next visit, which retries only this download
             pending = 1
-            log_error(site, post_id, "attachment_failed", "attachment", "pending", att_url, st,
-                      att_name, forum=forum, att_id=att_id)
+            log_error(
+                site,
+                post_id,
+                "attachment_failed",
+                "attachment",
+                "pending",
+                att_url,
+                st,
+                att_name,
+                forum=forum,
+                att_id=att_id,
+            )
             continue
         got = magnet_from_torrent_bytes(data)
         size = _magnet_meta(got[1])[2] if got else 0
@@ -1107,20 +1397,59 @@ def extract(site, post_id, url, page, language=None):
                 upsert_release(rec)
                 n += 1
             else:
-                log_error(site, post_id, "magnet_skipped", "attachment", "recorded", att_url,
-                          detail=att_name, forum=forum, dedupe_key=got[0])
+                log_error(
+                    site,
+                    post_id,
+                    "magnet_skipped",
+                    "attachment",
+                    "recorded",
+                    att_url,
+                    detail=att_name,
+                    forum=forum,
+                    dedupe_key=got[0],
+                )
         else:
-            log_error(site, post_id, _attachment_reason(data), "attachment", "recorded", att_url, st,
-                      att_name, forum=forum, dedupe_key=att_id, att_id=att_id)
+            log_error(
+                site,
+                post_id,
+                _attachment_reason(data),
+                "attachment",
+                "recorded",
+                att_url,
+                st,
+                att_name,
+                forum=forum,
+                dedupe_key=att_id,
+                att_id=att_id,
+            )
 
     own_host = (urlparse(url).hostname or "").lower()
-    links = [annotate_link(ln, title) for ln in
-             find_weblinks(page, own_host, _attachment_map(site, post_id))]
+    links = [
+        annotate_link(ln, title)
+        for ln in find_weblinks(page, own_host, _attachment_map(site, post_id))
+    ]
     replace_weblinks(site, post_id, links, title, language)
-    mark_post(site, post_id, url, len(magnets) + len(attachments), forum, posted_at, title, pending)
+    mark_post(
+        site,
+        post_id,
+        url,
+        len(magnets) + len(attachments),
+        forum,
+        posted_at,
+        title,
+        pending,
+    )
     if not magnets and not attachments and not links and is_served(site, forum, None):
-        log_error(site, post_id, "empty", "extract", "recorded", url,
-                  detail=f"no torrents or links: {title}"[:300], forum=forum)
+        log_error(
+            site,
+            post_id,
+            "empty",
+            "extract",
+            "recorded",
+            url,
+            detail=f"no torrents or links: {title}"[:300],
+            forum=forum,
+        )
     return n
 
 
@@ -1131,12 +1460,22 @@ def _safe_extract(site, post_id, url, page, language):
         raise
     except Exception as e:
         # a parser bug: record the topic (so the walk moves on) and the error; fix + `reparse`
-        log_error(site, post_id, "extract_error", "extract", "recorded", url, detail=repr(e),
-                  dedupe_key=repr(e)[:80])
+        log_error(
+            site,
+            post_id,
+            "extract_error",
+            "extract",
+            "recorded",
+            url,
+            detail=repr(e),
+            dedupe_key=repr(e)[:80],
+        )
         mark_post(site, post_id, url, 0)
         with DB_LOCK:
-            db().execute("UPDATE posts SET parsed_v=0, last_error='extract_error' WHERE site=? AND post_id=?",
-                         (site, post_id))
+            db().execute(
+                "UPDATE posts SET parsed_v=0, last_error='extract_error' WHERE site=? AND post_id=?",
+                (site, post_id),
+            )
             db().commit()
         return 0
 
@@ -1159,10 +1498,20 @@ def process_topic(site, post_id, url, language=None):
             mark_gone(site, post_id, url, typ)
             log_error(site, post_id, typ, "fetch", "gone", url, status)
         return 0
-    if not ARTICLE_RE.search(page):          # a moved/hidden stub (redirects home), an error page
+    if not ARTICLE_RE.search(
+        page
+    ):  # a moved/hidden stub (redirects home), an error page
         mark_gone(site, post_id, url, "no_article")
-        log_error(site, post_id, "no_article", "fetch", "gone", url, status,
-                  f"no <article> on the page: {topic_title(page) or 'untitled'}"[:300])
+        log_error(
+            site,
+            post_id,
+            "no_article",
+            "fetch",
+            "gone",
+            url,
+            status,
+            f"no <article> on the page: {topic_title(page) or 'untitled'}"[:300],
+        )
         return 0
     view = archive_view(page)
     m = CANONICAL_RE.search(view)
@@ -1234,11 +1583,30 @@ def read_listing(base, forum_path, page, site=None):
     try:
         status, page_html = fetch_page(url)
     except PlainUnavailable as e:
-        log_error(site, None, e.typ, "listing", "retry", url, e.status, str(e), forum=forum_id(forum_path))
+        log_error(
+            site,
+            None,
+            e.typ,
+            "listing",
+            "retry",
+            url,
+            e.status,
+            str(e),
+            forum=forum_id(forum_path),
+        )
         raise
     if status != 200 or not page_html:
-        log_error(site, None, "listing_failed", "listing", "retry", url, status,
-                  fetch_error_type(status, page_html), forum=forum_id(forum_path))
+        log_error(
+            site,
+            None,
+            "listing_failed",
+            "listing",
+            "retry",
+            url,
+            status,
+            fetch_error_type(status, page_html),
+            forum=forum_id(forum_path),
+        )
         return None, 0
     counts = [int(x) for x in re.findall(r'data-pages=["\'](\d+)', page_html)]
     topics, seen = [], set()
@@ -1270,7 +1638,9 @@ def crawl_forum(site, base, forum_path, language, known_before):
         p, r = _read_topics(site, topics, language)
         posts += p
         releases += r
-        if page >= pages or (page >= MIN_PAGES and all(pid in known_before for pid, _ in topics)):
+        if page >= pages or (
+            page >= MIN_PAGES and all(pid in known_before for pid, _ in topics)
+        ):
             break
     return posts, releases
 
@@ -1280,7 +1650,9 @@ def reset_walk_if_needed():
     if get_meta("walk_epoch") == str(WALK_EPOCH):
         return False
     with DB_LOCK:
-        db().execute("DELETE FROM meta WHERE key LIKE 'walk:%' OR key LIKE 'walkdone:%'")
+        db().execute(
+            "DELETE FROM meta WHERE key LIKE 'walk:%' OR key LIKE 'walkdone:%'"
+        )
         db().commit()
     set_meta("walk_epoch", WALK_EPOCH)
     log(f"backfill: walk epoch {WALK_EPOCH} -- every forum is walked again from page 1")
@@ -1320,12 +1692,15 @@ def backfill(site, base, forums, budget, workers=1):
 
 
 def backfill_remaining(site, forums):
-    return sum(1 for path, _ in forums if get_meta(f"walkdone:{site}:{forum_id(path)}") != "1")
+    return sum(
+        1 for path, _ in forums if get_meta(f"walkdone:{site}:{forum_id(path)}") != "1"
+    )
 
 
 SITEMAP_TOPIC_RE = re.compile(
-    r'<loc>([^<]*/forums/topic/(\d+)-[^<]*)</loc>\s*<lastmod>([^<]+)</lastmod>', re.I)
-SITEMAP_FORUM_RE = re.compile(r'<loc>[^<]*/forums/forum/((\d+)-[^/<]*)/?</loc>', re.I)
+    r"<loc>([^<]*/forums/topic/(\d+)-[^<]*)</loc>\s*<lastmod>([^<]+)</lastmod>", re.I
+)
+SITEMAP_FORUM_RE = re.compile(r"<loc>[^<]*/forums/forum/((\d+)-[^/<]*)/?</loc>", re.I)
 
 
 def discover_forums(site, base):
@@ -1347,7 +1722,10 @@ def sitemap_topics(site, base, now=None):
     if status != 200 or not index:
         log(f"  sitemap: index unavailable ({status})")
         return None
-    files = [htmlmod.unescape(u) for u in re.findall(r"<loc>([^<]*forums_Topic[^<]*)</loc>", index)]
+    files = [
+        htmlmod.unescape(u)
+        for u in re.findall(r"<loc>([^<]*forums_Topic[^<]*)</loc>", index)
+    ]
     entries = {}
     for f in files:
         st, body = fetch_plain(f)
@@ -1368,7 +1746,10 @@ def sitemap_sweep(site, base, now=None):
     is within SITEMAP_DAYS -- catches a topic moved into a forum after the walk passed it, or one a
     listing hiccup skipped. The same daily pass refreshes the forum list. Needs plain HTTP."""
     now = now or time.time()
-    if not HTTP_PROXY or now - float(get_meta(f"sitemap:{site}") or 0) < SITEMAP_INTERVAL:
+    if (
+        not HTTP_PROXY
+        or now - float(get_meta(f"sitemap:{site}") or 0) < SITEMAP_INTERVAL
+    ):
         return 0, 0
     role, _CTX.role = getattr(_CTX, "role", "head"), "sitemap"
     try:
@@ -1377,16 +1758,24 @@ def sitemap_sweep(site, base, now=None):
         if entries is None:
             return 0, 0
         with DB_LOCK:
-            known = {r[0] for r in db().execute("SELECT post_id FROM posts WHERE site=?", (site,))}
-        todo = [(pid, loc) for pid, (loc, ts) in sorted(entries.items(), reverse=True)
-                if pid not in known and now - ts < SITEMAP_DAYS * 86400]
+            known = {
+                r[0]
+                for r in db().execute("SELECT post_id FROM posts WHERE site=?", (site,))
+            }
+        todo = [
+            (pid, loc)
+            for pid, (loc, ts) in sorted(entries.items(), reverse=True)
+            if pid not in known and now - ts < SITEMAP_DAYS * 86400
+        ]
         posts = releases = 0
         for pid, loc in todo:
             releases += process_topic(site, pid, loc, None)
             posts += 1
         set_meta(f"sitemap:{site}", now)
-        log(f"  sitemap: {nforums} forums, {len(entries)} topics listed, {len(todo)} unseen within "
-            f"{SITEMAP_DAYS:g}d read, {releases} releases")
+        log(
+            f"  sitemap: {nforums} forums, {len(entries)} topics listed, {len(todo)} unseen within "
+            f"{SITEMAP_DAYS:g}d read, {releases} releases"
+        )
         return posts, releases
     finally:
         _CTX.role = role
@@ -1403,8 +1792,12 @@ def audit(site, base, workers=1):
         if entries is None:
             return None
         with DB_LOCK:
-            state = {r["post_id"]: (r["gone"], r["pending"]) for r in db().execute(
-                "SELECT post_id, gone, pending FROM posts WHERE site=?", (site,))}
+            state = {
+                r["post_id"]: (r["gone"], r["pending"])
+                for r in db().execute(
+                    "SELECT post_id, gone, pending FROM posts WHERE site=?", (site,)
+                )
+            }
         items, have = [], 0
         for pid, (loc, _) in sorted(entries.items(), reverse=True):
             gone, pending = state.get(pid, (0, 0))
@@ -1414,20 +1807,38 @@ def audit(site, base, workers=1):
                 items.append((pid, loc, "force", None))
             elif pending:
                 items.append((pid, loc, "reparse", None))
-        for i in range(0, len(items), 25):          # batches: a transient failure retries 25, not all
-            run_topics(site, items[i:i + 25], workers)
+        for i in range(
+            0, len(items), 25
+        ):  # batches: a transient failure retries 25, not all
+            run_topics(site, items[i : i + 25], workers)
         missing = 0
         for pid, loc, _, _ in items:
             with DB_LOCK:
-                row = db().execute("SELECT gone, pending, last_error FROM posts WHERE site=? AND post_id=?",
-                                   (site, pid)).fetchone()
+                row = (
+                    db()
+                    .execute(
+                        "SELECT gone, pending, last_error FROM posts WHERE site=? AND post_id=?",
+                        (site, pid),
+                    )
+                    .fetchone()
+                )
             if not archived(site, pid) or (row and (row["gone"] or row["pending"])):
                 missing += 1
-                log_error(site, pid, "audit_missing", "audit", "recorded", loc,
-                          detail=(row["last_error"] if row else "never read") or "pending attachment",
-                          dedupe_key=get_meta("walk_epoch"))
-        log(f"audit {site}: {len(entries)} topics in the sitemap, {have} archived before, "
-            f"{len(items)} retried, {missing} still missing (see the error log)")
+                log_error(
+                    site,
+                    pid,
+                    "audit_missing",
+                    "audit",
+                    "recorded",
+                    loc,
+                    detail=(row["last_error"] if row else "never read")
+                    or "pending attachment",
+                    dedupe_key=get_meta("walk_epoch"),
+                )
+        log(
+            f"audit {site}: {len(entries)} topics in the sitemap, {have} archived before, "
+            f"{len(items)} retried, {missing} still missing (see the error log)"
+        )
         return len(entries), have, len(items), missing
     finally:
         _CTX.role = role
@@ -1447,12 +1858,17 @@ def refresh_active_series(site, base):
         return 0, 0
     now = time.time()
     with DB_LOCK:
-        rows = db().execute(
-            """SELECT p.post_id, p.url, max(r.language) AS language FROM posts p
+        rows = (
+            db()
+            .execute(
+                """SELECT p.post_id, p.url, max(r.language) AS language FROM posts p
                JOIN releases r ON r.site = p.site AND r.post_id = p.post_id
                WHERE p.site = ? AND r.kind = 'series'
                GROUP BY p.post_id HAVING max(r.added_at) > ?""",
-            (site, now - ACTIVE_DAYS * 86400)).fetchall()
+                (site, now - ACTIVE_DAYS * 86400),
+            )
+            .fetchall()
+        )
     posts = releases = 0
     for r in rows:
         key = f"reread:{site}:{r['post_id']}"
@@ -1464,12 +1880,24 @@ def refresh_active_series(site, base):
         # current domain + stored slug: the domain rotates, the topic id doesn't
         url = f"{base}/index.php?/forums/topic/{r['post_id']}-{slug}/"
         with DB_LOCK:
-            before = db().execute("SELECT count(*) FROM releases WHERE site=? AND post_id=?",
-                                  (site, str(r["post_id"]))).fetchone()[0]
+            before = (
+                db()
+                .execute(
+                    "SELECT count(*) FROM releases WHERE site=? AND post_id=?",
+                    (site, str(r["post_id"])),
+                )
+                .fetchone()[0]
+            )
         process_topic(site, r["post_id"], url, r["language"])
         with DB_LOCK:
-            after = db().execute("SELECT count(*) FROM releases WHERE site=? AND post_id=?",
-                                 (site, str(r["post_id"]))).fetchone()[0]
+            after = (
+                db()
+                .execute(
+                    "SELECT count(*) FROM releases WHERE site=? AND post_id=?",
+                    (site, str(r["post_id"])),
+                )
+                .fetchone()[0]
+            )
         set_meta(key, now)
         posts += 1
         if after > before:
@@ -1485,6 +1913,7 @@ def _active_role(fn):
             return fn(*a, **kw)
         finally:
             _CTX.role = role
+
     return wrapped
 
 
@@ -1503,10 +1932,17 @@ def crawl_site(site):
     if not base:
         return
     with DB_LOCK:
-        known = {r[0] for r in db().execute("SELECT post_id FROM posts WHERE site=?", (site,)).fetchall()}
+        known = {
+            r[0]
+            for r in db()
+            .execute("SELECT post_id FROM posts WHERE site=?", (site,))
+            .fetchall()
+        }
     forums = list(release_forums(site).values())
-    log(f"{site}: head walk of {len(forums)} release forum(s) at {base} "
-        f"(plain HTTP {'via ' + HTTP_PROXY if HTTP_PROXY else 'off'})")
+    log(
+        f"{site}: head walk of {len(forums)} release forum(s) at {base} "
+        f"(plain HTTP {'via ' + HTTP_PROXY if HTTP_PROXY else 'off'})"
+    )
     tp = tr = 0
     for forum_path, language in forums:
         try:
@@ -1525,15 +1961,23 @@ def crawl_site(site):
     except Exception as e:
         ap = ar = 0
         log(f"  active-series refresh error: {e}")
-    log(f"{site}: done -- {tp} topics fetched, {tr} releases indexed; "
-        f"sitemap: {sp} topics, {sr} releases; active series: {ap} re-read, {ar} new")
+    log(
+        f"{site}: done -- {tp} topics fetched, {tr} releases indexed; "
+        f"sitemap: {sp} topics, {sr} releases; active series: {ap} re-read, {ar} new"
+    )
 
 
 def recent_series_titles():
     """Served titles' source for nudge_sonarr: series releases indexed in the last SONARR_NUDGE_DAYS."""
     with DB_LOCK:
-        rows = db().execute("SELECT DISTINCT title FROM releases WHERE kind='series' AND added_at > ?",
-                            (time.time() - SONARR_NUDGE_DAYS * 86400,)).fetchall()
+        rows = (
+            db()
+            .execute(
+                "SELECT DISTINCT title FROM releases WHERE kind='series' AND added_at > ?",
+                (time.time() - SONARR_NUDGE_DAYS * 86400,),
+            )
+            .fetchall()
+        )
     return [r[0] for r in rows]
 
 
@@ -1544,8 +1988,10 @@ def run_crawler():
     if not any(SITES.values()) and not load_config():
         log("no config available -- crawler idle; Torznab feed still serves")
         return
-    log(f"crawler starting; both sites every {CRAWL_INTERVAL}s (plain HTTP {HTTP_PROXY or 'off'}, "
-        f"fallback {FLARESOLVERR_URL})")
+    log(
+        f"crawler starting; both sites every {CRAWL_INTERVAL}s (plain HTTP {HTTP_PROXY or 'off'}, "
+        f"fallback {FLARESOLVERR_URL})"
+    )
     while True:
         try:
             for site in SITES:
@@ -1573,8 +2019,10 @@ def run_backfill():
             time.sleep(86400)
     _CTX.plain_only, _CTX.role = True, "backfill"
     reset_walk_if_needed()
-    log(f"backfill: {BACKFILL_WORKERS} worker(s), {BACKFILL_CHUNK} listing pages per step")
-    bases = {}                          # site -> (base or None, resolved at)
+    log(
+        f"backfill: {BACKFILL_WORKERS} worker(s), {BACKFILL_CHUNK} listing pages per step"
+    )
+    bases = {}  # site -> (base or None, resolved at)
     stats = {"pages": 0, "topics": 0, "releases": 0, "logged": time.time()}
     while True:
         worked = False
@@ -1602,12 +2050,16 @@ def run_backfill():
                 stats["topics"] += p
                 stats["releases"] += r
                 if time.time() - stats["logged"] >= 600:
-                    log(f"backfill {site}: {stats['pages']} pages, {stats['topics']} topics read, "
+                    log(
+                        f"backfill {site}: {stats['pages']} pages, {stats['topics']} topics read, "
                         f"{stats['releases']} releases in the last {int((time.time() - stats['logged']) / 60)} min; "
-                        f"{backfill_remaining(site, forums)} of {len(forums)} forum(s) left")
+                        f"{backfill_remaining(site, forums)} of {len(forums)} forum(s) left"
+                    )
                     stats.update(pages=0, topics=0, releases=0, logged=time.time())
             except PlainUnavailable as e:
-                log(f"backfill: plain HTTP unavailable ({e}); pausing {BACKFILL_PAUSE:g}s")
+                log(
+                    f"backfill: plain HTTP unavailable ({e}); pausing {BACKFILL_PAUSE:g}s"
+                )
                 bases.pop(site, None)
                 time.sleep(BACKFILL_PAUSE)
             except Exception as e:
@@ -1621,25 +2073,25 @@ def run_backfill():
 def caps_xml():
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<caps>\n'
+        "<caps>\n"
         '  <server title="tamilmv"/>\n'
         '  <limits max="100" default="100"/>\n'
-        '  <searching>\n'
+        "  <searching>\n"
         '    <search available="yes" supportedParams="q"/>\n'
         '    <movie-search available="yes" supportedParams="q,year"/>\n'
         '    <tv-search available="yes" supportedParams="q,season,ep"/>\n'
-        '  </searching>\n'
-        '  <categories>\n'
+        "  </searching>\n"
+        "  <categories>\n"
         '    <category id="2000" name="Movies">\n'
         '      <subcat id="2030" name="Movies/SD"/>\n'
         '      <subcat id="2040" name="Movies/HD"/>\n'
-        '    </category>\n'
+        "    </category>\n"
         '    <category id="5000" name="TV">\n'
         '      <subcat id="5030" name="TV/SD"/>\n'
         '      <subcat id="5040" name="TV/HD"/>\n'
-        '    </category>\n'
-        '  </categories>\n'
-        '</caps>\n'
+        "    </category>\n"
+        "  </categories>\n"
+        "</caps>\n"
     )
 
 
@@ -1649,8 +2101,14 @@ def _served_rows(sql, args=()):
         rows = db().execute(sql, args).fetchall()
     overrides = forum_overrides()
     released = {site: release_forums(site) for site in SITES}
-    return [r for r in rows
-            if is_served(r["site"], r["pforum"], r["pserve"], overrides, released.get(r["site"], {}))]
+    return [
+        r
+        for r in rows
+        if r["site"] in SITES
+        and is_served(
+            r["site"], r["pforum"], r["pserve"], overrides, released.get(r["site"], {})
+        )
+    ]
 
 
 def _wanted(t, kind, row_cats, cats, season, row_season):
@@ -1670,12 +2128,17 @@ def _wanted(t, kind, row_cats, cats, season, row_season):
 def query_releases(t, q, season, cats, offset=0, limit=PAGE_MAX):
     rows = _served_rows(
         "SELECT r.*, p.forum AS pforum, p.serve AS pserve FROM releases r "
-        "LEFT JOIN posts p ON p.site = r.site AND p.post_id = r.post_id ORDER BY r.added_at DESC")
-    terms = search_terms(q)   # shared with movierulz: alias-aware, never matches-everything
+        "LEFT JOIN posts p ON p.site = r.site AND p.post_id = r.post_id ORDER BY r.added_at DESC"
+    )
+    terms = search_terms(
+        q
+    )  # shared with movierulz: alias-aware, never matches-everything
     out = []
     for r in rows:
         fam = 5000 if r["kind"] == "series" else 2000
-        if not _wanted(t, r["kind"], (fam, torznab_category(r)), cats, season, r["season"]):
+        if not _wanted(
+            t, r["kind"], (fam, torznab_category(r)), cats, season, r["season"]
+        ):
             continue
         rank = match_rank(terms, r["title"])
         if rank is None:
@@ -1692,12 +2155,15 @@ def query_links(t, q, season, cats, offset=0):
     rows = _served_rows(
         "SELECT w.*, p.forum AS pforum, p.serve AS pserve FROM weblinks w "
         "LEFT JOIN posts p ON p.site = w.site AND p.post_id = w.post_id "
-        "WHERE w.lid IS NOT NULL AND w.kind IN ('movie', 'series') ORDER BY w.found_at DESC")
+        "WHERE w.lid IS NOT NULL AND w.kind IN ('movie', 'series') ORDER BY w.found_at DESC"
+    )
     terms = search_terms(q)
     out = []
     for r in rows:
         fam = 5000 if r["kind"] == "series" else 2000
-        if not _wanted(t, r["kind"], (fam, torznab_category(r)), cats, season, r["season"]):
+        if not _wanted(
+            t, r["kind"], (fam, torznab_category(r)), cats, season, r["season"]
+        ):
             continue
         rank = match_rank(terms, r["title"] or "")
         if rank is None:
@@ -1714,7 +2180,9 @@ def served_title(title, kind, magnet=None):
     torrent is ONE video file (a remux, importable). Radarr reads 'DVD9' as a raw disc image and
     rejects it ('Raw Bluray/DVD release') -- right for an ISO/VIDEO_TS torrent, which keeps it."""
     t = series_title(title) if kind == "series" else title
-    if DVD_DISC_RE.search(t) and (magnet is None or VIDEO_EXT_RE.search(_dn(magnet)[-6:])):
+    if DVD_DISC_RE.search(t) and (
+        magnet is None or VIDEO_EXT_RE.search(_dn(magnet)[-6:])
+    ):
         t = DVD_DISC_RE.sub("DVD Remux", t)
     return t
 
@@ -1773,29 +2241,39 @@ def results_xml(rows, links=(), feed_base=None):
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">\n'
-        '  <channel>\n'
-        '    <title>tamilmv</title>\n'
-        '    <description>tamilmv/tamilblasters torznab feed</description>\n'
-        '    <link>http://media-bridge:8005/torznab</link>\n'
-        + "".join(items) +
-        '  </channel>\n'
-        '</rss>\n'
+        "  <channel>\n"
+        "    <title>tamilmv</title>\n"
+        "    <description>tamilmv torznab feed</description>\n"
+        "    <link>http://media-bridge:8005/torznab</link>\n"
+        + "".join(items)
+        + "  </channel>\n"
+        "</rss>\n"
     )
 
 
 # ---- topic page (/t/<site>/<id>): the info link of every item ----
 # Scraped HTML is shown with scripts impossible (CSP) and stripped anyway; images blocked (they'd
 # tell third-party image hosts who is looking).
-PAGE_CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; "
-            "form-action 'none'; frame-ancestors 'none'")
-_DROP_BLOCK_RE = re.compile(r"<(script|style|iframe|object|embed|noscript|template|svg)\b.*?</\1\s*>",
-                            re.I | re.S)
-_DROP_TAG_RE = re.compile(r"</?(script|iframe|object|embed|link|meta|base|form|input|button|textarea|"
-                          r"select|frame|frameset|svg)\b[^>]*>", re.I)
+PAGE_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+_DROP_BLOCK_RE = re.compile(
+    r"<(script|style|iframe|object|embed|noscript|template|svg)\b.*?</\1\s*>",
+    re.I | re.S,
+)
+_DROP_TAG_RE = re.compile(
+    r"</?(script|iframe|object|embed|link|meta|base|form|input|button|textarea|"
+    r"select|frame|frameset|svg)\b[^>]*>",
+    re.I,
+)
 _EVENT_ATTR_RE = re.compile(r"""\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""", re.I)
-_JS_URL_RE = re.compile(r"""(href|src|action)\s*=\s*(["'])\s*(?:javascript|data|vbscript):[^"']*\2""", re.I)
-_SITE_HOST_RE = {"tamilmv": re.compile(r"https?://(?:www\.)?1tamilmv\.[a-z]+", re.I),
-                 "tamil_blasters": re.compile(r"https?://(?:www\.)?1tamilblasters\.[a-z]+", re.I)}
+_JS_URL_RE = re.compile(
+    r"""(href|src|action)\s*=\s*(["'])\s*(?:javascript|data|vbscript):[^"']*\2""", re.I
+)
+_SITE_HOST_RE = {
+    "tamilmv": re.compile(r"https?://(?:www\.)?1tamilmv\.[a-z]+", re.I),
+}
 
 
 def sanitize(html_, site=None, base=None):
@@ -1804,7 +2282,7 @@ def sanitize(html_, site=None, base=None):
     s = _EVENT_ATTR_RE.sub("", s)
     s = _JS_URL_RE.sub(r'\1="#"', s)
     if base and site in _SITE_HOST_RE:
-        s = _SITE_HOST_RE[site].sub(base, s)     # old domains -> the live one
+        s = _SITE_HOST_RE[site].sub(base, s)  # old domains -> the live one
     return s
 
 
@@ -1815,24 +2293,51 @@ def _fmt_size(n):
 def topic_page(site, post_id):
     """(status, html) of a topic's page: direct links, live tamilmv link, torrents, saved copy."""
     with DB_LOCK:
-        post = db().execute("SELECT * FROM posts WHERE site=? AND post_id=?", (site, post_id)).fetchone()
-        rels = db().execute(
-            "SELECT * FROM releases WHERE btih IN (SELECT btih FROM release_topics WHERE site=? AND post_id=?) "
-            "OR (site=? AND post_id=?) ORDER BY size DESC", (site, post_id, site, post_id)).fetchall()
-        links = db().execute("SELECT * FROM weblinks WHERE site=? AND post_id=? ORDER BY rowid",
-                             (site, post_id)).fetchall()
-    if post is None:
+        post = (
+            db()
+            .execute("SELECT * FROM posts WHERE site=? AND post_id=?", (site, post_id))
+            .fetchone()
+        )
+        rels = (
+            db()
+            .execute(
+                "SELECT * FROM releases WHERE btih IN (SELECT btih FROM release_topics WHERE site=? AND post_id=?) "
+                "OR (site=? AND post_id=?) ORDER BY size DESC",
+                (site, post_id, site, post_id),
+            )
+            .fetchall()
+        )
+        links = (
+            db()
+            .execute(
+                "SELECT * FROM weblinks WHERE site=? AND post_id=? ORDER BY rowid",
+                (site, post_id),
+            )
+            .fetchall()
+        )
+    if post is None or site not in SITES:
         return 404, "<!doctype html><meta charset=utf-8><p>Unknown topic."
     q = htmlmod.escape
     arch = archive_get(site, post_id)
     base = get_meta(f"base:{site}")
     slug = _slug(post["url"])
-    live = f"{base}/index.php?/forums/topic/{post_id}-{slug}/" if base and slug else post["url"]
+    live = (
+        f"{base}/index.php?/forums/topic/{post_id}-{slug}/"
+        if base and slug
+        else post["url"]
+    )
     served = is_served(site, post["forum"], post["serve"])
-    title = post["title"] or (topic_title(arch[1]) if arch else "") or f"topic {post_id}"
+    title = (
+        post["title"] or (topic_title(arch[1]) if arch else "") or f"topic {post_id}"
+    )
     rel_names = {r["btih"]: r["title"] for r in rels}
-    posted = (datetime.datetime.fromtimestamp(post["posted_at"], datetime.timezone.utc).strftime("%Y-%m-%d")
-              if post["posted_at"] else "?")
+    posted = (
+        datetime.datetime.fromtimestamp(
+            post["posted_at"], datetime.timezone.utc
+        ).strftime("%Y-%m-%d")
+        if post["posted_at"]
+        else "?"
+    )
     out = [
         "<!doctype html><html><head><meta charset=utf-8>",
         "<meta name=viewport content='width=device-width,initial-scale=1'>",
@@ -1855,9 +2360,15 @@ def topic_page(site, post_id):
         f"<span class=tag>{'served' if served else 'not served'}</span>"
         + ("<span class=tag>gone</span>" if post["gone"] else "")
         + ("<span class=tag>attachment pending</span>" if post["pending"] else "")
-        + (f"<span class=tag>{q(post['last_error'])}</span>" if post["last_error"] else "") + "</p>",
+        + (
+            f"<span class=tag>{q(post['last_error'])}</span>"
+            if post["last_error"]
+            else ""
+        )
+        + "</p>",
         f"<p><a href='{q(live)}' target=_blank rel='noopener noreferrer'>Open on tamilmv ↗</a>"
-        + (f" <span class=mut>(live domain {q(base)})</span>" if base else "") + "</p>",
+        + (f" <span class=mut>(live domain {q(base)})</span>" if base else "")
+        + "</p>",
         "<h2>Direct links</h2>",
     ]
     if links:
@@ -1868,8 +2379,13 @@ def topic_page(site, post_id):
                 f"<tr id='l{q(w['lid'] or '')}'><td><a href='{q(w['url'])}' target=_blank "
                 f"rel='noopener noreferrer'>{q(w['host'])} ↗</a></td>"
                 f"<td>{q(w['label'] or '')}"
-                + (f"<br><span class=mut>same file as torrent: {q(same)}</span>" if same else "")
-                + f"</td><td class=mut>{_fmt_size(w['size'])}</td></tr>")
+                + (
+                    f"<br><span class=mut>same file as torrent: {q(same)}</span>"
+                    if same
+                    else ""
+                )
+                + f"</td><td class=mut>{_fmt_size(w['size'])}</td></tr>"
+            )
         out.append("</table>")
     else:
         out.append("<p class=mut>None.</p>")
@@ -1877,16 +2393,22 @@ def topic_page(site, post_id):
     if rels:
         out.append("<table>")
         for r in rels:
-            out.append(f"<tr><td><a href='{q(r['magnet'])}'>magnet</a></td><td>{q(r['title'])}</td>"
-                       f"<td class=mut>{_fmt_size(r['size'])}</td></tr>")
+            out.append(
+                f"<tr><td><a href='{q(r['magnet'])}'>magnet</a></td><td>{q(r['title'])}</td>"
+                f"<td class=mut>{_fmt_size(r['size'])}</td></tr>"
+            )
         out.append("</table>")
     else:
         out.append("<p class=mut>None.</p>")
     out.append("<h2>Saved copy</h2>")
     if arch:
-        saved = datetime.datetime.fromtimestamp(arch[2], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        out.append(f"<p class=mut>saved {saved} from {q(arch[0])}</p>"
-                   f"<div class=post>{sanitize(arch[1], site, base)}</div>")
+        saved = datetime.datetime.fromtimestamp(
+            arch[2], datetime.timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
+        out.append(
+            f"<p class=mut>saved {saved} from {q(arch[0])}</p>"
+            f"<div class=post>{sanitize(arch[1], site, base)}</div>"
+        )
     else:
         out.append("<p class=mut>Not archived yet (the backfill will get to it).</p>")
     out.append("</body></html>")
@@ -1911,15 +2433,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _feed_base(self):
         host = self.headers.get("Host", "")
-        return f"http://{host}" if re.fullmatch(r"[A-Za-z0-9.\-]+(:\d+)?", host) else PUBLIC_URL
+        return (
+            f"http://{host}"
+            if re.fullmatch(r"[A-Za-z0-9.\-]+(:\d+)?", host)
+            else PUBLIC_URL
+        )
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path.startswith("/nograb/"):
             # a '[DL-LINK]' item was force-grabbed: 404 = 'release no longer available'
-            self._send("not a torrent: open the item's info link for the direct download", 404,
-                       "text/plain; charset=utf-8")
+            self._send(
+                "not a torrent: open the item's info link for the direct download",
+                404,
+                "text/plain; charset=utf-8",
+            )
             return
         m = re.fullmatch(r"/t/([a-z_]+)/(\d+)/?", path)
         if m:
@@ -1962,10 +2491,12 @@ class Handler(BaseHTTPRequestHandler):
 def serve_torznab():
     db()
     adb()
-    load_config()     # serve flags need the forum map; the crawler thread may not have loaded it yet
+    load_config()  # serve flags need the forum map; the crawler thread may not have loaded it yet
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"torznab server listening on :{PORT} (apikey {'set' if APIKEY else 'DISABLED'}; "
-        f"topic pages at {PUBLIC_URL}/t/...)")
+    log(
+        f"torznab server listening on :{PORT} (apikey {'set' if APIKEY else 'DISABLED'}; "
+        f"topic pages at {PUBLIC_URL}/t/...)"
+    )
     httpd.serve_forever()
 
 
@@ -1973,7 +2504,11 @@ def print_links(query):
     """`python -m tamilmv links <words>`: stored web links whose topic matches every word."""
     words = [w for w in re.split(r"\s+", query.lower()) if w]
     with DB_LOCK:
-        rows = db().execute("SELECT * FROM weblinks ORDER BY post_id DESC, rowid").fetchall()
+        rows = (
+            db()
+            .execute("SELECT * FROM weblinks ORDER BY post_id DESC, rowid")
+            .fetchall()
+        )
     last = None
     for r in rows:
         hay = f"{r['topic']} {r['label']}".lower()
@@ -1981,8 +2516,10 @@ def print_links(query):
             continue
         if (r["site"], r["post_id"]) != last:
             last = (r["site"], r["post_id"])
-            print(f"\n[{r['site']} {r['post_id']}] {r['topic']}  ({r['language']})  "
-                  f"{topic_url(r['site'], r['post_id'])}")
+            print(
+                f"\n[{r['site']} {r['post_id']}] {r['topic']}  ({r['language']})  "
+                f"{topic_url(r['site'], r['post_id'])}"
+            )
         size = f"{r['size'] / 1e9:.1f} GB  " if r["size"] else ""
         print(f"  {size}{r['url']}\n      {r['label'][:160]}")
 
@@ -1991,9 +2528,14 @@ def reparse_all(site=None):
     """`python -m tamilmv reparse [site]`: re-run extract() over the archive (no page fetches)."""
     load_config()
     with ARCH_LOCK:
-        keys = [(r["site"], r["post_id"]) for r in adb().execute(
-            "SELECT site, post_id FROM pages" + (" WHERE site=?" if site else ""),
-            (site,) if site else ())]
+        keys = [
+            (r["site"], r["post_id"])
+            for r in adb().execute(
+                "SELECT site, post_id FROM pages" + (" WHERE site=?" if site else ""),
+                (site,) if site else (),
+            )
+            if r["site"] in SITES
+        ]
     n = 0
     for i, (s, pid) in enumerate(keys, 1):
         n += reparse_topic(s, pid)
@@ -2004,7 +2546,9 @@ def reparse_all(site=None):
 
 def _parse_topic_arg(arg):
     """'174730', a topic URL, or '174730-slug' -> (post id, url path suffix)."""
-    m = re.search(r"topic/(\d+)-?([^/?#]*)", arg) or re.fullmatch(r"(\d+)-?([^/?#]*)", arg.strip())
+    m = re.search(r"topic/(\d+)-?([^/?#]*)", arg) or re.fullmatch(
+        r"(\d+)-?([^/?#]*)", arg.strip()
+    )
     if not m:
         raise SystemExit(f"not a topic id or URL: {arg}")
     return int(m.group(1)), m.group(2)
@@ -2019,20 +2563,49 @@ def refetch_cli(args, site="tamilmv"):
     for arg in args:
         pid, slug = _parse_topic_arg(arg)
         with DB_LOCK:
-            row = db().execute("SELECT url FROM posts WHERE site=? AND post_id=?", (site, pid)).fetchone()
+            row = (
+                db()
+                .execute(
+                    "SELECT url FROM posts WHERE site=? AND post_id=?", (site, pid)
+                )
+                .fetchone()
+            )
         slug = slug or _slug(row["url"] if row else "") or "x"
         url = f"{base}/index.php?/forums/topic/{pid}-{slug}/"
         n = process_topic(site, pid, url)
         with DB_LOCK:
-            post = db().execute("SELECT * FROM posts WHERE site=? AND post_id=?", (site, pid)).fetchone()
-            rels = db().execute("SELECT title, size FROM releases WHERE btih IN "
-                                "(SELECT btih FROM release_topics WHERE site=? AND post_id=?)", (site, pid)).fetchall()
-            links = db().execute("SELECT title, host, size FROM weblinks WHERE site=? AND post_id=?",
-                                 (site, pid)).fetchall()
-        state = ("GONE (" + (post["last_error"] or "") + ")") if post and post["gone"] else "ok"
-        print(f"[{site} {pid}] {state} forum={post['forum'] if post else '?'} "
-              f"served={is_served(site, post['forum'], post['serve']) if post else '?'} "
-              f"new releases={n}  {topic_url(site, pid)}\n  {post['title'] if post else ''}")
+            post = (
+                db()
+                .execute("SELECT * FROM posts WHERE site=? AND post_id=?", (site, pid))
+                .fetchone()
+            )
+            rels = (
+                db()
+                .execute(
+                    "SELECT title, size FROM releases WHERE btih IN "
+                    "(SELECT btih FROM release_topics WHERE site=? AND post_id=?)",
+                    (site, pid),
+                )
+                .fetchall()
+            )
+            links = (
+                db()
+                .execute(
+                    "SELECT title, host, size FROM weblinks WHERE site=? AND post_id=?",
+                    (site, pid),
+                )
+                .fetchall()
+            )
+        state = (
+            ("GONE (" + (post["last_error"] or "") + ")")
+            if post and post["gone"]
+            else "ok"
+        )
+        print(
+            f"[{site} {pid}] {state} forum={post['forum'] if post else '?'} "
+            f"served={is_served(site, post['forum'], post['serve']) if post else '?'} "
+            f"new releases={n}  {topic_url(site, pid)}\n  {post['title'] if post else ''}"
+        )
         for r in rels:
             print(f"    torrent  {_fmt_size(r['size']):>9}  {r['title']}")
         for w in links:
@@ -2048,17 +2621,24 @@ def recrawl_cli(args, site="tamilmv"):
     with DB_LOCK:
         if forums:
             for fid in forums:
-                db().execute("DELETE FROM meta WHERE key IN (?, ?)",
-                             (f"walk:{site}:{fid}", f"walkdone:{site}:{fid}"))
+                db().execute(
+                    "DELETE FROM meta WHERE key IN (?, ?)",
+                    (f"walk:{site}:{fid}", f"walkdone:{site}:{fid}"),
+                )
         else:
-            db().execute("DELETE FROM meta WHERE key LIKE ? OR key LIKE ?", (f"walk:{site}:%", f"walkdone:{site}:%"))
+            db().execute(
+                "DELETE FROM meta WHERE key LIKE ? OR key LIKE ?",
+                (f"walk:{site}:%", f"walkdone:{site}:%"),
+            )
         db().execute("DELETE FROM meta WHERE key=?", (f"audit:{site}",))
         db().commit()
     if "--refetch" in args:
         set_meta(f"refetch_before:{site}", time.time())
-    print(f"recrawl: {'forums ' + ', '.join(forums) if forums else 'all forums'} of {site} reset"
-          + (" (every topic will be downloaded again)" if "--refetch" in args else "")
-          + "; the backfill thread starts within 10 min")
+    print(
+        f"recrawl: {'forums ' + ', '.join(forums) if forums else 'all forums'} of {site} reset"
+        + (" (every topic will be downloaded again)" if "--refetch" in args else "")
+        + "; the backfill thread starts within 10 min"
+    )
 
 
 def errors_cli(args):
@@ -2082,18 +2662,31 @@ def errors_cli(args):
             pass
 
     def ts(r):
-        return datetime.datetime.strptime(r["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc).timestamp()
+        return (
+            datetime.datetime.strptime(r["ts"], "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=datetime.timezone.utc)
+            .timestamp()
+        )
 
     def unresolved(r):
         if r.get("post_id") is None:
             return r.get("outcome") == "retry"
         with DB_LOCK:
-            p = db().execute("SELECT gone, pending, last_error FROM posts WHERE site=? AND post_id=?",
-                             (r["site"], r["post_id"])).fetchone()
+            p = (
+                db()
+                .execute(
+                    "SELECT gone, pending, last_error FROM posts WHERE site=? AND post_id=?",
+                    (r["site"], r["post_id"]),
+                )
+                .fetchone()
+            )
         if r["type"] in ONE_OFF:
-            return True                           # findings: resolved only by fixing the parser/rules
-        return p is None or bool(p["gone"] or p["pending"]) or not archived(r["site"], r["post_id"])
+            return True  # findings: resolved only by fixing the parser/rules
+        return (
+            p is None
+            or bool(p["gone"] or p["pending"])
+            or not archived(r["site"], r["post_id"])
+        )
 
     rows = [r for r in rows if (not typ or r["type"] == typ) and ts(r) >= since]
     if unresolved_only:
@@ -2105,16 +2698,25 @@ def errors_cli(args):
     print(f"{len(rows)} entries in {ERRORS_PATH}" + (f" (type {typ})" if typ else ""))
     for t_, items in sorted(by.items(), key=lambda kv: -len(kv[1])):
         open_n = sum(1 for r in items if unresolved(r))
-        print(f"\n{t_}: {len(items)} total, {sum(1 for r in items if ts(r) >= day)} in 24h, {open_n} unresolved")
+        print(
+            f"\n{t_}: {len(items)} total, {sum(1 for r in items if ts(r) >= day)} in 24h, {open_n} unresolved"
+        )
         for r in items[-5:]:
-            where = f"topic {r['post_id']}" if r.get("post_id") else f"forum {r.get('forum')}"
-            print(f"   {r['ts']} {where} [{r['stage']}/{r['outcome']}] {r.get('detail', '')[:100]}")
+            where = (
+                f"topic {r['post_id']}"
+                if r.get("post_id")
+                else f"forum {r.get('forum')}"
+            )
+            print(
+                f"   {r['ts']} {where} [{r['stage']}/{r['outcome']}] {r.get('detail', '')[:100]}"
+            )
             if r.get("url"):
                 print(f"      {r['url'][:150]}")
 
 
 if __name__ == "__main__":
     import sys
+
     cmd, rest = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
     if cmd == "links":
         print_links(" ".join(rest))

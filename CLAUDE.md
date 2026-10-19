@@ -7,9 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on a
 **Jetson Nano Super (aarch64)**. Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
-`media-bridge/` (six responsibilities in one container: blackhole bridge (Seedr backend) + jellyfin-reaper + movierulz
-scraper/Torznab feed + tamilmv/tamilblasters scraper/Torznab feed + daddylive live-TV resolver
-(**disabled** since 2026-09-24) + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
+`media-bridge/` (five responsibilities in one container: blackhole bridge (Seedr/seedbox backends) + jellyfin-reaper + movierulz
+scraper/Torznab feed + tamilmv scraper/Torznab feed + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
 (`prowlarr/`, `radarr/`, `sonarr/`, `bazarr/`, `jellyfin/`, `data/`, `media-bridge/config/`) are
 runtime data and are gitignored — only the compose file and the custom service code are version-controlled.
 
@@ -25,12 +24,12 @@ Caddy proxies to `127.0.0.1:8096` (Jellyfin is `network_mode: host`) and exposer
 ```bash
 docker compose up -d                              # bring up / apply compose changes
 docker compose up -d --build media-bridge         # rebuild the custom service after editing its .py
-docker compose logs -f media-bridge               # follow its logs ([bridge]/[seedr]/[reaper]/[movierulz]/[tamilmv]/[daddylive]/[youtube] tags)
+docker compose logs -f media-bridge               # follow its logs ([bridge]/[seedr]/[reaper]/[movierulz]/[tamilmv]/[youtube] tags)
 docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun restart (see below)
 ```
 
 There is no build/lint tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its components as 11 supervised threads — 14 with daddylive re-enabled; 2 are pull workers). To
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 11 supervised threads; 2 are pull workers). To
 exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
 `unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
 blocks the user for it):
@@ -51,7 +50,7 @@ Consequences that drive most edits here:
 - **Restart gotcha**: restarting gluetun recreates its netns and silently breaks every dependent
   container. After any gluetun restart you MUST `docker restart prowlarr flaresolverr sonarr radarr`
   (or `docker compose down && up -d`). `media-bridge` and `jellyfin` are unaffected — and the
-  `media-bridge` host-published feeds (movierulz Torznab `8002`, youtube grabber `8003`, tamilmv Torznab `8005`; daddylive `8004` is disabled) keep serving,
+  `media-bridge` host-published feeds (movierulz Torznab `8002`, youtube grabber `8003`, tamilmv Torznab `8005`) keep serving,
   since they are published on the host, not on gluetun.
 - **Recreate ≠ restart**: the dependents join gluetun by container ID (`container:<id>`), so after
   gluetun is *recreated* (compose change, image bump) `docker restart` can't fix them — recreate them
@@ -107,7 +106,7 @@ Push alerts go to ntfy.sh on **two** topics, and they must stay split:
 
 Both live in `.env`. They were one topic until 2026-09-11, which **silently hid DIUN entirely**: the
 phone app collapses a topic's messages into one notification group, so media-bridge's recurring
-alerts (a dead tamilblasters seed re-alerting every crawl pass, ~24/day at priority 4) buried DIUN's
+alerts (a dead scraper seed re-alerting every crawl pass, ~24/day at priority 4) buried DIUN's
 4-8 once-daily messages at priority 3. DIUN was never broken — `docker logs diun` showed "Image update
 found" on every run and no send errors; the messages were arriving and being drowned. If DIUN ever
 seems silent again, check the topic *before* suspecting the notifier: `docker exec diun diun notif test`
@@ -149,11 +148,11 @@ put the image back to `lscr.io/linuxserver/jellyfin:latest` with the four env va
 
 ## media-bridge (`media-bridge/`)
 
-One container running six components as supervised daemon threads (`main.py` → each in a try/except
+One container running five components as supervised daemon threads (`main.py` → each in a try/except
 wrapper that logs + ntfy-alerts + restarts, so one crash can't take the others down). It is **off the
 VPN** on the default bridge net; it reaches the *arr apps and FlareSolverr via `http://gluetun:<port>`
 and host-net Jellyfin via `host.docker.internal`. Shared helpers live in `common.py` (`clog`, `norm`,
-`ntfy`). Logs are tagged `[bridge]` / `[seedr]` / `[reaper]` / `[movierulz]` / `[tamilmv]` / `[daddylive]` / `[youtube]`. Rebuilding/restarting this container to
+`ntfy`). Logs are tagged `[bridge]` / `[seedr]` / `[reaper]` / `[movierulz]` / `[tamilmv]` / `[youtube]`. Rebuilding/restarting this container to
 ship a movierulz change also restarts the bridge loop mid-download — safe, since the bridge resumes from its
 `.bridge-state` JSON.
 
@@ -164,21 +163,15 @@ moved to the wire untouched; Wi-Fi is statically pinned to `10.0.0.180` (Network
 `ipv4.method=manual`), with a matching router DHCP reservation on `f8:3d:c6:57:20:87` holding that address
 out of the pool. Nothing in this stack depends on the Wi-Fi address any more, which is the point — do not
 re-pin it anywhere).
-The feeds (`8002`, `8003`, `8005`; `8004` while daddylive was on) publish as plain `"800x:800x"`. Binding a literal address here has two
-failure modes, both hit in practice: it (1) **dies with its NIC** — and since all four binds live in one
+The feeds (`8002`, `8003`, `8005`) publish as plain `"800x:800x"`. Binding a literal address here has two
+failure modes, both hit in practice: it (1) **dies with its NIC** — and since all the binds live in one
 container, a Wi-Fi blip stopped Docker from starting `media-bridge` *at all*, taking the bridge and
 `[reaper]` down with it; and (2) **races the DHCP lease at boot**, because `docker.service` orders on
 `network-online.target`, which one interface can satisfy before another's lease exists — the same race
 that took Immich down for 10h on 2026-08-09. The retired `never 0.0.0.0` comment justified itself as
 protection against a changed router forward, which it never was: a forward targets a LAN IP and the
 sockets were bound to exactly that LAN IP. **What actually keeps these off the internet is that the
-router forwards only 443** (see `~/exposer`) — so never forward `8002`–`8005`.
-
-**Open-relay caveat on `/hls`** (pre-existing, unrelated to the binding change): `_proxy_hls` base64-decodes
-the path and `SESSION.get`s it with no scheme or host allowlist, so anyone who can reach `:8004` can make
-the Jetson fetch an arbitrary URL and read the bytes back — including loopback and the router's admin page.
-LAN-only today. Fixing it means allowlisting upstream hosts in `_proxy_hls`, not a firewall rule (the LAN is
-exactly where it is reachable from).
+router forwards only 443** (see `~/exposer`) — so never forward `8002`, `8003` or `8005`.
 
 ### blackhole bridge (`media-bridge/bridge.py` + `media-bridge/backends/`)
 
@@ -447,8 +440,8 @@ set permanently near-empty and **silently stop all reaping**. Any new Jellyfin a
 ### movierulz component (`media-bridge/movierulz.py`)
 
 A crawler thread + a stdlib Torznab HTTP server (`:8002`, host-published) that makes 5movierulz a
-generic Torznab indexer for Prowlarr — the tamilmv/tamilblasters spiders are compiled into the
-MediaFusion image and can't be taught a new site, so we scrape this one ourselves.
+generic Torznab indexer for Prowlarr — MediaFusion's tamil-site spiders were compiled into its
+image and couldn't be taught a new site, so we scrape this one ourselves.
 
 - **Crawler** (`run_crawler` → `crawl_once`, every `CRAWL_INTERVAL`, default hourly): paginates the
   **master `/movies` listing** (`MOVIERULZ_MOVIES_PATH`) newest-first. One master source deliberately
@@ -563,37 +556,33 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 
 ### tamilmv component (`media-bridge/tamilmv.py`)
 
-A crawler thread + a stdlib Torznab HTTP server (`:8005`, host-published) that scrapes **tamilmv +
-tamilblasters** (Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + episode-range packs) into a
-Torznab feed for Prowlarr. **This replaced the retired MediaFusion 4-container stack** (postgres + redis
+A crawler thread + a stdlib Torznab HTTP server (`:8005`, host-published) that scrapes **tamilmv**
+(Tamil/Telugu/Hindi/Malayalam/Kannada/English movies + episode-range packs) into a Torznab feed for
+Prowlarr. **This replaced the retired MediaFusion 4-container stack** (postgres + redis
 + Rust api/worker), whose compiled tamil spiders were the only part worth keeping — and whose ext.to
 scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSolverr continuously.
 
 - **Same pattern as movierulz**, and reuses its stateless helpers by import (`fetch`, `parse_magnet`,
   `classify`, `normalize_title`, `title_matches`, `torznab_category`, `error_xml`, `MAGNET_RE`). Own
-  sqlite `media-bridge/config/tamilmv.db` (`posts` keyed by `(site, post_id)` since topic ids collide
-  across the two sites; `releases` keyed by btih). Own Torznab server on `:8005` (server title
+  sqlite `media-bridge/config/tamilmv.db` (`posts` keyed by `(site, post_id)` — a leftover of the
+  two-site days, see below; `releases` keyed by btih). Own Torznab server on `:8005` (server title
   `tamilmv`, apikey `TAMILMV_APIKEY`, every `<item>` carries `<pubDate>` + `FAKE_SEEDERS`).
 - **Domain rotation (the key bit): seeds + per-language forum maps come from MediaFusion's UPSTREAM
   GitHub `scraper_config.json`** (`TAMILMV_CONFIG_URL`), refreshed daily and cached to
   `config/tamilmv_config.json`. The **live domain** is found by following the seed's 301 redirect
   (`resolve_base`, plain HTTP — the redirect resolves at Cloudflare's edge, no FlareSolverr). Recovery
   ladder when a base dies: re-resolve → force a GitHub config refresh for a newer `homepage` → still
-  dead → ntfy (then set `TAMILMV_SEED_OVERRIDE`/`TAMILBLASTERS_SEED_OVERRIDE` as an emergency manual pin).
+  dead → ntfy (then set `TAMILMV_SEED_OVERRIDE` as an emergency manual pin).
   **The dead-site ntfy is rate-limited** to one push per `TAMILMV_DEAD_ALERT_INTERVAL` (default 86400s)
   per site, tracked in `dead_alert:<site>` in tamilmv.db's `meta` table. Ungated, it fired on *every*
   crawl pass — ~24/day forever, which drowned the shared ntfy topic (see "ntfy: two topics" above). A
   successful resolve resets the timer to 0, so a site that recovers and dies again alerts immediately
   rather than waiting out the previous outage's window. The per-pass `log()` line is NOT throttled —
   `docker compose logs media-bridge` still shows the true state hourly.
-- **Config shapes differ**: tamilmv uses `supported_search_forums` (33 forums), tamil_blasters uses
-  `catalogs` (28) — `_parse_site_cfg` normalizes both to `[(forum_path, language)]`.
-- **tamilblasters has been down since 2026-08-23** (last crawl; last new release 08-07): the seed
-  `1tamilblasters.wtf` 301s to `.garden` (home IP) / `.gripe` (VPN), and those and `.land` all answer
-  Cloudflare **522** = origin offline. `1tamilblasters.tech` is a **fake** (WordPress SEO clone: every
-  URL returns its homepage, no magnets, no `sitemap.php`) — never pin it. The Telegram "Tamil Blasters"
-  channel now posts an unrelated Instagram account, not domains. When a real domain appears, verify it
-  serves a known topic (e.g. `…/forums/topic/16655-…`) with magnets before pinning it.
+- **tamilblasters was removed 2026-10-19** (dead since 2026-08-23: every domain answered Cloudflare 522).
+  `SITES` in `tamilmv.py` lists the sites that are crawled **and served**; old `tamil_blasters` rows
+  stay in the DBs and archive (keyed by `site`) but never reach the feed or a topic page, and
+  `reparse` skips them. Re-adding a site = an entry in `SITES` (its config key + seed override env var).
 - **Archive everything, extract from the archive, serve only what is flagged** (rebuilt 2026-09-30, after
   Seethamma Vakitlo Sirimalle Chettu — a 2023 topic on page ~10 of Telugu forum 25 — was never indexed
   while Radarr burned 16 dead public grabs). Measured on 1tamilmv then: ~33k topics, 68 forums; the old
@@ -733,94 +722,6 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   enabled on this indexer is cheap — the CF cost is entirely in the background crawler.
 - **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`match_rank`,
   so the alias expansion and the "never match everything" guard described above apply here too.
-
-### daddylive component (`media-bridge/daddylive.py`) — DISABLED 2026-09-24
-
-**Switched off, code kept.** `DADDYLIVE_ENABLED=false` in compose keeps `main.py` from starting its three
-threads; the `8004` port is unpublished; the `DADDYLIVE_*`/`DLHD_BASE` vars are commented out; the
-container healthcheck moved from `:8004/daddylive.m3u` to `:8005/torznab/api?t=caps` (autoheal would
-otherwise restart-loop the whole container); and the Jellyfin M3U tuner + XMLTV guide were deleted. To
-re-enable, undo all five: flag → `true`, uncomment the vars, re-add `"8004:8004"`, optionally point the
-healthcheck back, and re-add the tuner/guide in Jellyfin (URLs under *Jellyfin wiring* below). Everything
-below describes the component as it ran.
-
-
-A refresher thread + a stdlib HTTP server (`:8004`, host-published) that turns DaddyLive (DLHD) into a
-Jellyfin **Live TV** source (M3U tuner + XMLTV EPG). Built because nothing off-the-shelf works on this
-box: MediaFusion's Rust build never ported its live scrapers, and Cabernet's DaddyLive plugin was taken
-down. **Why a custom resolver and not a community M3U feed:** those publish bare `*.newkso.ru` URLs that
-are **Cloudflare-walled** (403 even with the right headers, even via FlareSolverr). DaddyLive's *own*
-player flow instead resolves to a different, **token-authed CDN (`phantemlis.top`, segments on Cloudflare
-R2) that needs NO request headers and IS reachable server-side** — so we resolve each channel the way the
-site's player does, on demand.
-
-- **Resolution chain** (`resolve`, per channel id, plain server-side HTTP — not CF-walled):
-  `{DLHD_BASE}/{folder}/stream-<id>.php` → iframe → `{embed_host}/premiumtv/daddy3.php?id=<id>` → page JS
-  `source: window.atob('<base64>')` → decode → `https://…phantemlis…/premium<id>/index.m3u8?md5v1=…&md5v2=…&expires=…`.
-  The embed host **rotates** (discovered dynamically per request); `DADDYLIVE_FOLDERS`
-  (default `cast,stream,watch,plus,casting,player` — `cast`/Player 2 is tried first, see below) are tried
-  in order so one down folder doesn't kill a channel. The `md5/expires` tokens are **self-authorizing (no Referer/UA) and minted fresh
-  per fetch (~74min TTL)** → resolved on demand. The site's `watch.php?id=<id>` shows **6 players = the 6
-  `DADDYLIVE_FOLDERS`** (Player 1=stream, 2=cast, 3=watch, 4=plus, 5=casting, 6=player); each folder's
-  `stream-<id>.php` embeds a **different provider** — Player 1/3 → `daddy3`→phantemlis, **2 → a rotating
-  Clappr embed** (`*.pages.dev/embed/<slug>` → e.g. `inproviszon.st`), 4 → `welovetocare.shop`,
-  **5 → `cdnlivetv.tv`/`tezgoal.com` (oplayer)**, 6 → `popcdn.day`. `_extract_source` understands four
-  provider formats: phantemlis' `atob(...)`; the cdnlivetv **oplayer** (`_extract_oplayer_source`:
-  `source:{src:VAR}` where `VAR = atob(a)+atob(b)+…`, reassembled from base64 parts →
-  `api.cdnlivetv.tv/secure/api/v1/<id>/playlist.m3u8?token=…`); **lovetier** (Player 6, reached via popcdn's
-  iframe → `lovetier.bz/player/<slug>`), a plain `streamUrl:"…index.m3u8?token=…"` JSON literal
-  (`STREAMURL_RE`, unescape `\/`) → `deviantart.lovetier.bz`; and the **Player 2 Clappr embed**
-  (`CDNBASE_RE`), whose page has no literal `.m3u8` — it builds the URL as `CDN_BASE + slug + '.m3u8'`
-  (`CDN_BASE` scraped from the page, `slug` = `_embed_slug()` off the `/embed/<slug>` iframe URL) →
-  e.g. `inproviszon.st/fox-usa.m3u8`. That playlist **requires the embed-page Referer** (CF 403 without),
-  but its segments are **PNG-disguised TS** (70-byte fake-PNG header + MPEG-TS, on `cdn-editing-temp.picsart.com`)
-  that **403 if a Referer is sent** — so segment fetches drop Referer/Origin (`_drop_referer`, in both
-  `_validate_source` and the `/hls` relay) and the PNG lead-in is trimmed to the first TS sync
-  (`_strip_png_decoy`). embed host, slug, and CDN all **rotate** — everything is scraped per resolve.
-  **welovetocare** (P4) is a JS SPA that reads `location.hash` (nothing server-side) and **tezgoal** (P5 alt)
-  is unreachable server-side — both still unparsed. So e.g. FOX USA (54) plays via Player 2, Willow Cricket
-  (346) via cdnlivetv, Willow XTRA (598) via lovetier.
-  `_resolve_from_page` walks folders in order and returns the first source that passes **segment-level
-  validation** — `_validate_source` descends master→variant→media playlist and requires a real segment to
-  return bytes, so a player whose playlists load but whose `.ts` segments are dead (a common failure, e.g.
-  phantemlis returning `500` on the child playlist — currently site-wide) is **rejected** (logged
-  `rejecting unplayable source`) and the next player is tried. So a channel with only phantemlis + no
-  alternate (some feeds) can 502 while phantemlis is down; one with a live Player 5 (e.g. Willow Cricket 346)
-  resolves via cdnlivetv.
-- **Favorites precheck** (`run_precheck`, `DADDYLIVE_FAVORITES` = comma-sep ids, every `DADDYLIVE_PRECHECK`s,
-  default 240): re-resolves+validates favorite channels in the background and keeps a **warm cache**
-  (`_warm`, TTL `max(PRECHECK*3, 300)`) that `resolve()` checks before the 60s `_resolve_cache`, so a
-  favorite opens instantly from a known-live player. Logs only online/offline **transitions** per channel.
-- **HLS rewriting proxy (required, NOT a 302 redirect):** DaddyLive serves HLS segments with **disguised
-  extensions** (`.js`/`.zst`/`.jpg` on Cloudflare R2) that ffmpeg's HLS demuxer **rejects** (`not in
-  allowed_segment_extensions`), and Jellyfin gives no way to pass `-allowed_extensions ALL`. So `/live/<id>`
-  fetches the resolved playlist and **rewrites every sub-playlist/segment/key URI** to route back through
-  `/hls/<b64-upstream-url>.<m3u8|ts|key>` (`rewrite_playlist`), relaying the bytes with clean
-  `.ts`/`vnd.apple.mpegurl` types so ffmpeg accepts them. The M3U points at `/live/<id>.m3u8` (extension
-  hint so Jellyfin picks the HLS demuxer). Verified: ffprobe sees h264+aac and a transcode runs clean.
-- **Channel list + EPG come from the public nightah/daddylive feed** (`DADDYLIVE_M3U_URL`/`_EPG_URL`): its
-  `premium<N>` == our channel id, so we keep its names/logos/tvg-id/group + EPG and just swap the dead
-  newkso URL for our `/live/<id>`. Channels upserted into `media-bridge/config/daddylive.db` (sqlite). Feed
-  uses `tvg-id="test"` as a placeholder for ~136 channels lacking EPG mapping — expected, not a bug.
-- **HTTP server** (`serve`): `GET /daddylive.m3u` (channel table; URLs = `/live/<id>.m3u8`),
-  `GET /epg.xml` (cached pass-through XMLTV), `GET /live/<id>[.m3u8]` (resolve → rewritten master playlist),
-  `GET /hls/<b64>.<m3u8|ts|key>` (proxy/relay). Some ids 502/offline at any moment — expected.
-- **Jellyfin wiring**: Live TV → M3U Tuner `http://127.0.0.1:8004/daddylive.m3u`, XMLTV guide
-  `http://127.0.0.1:8004/epg.xml` (Jellyfin is host-net → reaches the host-published port; the feed
-  survives gluetun restarts since it's published on the host, not gluetun). **The M3U and the rewritten
-  `/hls` URLs now derive their base from the request's own `Host` header** (`Handler._request_base_url()`,
-  threaded into `rewrite_playlist(..., public=)` → `_proxy_uri`), so a client that dials the Ethernet IP
-  gets Ethernet URLs back and one that dials Wi-Fi gets Wi-Fi URLs — nothing is pinned to a NIC.
-  `DADDYLIVE_PUBLIC_URL` is now only the **fallback** for callers with no request context (the precheck
-  thread). It must still not be `127.0.0.1` (that would resolve to the TV itself). Before 2026-08-30 it
-  was hardcoded to the Wi-Fi IP, which made every segment URL unreachable whenever that NIC was down.
-- **Playback notes**: `resolve()` caches the master URL per channel for `DADDYLIVE_RESOLVE_TTL` (60s) so
-  Jellyfin's repeated opens (probe + transcode + retry) don't each re-resolve — fixes "player error then
-  plays in secs". Jellyfin's **Direct Stream (`-c copy`) remux is flaky on some live streams** (FFmpeg
-  code 8) while transcode is reliable → on the Jetson cap the client's quality to ~720p to force
-  (software) transcode. Offline channels legitimately 502.
-- **Rotation maintenance**: only a change to the dlhd *domain* needs a one-line `DLHD_BASE` update in
-  `.env`; embed/CDN host rotations are handled automatically. Watch for `atob(…)`/iframe-pattern changes.
 
 ### youtube component (`media-bridge/youtube.py`)
 
