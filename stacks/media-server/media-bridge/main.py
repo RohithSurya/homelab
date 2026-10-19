@@ -17,6 +17,7 @@ Each unit runs in its own thread wrapped so a crash logs + ntfy-alerts + restart
 without taking down the others (threads are I/O-bound; requests releases the GIL,
 so the bridge's large blocking downloads don't stall the Torznab server or crawler).
 """
+import os
 import threading
 import time
 
@@ -27,6 +28,7 @@ import movierulz
 import tamilmv
 import youtube
 from common import clog, ntfy
+from components import COMPONENTS, enabled_components
 
 
 def supervise(name, target):
@@ -47,19 +49,25 @@ def supervise(name, target):
 
 
 def main():
-    parts = ["bridge", "reaper", "movierulz", "tamilmv", "youtube"]
-    clog("main", "media-bridge starting: " + " + ".join(parts))
-    supervise("bridge", bridge.run_forever)
-    for i in range(puller.WORKERS):  # pull finished transfers home in the background, side by side
-        supervise(f"bridge-puller-{i + 1}", puller.run_worker)
-    supervise("reaper", reaper.run_forever)
-    supervise("movierulz-crawler", movierulz.run_crawler)
-    supervise("movierulz-torznab", movierulz.serve_torznab)
-    supervise("tamilmv-crawler", tamilmv.run_crawler)
-    supervise("tamilmv-backfill", tamilmv.run_backfill)  # full walk of every forum, plain HTTP only
-    supervise("tamilmv-torznab", tamilmv.serve_torznab)
-    supervise("youtube-worker", youtube.run_worker)
-    supervise("youtube-server", youtube.serve)
+    parts = enabled_components(os.environ.get("MEDIA_BRIDGE_COMPONENTS", ""))
+    off = [c for c in COMPONENTS if c not in parts]
+    clog("main", "media-bridge starting: " + " + ".join(parts) + (f" (off: {', '.join(off)})" if off else ""))
+    if "bridge" in parts:
+        supervise("bridge", bridge.run_forever)
+        for i in range(puller.WORKERS):  # pull finished transfers home in the background, side by side
+            supervise(f"bridge-puller-{i + 1}", puller.run_worker)
+    if "reaper" in parts:
+        supervise("reaper", reaper.run_forever)
+    if "movierulz" in parts:
+        supervise("movierulz-crawler", movierulz.run_crawler)
+        supervise("movierulz-torznab", movierulz.serve_torznab)
+    if "tamilmv" in parts:
+        supervise("tamilmv-crawler", tamilmv.run_crawler)
+        supervise("tamilmv-backfill", tamilmv.run_backfill)  # full walk of every forum, plain HTTP only
+        supervise("tamilmv-torznab", tamilmv.serve_torznab)
+    if "youtube" in parts:
+        supervise("youtube-worker", youtube.run_worker)
+        supervise("youtube-server", youtube.serve)
     while True:
         time.sleep(3600)
 

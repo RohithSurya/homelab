@@ -140,7 +140,10 @@ def put(name, value, note=""):
     if name in c:
         _run(["secret", "edit", f"--value={value}", "--", c[name]["id"]], _server)
     else:
-        projects = {s["projectId"] for s in c.values() if s.get("projectId")}
+        # VAULT_PROJECT (project id) picks the target once the account sees several projects
+        # (homelab-prod / homelab-dev / Hermes since 2026-10-19).
+        projects = {os.environ["VAULT_PROJECT"]} if os.environ.get("VAULT_PROJECT") else \
+            {s["projectId"] for s in c.values() if s.get("projectId")}
         if len(projects) != 1:
             projects = {p["id"] for p in _run(["project", "list"], _server) or []}
         if len(projects) != 1:
