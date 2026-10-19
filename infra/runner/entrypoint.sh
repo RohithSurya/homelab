@@ -23,11 +23,12 @@ chown -R "$RUN_AS" /opt/runner /state
 
 if [ ! -e /state/.runner ]; then
   : "${RUNNER_TOKEN:?first start needs RUNNER_TOKEN}"
-  sudo -u "$USER_NAME" -E /opt/runner/config.sh --unattended --replace \
+  sudo -u "$USER_NAME" -H /opt/runner/config.sh --unattended --replace \
     --url "$RUNNER_URL" --token "$RUNNER_TOKEN" --name "$RUNNER_NAME" \
     --labels "$RUNNER_LABELS" --work /opt/runner/_work
   for f in .runner .credentials .credentials_rsaparams; do
     mv "/opt/runner/$f" "/state/$f" && ln -sf "/state/$f" "/opt/runner/$f"
   done
 fi
-exec sudo -u "$USER_NAME" -E --preserve-env=HOMELAB_HOST,BWS_TOKEN_FILE /opt/runner/run.sh
+# -H: the job's HOME is the runner user's own (not /root, which it can't read -> checkout fails)
+exec sudo -u "$USER_NAME" -H --preserve-env=HOMELAB_HOST,BWS_TOKEN_FILE /opt/runner/run.sh
