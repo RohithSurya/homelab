@@ -40,6 +40,10 @@ services:
       - DNS_ADDRESS=9.9.9.9
       - DNS_UPSTREAM_RESOLVERS=quad9,google
       - TZ=Etc/UTC
+      # Built-in HTTP proxy (:8888) so off-VPN media-bridge can make plain requests from the VPN
+      # exit IP (tamilmv crawler: TAMILMV_HTTP_PROXY=http://gluetun:8888). NOT published on the
+      # host -- reachable only from docker networks via the `gluetun` hostname.
+      - HTTPPROXY=on
     ports:
       - 9696:9696                                # prowlarr UI (moved here from prowlarr)
       - 8000:8000                                # gluetun control/health API
@@ -158,7 +162,10 @@ services:
       # --- blackhole bridge (bridge.py) + its download backends (backends/) ---
       # Which backend runs each blackhole drop, first match wins: <private|public|*>:<backend>.
       # e.g. private:seedbox,public:seedr. The *arr apps are unaffected by any choice here.
-      - BRIDGE_ROUTE=*:seedr
+      # 2026-10-06: public moved to the seedbox too while Seedr's TLS certificate is expired (every
+      # Seedr call fails verification). Public results are deleted from the box right after delivery.
+      # Back to Seedr: private:seedbox,public:seedr
+      - BRIDGE_ROUTE=private:seedbox,public:seedbox # 2026-09-25: private trackers -> Pulsed seedbox (per-tracker seed rules)
       # --- Seedr backend ---
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
@@ -167,6 +174,46 @@ services:
       - SEED_HOLD=176400                            # 49h: private-tracker results stay on Seedr to seed (H&R rules)
       - SEEDR_FTP_HOST=ftps.seedr.cc                # FTP fallback for CDN-404'd files + byte resume; empty = off
       - SEEDR_FTP_PASSWORD_B64=${SEEDR_FTP_PASSWORD_B64:-}  # optional; unset = account password
+      # --- private-tracker seed rules (hit-and-run); key = substring of the grab's indexer name.
+      #     <hours>h = seed time required; <ratio>|<hours>h = whichever first. A drop whose rule
+      #     exceeds its backend's cap (Seedr: 48h) waits in the blackhole instead of being sent.
+      #     iptorrents is 48h only while the account is VIP (H&R-exempt until 2026-10-25): set it
+      #     to 1.0|336h when VIP ends. private-default covers unknown trackers and stays strictest.
+      - SEED_RULES=hd-space=48h,iptorrents=48h,torrenthaven=120h,retrotoon=72h,czteam=1.0|72h,private-default=336h
+      # --- pulls home (puller.py): tuned SFTP (16 MiB window, 255 KiB requests, AES-GCM) fills the
+      #     box's shared uplink (~40 MB/s evenings) with 1-2 streams per big file; small files (scene
+      #     RAR volumes) go 4 at a time (11.7 -> 36.6 MB/s). Measured 2026-09-26. Never start a pull
+      #     that would leave less than PULL_MIN_FREE_GB free here.
+      - PULL_SEGMENTS=2
+      - PULL_PARALLEL_FILES=4
+      - SEEDBOX_SFTP_WINDOW_MB=16
+      - PULL_MIN_FREE_GB=25
+      # Pulls running at once: a small movie or a follow step no longer waits behind a 30 GB pull.
+      # They share the box's uplink, so total speed is the same -- only who waits changes.
+      - PULL_WORKERS=2
+      # Follow mode (backends/follow.py): while a seedbox torrent downloads, copy its finished,
+      # SHA-1-verified pieces home every FOLLOW_INTERVAL s, so the final pull only fetches the rest.
+      # off|private|all; enabled 2026-10-16 for everything (public routes to the seedbox too now).
+      - FOLLOW=all
+      # --- retry rules (user decisions 2026-09-25). Both start in DRY-RUN: they only log what they
+      #     would do (`python -m bridgelog` / events table) until switched to false after review.
+      - SLOW_RULE=public                            # public|all|off: <5% after 2h, or projected ETA > 24h
+      - SLOW_RULE_DRY_RUN=true
+      - GIVE_UP_AFTER=10                            # failed attempts per movie/episode -> unmonitor + stop
+      - GIVE_UP_DRY_RUN=true
+      - FAILFAST=public                             # public|off: no metadata / 0 seeds after 10 min, nothing downloaded
+      - FAILFAST_DRY_RUN=true
+      # --- public torrents only: add ngosang/trackerslist's best ~20 trackers (daily, cached in config).
+      #     NEVER applied to private torrents (would leak their infohash -> tracker ban).
+      - PUBLIC_EXTRA_TRACKERS=on
+      # --- seedbox backend (qBittorrent over SSH, backends/qbit.py). Secrets are NOT here: the SSH
+      #     keys, qBittorrent password and pinned host key come from the vault (vault.py, token in
+      #     media-bridge/config/bws_token). Only used once BRIDGE_ROUTE names "seedbox".
+      - SEEDBOX_SSH_HOST=${SEEDBOX_SSH_HOST:-}
+      - SEEDBOX_SSH_USER=${SEEDBOX_SSH_USER:-}
+      - SEEDBOX_QBIT_USER=${SEEDBOX_QBIT_USER:-}
+      - SEEDBOX_QUOTA_GB=230                        # fallback only; the real figure is read from ~/.quota
+      - BWS_SERVER_URL=https://vault.bitwarden.com  # Bitwarden Secrets Manager, US region
       # --- shared *arr / jellyfin / ntfy ---
       - RADARR_URL=http://gluetun:7878
       - RADARR_API_KEY=${RADARR_API_KEY}
@@ -196,14 +243,23 @@ services:
       - REQUEST_DELAY=3
       # --- tamilmv/tamilblasters scraper -> Torznab feed :8005 (replaces MediaFusion) ---
       # Seeds + per-language forum maps come from MediaFusion's upstream GitHub config (auto-tracks
-      # domain rotation); live domain resolved by following the seed's 301 redirect. Content pages
-      # fetched via the same FLARESOLVERR_URL as movierulz. Reuses FAKE_SEEDERS/REQUEST_DELAY above.
+      # domain rotation); live domain resolved by following the seed's 301 redirect. Pages, sitemap
+      # and .torrent attachments go plain HTTP through gluetun's proxy (VPN exit IP); FlareSolverr
+      # (FLARESOLVERR_URL) is the fallback on a CF challenge. Reuses FAKE_SEEDERS/REQUEST_DELAY above.
+      - TAMILMV_HTTP_PROXY=http://gluetun:8888
+      # Topic pages (every item's info link in Radarr/Sonarr, incl. '[DL-LINK]' direct links) use
+      # the Tailscale address, so they open at home and away (Radarr is reached the same way).
+      - TAMILMV_PUBLIC_URL=http://100.122.87.20:8005
+      # Backfill: topics of a listing page fetched in parallel (measured: 1 -> 1.62 s/topic,
+      # 3 -> 0.61, 4 -> 0.52 with request latency rising). Every topic problem -> JSONL log.
+      - TAMILMV_BACKFILL_WORKERS=3
+      - TAMILMV_ERRORS_LOG=/config/tamilmv_errors.jsonl
       - TAMILMV_CONFIG_URL=https://raw.githubusercontent.com/mhdzumair/MediaFusion/main/resources/json/scraper_config.json
       - TAMILMV_APIKEY=${TAMILMV_APIKEY}           # also the Torznab apikey entered in Prowlarr
       - TAMILMV_PORT=8005
       - TAMILMV_CONFIG_REFRESH=86400               # re-pull GitHub config daily
       - TAMILMV_CRAWL_INTERVAL=3600
-      - TAMILMV_MAX_PAGES=5                         # per-forum page cap (bounds each crawl pass)
+      - TAMILMV_MAX_PAGES=5                         # head walk: newest pages per forum each pass
       # Dead-site ntfy at most weekly (default daily). tamil_blasters has been a Cloudflare 522
       # behind its seed's redirect since 2026-08-23; a daily high-priority alert was just noise.
       # Recovery is still immediate: a successful resolve resets the timer.
@@ -249,8 +305,29 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
+  # ── home-egress: off-VPN HTTP proxy for IP-bound private-tracker sessions ─────────
+  # KrazyZone binds its login cookie to the IP you logged in from (the home IPv4); from
+  # the Proton exit IP it answers `Refresh: account-login.php` + deletes the cookie. So
+  # Prowlarr reaches ONLY those sites through this proxy (Prowlarr → Settings → Indexers →
+  # HTTP proxy 10.0.0.179:8006, tag `home-egress`, tag the indexer). Everything else stays
+  # on the VPN. Destination allowlist in home-egress/filter; clients limited to docker
+  # bridge sources (gluetun's netns), so LAN hosts can't use it. HTTP only — no BitTorrent.
+  home-egress:
+    build: ./home-egress
+    container_name: home-egress
+    ports:
+      - "8006:8888"                              # all interfaces (see media-bridge); never forward
+    volumes:
+      - ./home-egress:/etc/tinyproxy:ro          # tinyproxy.conf + filter; edit then `docker restart home-egress`
+    labels:
+      - 'wud.watch=false'
+      - 'updater.policy=never'
+      - "diun.enable=false"                        # locally-built image (no registry)
+    logging: *default-logging
+    restart: unless-stopped
+
   bazarr:
-    image: lscr.io/linuxserver/bazarr:v1.6.1-ls365   # pinned
+    image: lscr.io/linuxserver/bazarr:v1.6.2-ls368   # pinned
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+-ls\d+$$'
       - 'updater.policy=auto'
@@ -276,7 +353,7 @@ services:
   jellyfin:
     # Pinned to the immutable dated build, not the floating "12.0": 12.0's DB migrations are
     # one-way (see above), so a surprise move is the one thing to avoid here.
-    image: jellyfin/jellyfin:12.1.20260915-010956
+    image: jellyfin/jellyfin:12.2.20261005-225228
     container_name: jellyfin
     network_mode: host                           # LAN/DLNA discovery + reachable on Tailscale IP
     user: "1000:1000"                            # official image ignores PUID/PGID; keeps files owned by the *arr user

@@ -20,6 +20,7 @@ survive Docker/shell '$' interpolation; plain SEEDR_PASSWORD also accepted.
 import base64
 import os
 import pathlib
+import threading
 import time
 
 import requests
@@ -52,10 +53,20 @@ SEED_HOLD = int(os.environ.get("SEED_HOLD", "176400"))
 # What the Seedr plan itself seeds a private torrent for, at most (Pro: 2:1 or 48h).
 SEEDR_MAX_SEED_HOURS = float(os.environ.get("SEEDR_MAX_SEED_HOURS", "48"))
 
-# Seedr Basic-auth lives on this session only -- never reuse it for anything else.
-SESSION = requests.Session()
-SESSION.auth = (EMAIL, PASSWORD)
-SESSION.headers["User-Agent"] = "seedr-bridge/1.0"
+# Seedr Basic-auth lives on these sessions only -- never reuse them for anything else. One per
+# thread: the pull worker downloads while the bridge thread polls, and a requests.Session isn't
+# safe to share across threads.
+_tls = threading.local()
+
+
+def _session():
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.auth = (EMAIL, PASSWORD)
+        s.headers["User-Agent"] = "seedr-bridge/1.0"
+        _tls.session = s
+    return s
 
 
 def log(msg):
@@ -63,7 +74,7 @@ def log(msg):
 
 
 def api(method, path, **kw):
-    r = SESSION.request(method, f"{BASE}{path}", timeout=kw.pop("timeout", 60), **kw)
+    r = _session().request(method, f"{BASE}{path}", timeout=kw.pop("timeout", 60), **kw)
     r.raise_for_status()
     return r
 
@@ -101,7 +112,7 @@ def download_file(file_id, dest: pathlib.Path, remote=None, size=None):
         seedr_ftp.download(remote, tmp)
     else:
         try:
-            with SESSION.get(
+            with _session().get(
                 f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
             ) as r:
                 r.raise_for_status()
@@ -194,6 +205,7 @@ class SeedrBackend(Backend):
     label = "Seedr"
     tag = "seedr"
     max_seed_hours = SEEDR_MAX_SEED_HOURS
+    full_retries = 5
     fetch_fail_log = "Seedr CDN failing"
     fetch_fail_note = "Seedr reported it complete but its CDN kept 404ing"
 
@@ -227,7 +239,9 @@ class SeedrBackend(Backend):
                     free = r.get("space_max", 0) - r.get("space_used", 0)
                 except Exception:
                     free = 0
-                raise Full(free) from e
+                # plenty of free space yet still 413 => the torrent itself is bigger than
+                # the account; it will never fit.
+                raise Full(free, never_fits=free > 20e9) from e
             if code == 409:
                 raise Exists() from e
             raise
@@ -295,6 +309,18 @@ class SeedrBackend(Backend):
             if f["id"] not in self.held and name_matches(os.path.splitext(f.get("name", ""))[0], title):
                 return DONE, {"kind": "file", "id": f["id"], "name": f["name"], "size": f.get("size")}
         return NOT_VISIBLE, None
+
+    def swarm(self, rec):
+        """Seedr's transfer entry reports the swarm too (seen live 2026-09-25): 'seeders',
+        'leechers', 'connected_to', 'download_rate', and 'size' once the metadata is known."""
+        t = self.torrents_by_id.get(rec.get("user_torrent_id")) or self.torrents_by_name.get(rec["title"])
+        if t is None:
+            return None
+        try:
+            seeds = int(t.get("seeders"))
+        except (TypeError, ValueError):
+            seeds = None
+        return {"metadata": bool(t.get("size")), "seeds": seeds if seeds is None or seeds >= 0 else None}
 
     def fetch(self, rec, result, dest_dir):
         if result["kind"] == "folder":

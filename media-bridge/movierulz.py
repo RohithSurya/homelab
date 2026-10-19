@@ -22,6 +22,7 @@ through FlareSolverr (which is inside the VPN), reached at FLARESOLVERR_URL
 """
 import datetime
 import email.utils
+import functools
 import os
 import re
 import sqlite3
@@ -34,7 +35,7 @@ from xml.sax.saxutils import escape
 
 import requests
 
-from common import clog, norm
+from common import clog, norm, ntfy
 
 # ---- config ----
 BASE = os.environ.get("MOVIERULZ_BASE", "").rstrip("/")  # required; set in .env (kept out of source)
@@ -67,6 +68,17 @@ ALIAS_REFRESH = int(os.environ.get("ALIAS_REFRESH", "900"))   # re-pull the Rada
 # Sonarr is the source of each show's year (see series_title). Reuses seedr's Sonarr credentials.
 SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
+# Sonarr learns new episodes only at its 12-hourly series refresh, and it can't grab a release for
+# episodes it doesn't list. When the feed holds a recent series release (indexed within
+# SONARR_NUDGE_DAYS) with episodes Sonarr lacks, ask it to refresh that show now, at most every
+# SONARR_NUDGE_INTERVAL s per show (0 = off). See nudge_sonarr().
+SONARR_NUDGE_INTERVAL = int(os.environ.get("SONARR_NUDGE_INTERVAL", "3600"))
+SONARR_NUDGE_DAYS = float(os.environ.get("SONARR_NUDGE_DAYS", "3"))
+# Stale-feed alert: ntfy (ops topic) when no NEW post has been seen for this many days -- the crawler
+# can run "successfully" while indexing nothing (a domain rotation went unnoticed for 10.7 days,
+# 2026-09-20 -> 09-30). Repeats at most every STALE_ALERT_REPEAT s until posts flow again.
+STALE_ALERT_DAYS = float(os.environ.get("MOVIERULZ_STALE_ALERT_DAYS", "4"))
+STALE_ALERT_REPEAT = float(os.environ.get("MOVIERULZ_STALE_ALERT_REPEAT", "86400"))
 
 # Best-effort language label parsed from the post slug (e.g. '...-telugu-7008.html' or
 # '...-telugu-dubbed-7112.html'). Functionally optional -- the feed matches by title, not language.
@@ -87,8 +99,11 @@ def log(msg):
 # Any internal post link, keyed on the trailing numeric id. Captures both URL schemes:
 #   Form A: /peddi-2026-dvdscr-telugu-7017.html
 #   Form B: /save-the-tigers-season-3-2026-telugu/movie-watch-online-free-7090.html
-_host = re.escape(urllib.parse.urlparse(BASE).netloc)
-POST_RE = re.compile(r'https?://' + _host + r'/[A-Za-z0-9/_-]+?-(\d+)\.html')
+# Any movierulz host, not just BASE's: the domain rotates (.solutions -> .institute, 2026-09) and the
+# old BASE keeps redirecting to the new one, so a BASE-only pattern matched ZERO post links and every
+# pass reported "0 posts" with no error for 10.7 days. crawl_once logs the new host when it moves.
+_HOST = r'(?:www\.)?\d*movierulz[a-z0-9-]*\.[a-z]{2,}(?:\.[a-z]{2,})?'
+POST_RE = re.compile(r'https?://(' + _HOST + r')/[A-Za-z0-9/_-]+?-(\d+)\.html', re.I)
 MAGNET_RE = re.compile(r'magnet:\?[^"\'<>\s]+')
 
 # Episode-range pack, e.g. "S02 EP (01-08)" -> indexed as multi-episode "S02E01-E08".
@@ -101,6 +116,8 @@ SERIES_HEAD_RE = re.compile(
     r'^(?P<base>.+?)(?:\s*[(\[]?\b(?:19|20)\d{2}\b[)\]]?)?(?P<rest>(?:\s+\d{3,4}p)?\s+S\d{1,2}E\d.*)$', re.I)
 # Other series markers (single ep "S04 EP09"/"S04E09", "S1P2"/"S1P-1-2", spelled-out
 # "Season 3") -> NOT mappable to Sonarr cleanly, so these releases are skipped.
+# The episodes a normalized series title covers: 'S03E37-E40' (or a lone 'S03E37').
+SERIES_EPS_RE = re.compile(r'\bS(\d{1,2})E(\d{1,3})(?:-E?(\d{1,3}))?', re.I)
 SERIES_ANY = re.compile(r'\bS\d{1,2}\s*(?:EP?\s*\d+|E\d+|P[\s\-\d])', re.I)
 SEASON_WORD = re.compile(r'\bSeason\s*\d+\b', re.I)
 
@@ -117,6 +134,8 @@ _ALIAS = {}            # unorm(title) -> [latin titles]; see _radarr_aliases()
 _ALIAS_TS = 0.0
 _ALIAS_LOCK = threading.Lock()
 _SERIES_YEAR = {}      # unorm(show title) -> Sonarr year (None if ambiguous); see _sonarr_years()
+_SERIES_ID = {}        # unorm(show title) -> Sonarr series id (None if ambiguous); same refresh
+_NUDGED = {}           # Sonarr series id -> when nudge_sonarr() last asked for a refresh
 _SERIES_YEAR_TS = 0.0
 # Separate lock for lazy init only: the crawler and torznab threads both call db() at startup, so the
 # init (incl. the one-shot ALTER migration below) must run exactly once. Not DB_LOCK -- callers like
@@ -328,6 +347,8 @@ def crawl_once():
     with DB_LOCK:
         known_before = {r[0] for r in db().execute("SELECT post_id FROM posts").fetchall()}
     page, reached_end = 1, False
+    hosts = set()
+    seen_this_pass = set()
     while page <= MAX_PAGES:
         url = f"{BASE}{MOVIES_PATH}/page/{page}"
         status, html = fetch(url)
@@ -337,7 +358,8 @@ def crawl_once():
             break
         page_ids, seen_on_page = [], set()
         for mobj in POST_RE.finditer(html):
-            pid = int(mobj.group(1))
+            hosts.add(mobj.group(1).lower())
+            pid = int(mobj.group(2))
             if pid in seen_on_page:
                 continue
             seen_on_page.add(pid)
@@ -349,10 +371,15 @@ def crawl_once():
             if post_needs_fetch(pid):
                 total_releases += process_post(pid, purl, lang_from_slug(purl))
                 total_posts += 1
-        # incremental mode only: once a whole page is posts we already had before this pass, the rest
-        # downstream is older and already indexed -> stop.
-        if not backfilling and page >= MIN_PAGES and all(pid in known_before for pid, _ in page_ids):
+        # incremental mode only: once a whole page is posts we already had -- known before this pass, or
+        # seen on an earlier page of it -- the rest downstream is older and already indexed -> stop.
+        # "Earlier page" matters: every listing page carries a sidebar of the NEWEST posts, so with
+        # known_before alone any new post made every page look new and each pass walked all ~200
+        # pages (found 2026-09-30: page 100 had 19 of 36 ids first seen that pass).
+        if not backfilling and page >= MIN_PAGES and all(
+                pid in known_before or pid in seen_this_pass for pid, _ in page_ids):
             break
+        seen_this_pass.update(pid for pid, _ in page_ids)
         page += 1
     if backfilling and reached_end:
         set_meta("backfill_done", "1")
@@ -362,7 +389,42 @@ def crawl_once():
         with DB_LOCK:
             db().execute("DELETE FROM releases WHERE added_at < ?", (cutoff,))
             db().commit()
+    base_host = urllib.parse.urlparse(BASE).netloc.lower()
+    moved = sorted(h for h in hosts if h != base_host)
+    if moved:
+        log(f"domain moved: post links point at {', '.join(moved)} (MOVIERULZ_BASE is {base_host}; "
+            f"crawling through the redirect -- update MOVIERULZ_BASE in .env)")
+        set_meta("moved_to", ",".join(moved))
+    else:
+        set_meta("moved_to", "")
+    set_meta("last_pass", f"{page} page(s), {total_posts} posts fetched, {total_releases} releases")
     log(f"crawl done: scanned {page} page(s), {total_posts} posts fetched, {total_releases} releases indexed")
+
+
+def check_stale(now=None):
+    """ntfy when no new post has been seen for STALE_ALERT_DAYS (posts.scraped_at = first-seen), at
+    most every STALE_ALERT_REPEAT s; a fresh post resets it. Returns True if it alerted."""
+    now = now or time.time()
+    if STALE_ALERT_DAYS <= 0:
+        return False
+    with DB_LOCK:
+        newest = db().execute("SELECT max(scraped_at) FROM posts").fetchone()[0]
+    if newest is None or now - newest < STALE_ALERT_DAYS * 86400:
+        set_meta("stale_alert", 0)
+        return False
+    if now - float(get_meta("stale_alert") or 0) < STALE_ALERT_REPEAT:
+        return False
+    days = (now - newest) / 86400
+    moved = get_meta("moved_to") or ""
+    ntfy(f"movierulz: no new posts for {days:.1f} days",
+         f"MOVIERULZ_BASE={BASE}\n"
+         + (f"post links now point at {moved} -- update MOVIERULZ_BASE in .env and recreate media-bridge\n"
+            if moved else "check `docker compose logs flaresolverr` (ERR_NAME_NOT_RESOLVED = domain gone)\n")
+         + f"last pass: {get_meta('last_pass') or '?'}",
+         priority="high", tags="warning")
+    set_meta("stale_alert", now)
+    log(f"stale alert sent: newest post {days:.1f} days old")
+    return True
 
 
 def run_crawler():
@@ -376,6 +438,14 @@ def run_crawler():
             crawl_once()
         except Exception as e:
             log(f"crawl error: {e}")
+        try:
+            check_stale()
+        except Exception as e:
+            log(f"stale check error: {e}")
+        try:
+            nudge_sonarr(recent_series_titles())
+        except Exception as e:
+            log(f"sonarr nudge error: {e}")
         time.sleep(CRAWL_INTERVAL)
 
 
@@ -422,14 +492,27 @@ def _collapse(s):
     return re.sub(r"(.)\1+", r"\1", norm(s))
 
 
+SHORT_TOKEN = 2   # query words this short must be a whole title word, not a substring
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _title_key(title):
+    """(collapsed title, its collapsed words) -- cached: every search scans the whole catalogue
+    once per term, and re-collapsing ~50k titles per term made a search take 10-30 s."""
+    return _collapse(title), frozenset(_collapse(w) for w in re.split(r"\W+", title or ""))
+
+
 def title_matches(q, title):
     """True if every word of the query (collapsed) appears in the collapsed title.
     Token-based + dup-collapse tolerates word order, spacing, and doubled letters --
-    the *arr still re-parse and filter results, so we can afford to be generous."""
-    ct = _collapse(title)
+    the *arr still re-parse and filter results, so we can afford to be generous.
+    A word of <= SHORT_TOKEN chars must be a whole title word: as a substring it matches nearly
+    everything -- Athadu's Radarr alias 'He' hit every title containing 'the'/'heart', filled
+    the 100-item page with unrelated releases and pushed Athadu itself out (2026-10-16)."""
+    ct, words = _title_key(title)
     toks = [_collapse(w) for w in q.split()]
     toks = [w for w in toks if w]
-    return all(w in ct for w in toks)
+    return all((w in words) if len(w) <= SHORT_TOKEN else (w in ct) for w in toks)
 
 
 def unorm(s):
@@ -495,7 +578,7 @@ def _sonarr_years():
     """{unorm(show title): year} from Sonarr, refreshed every ALIAS_REFRESH. Best-effort, same
     contract as _radarr_aliases(): stale map on failure, timestamp stamped before the fetch.
     A title two library shows share maps to None (no rewrite -- we can't tell which one)."""
-    global _SERIES_YEAR, _SERIES_YEAR_TS
+    global _SERIES_YEAR, _SERIES_ID, _SERIES_YEAR_TS
     if not (SONARR_URL and SONARR_API_KEY):
         return _SERIES_YEAR
     with _ALIAS_LOCK:
@@ -510,7 +593,7 @@ def _sonarr_years():
     except Exception as e:
         log(f"sonarr year refresh failed: {e}")
         return _SERIES_YEAR
-    years = {}
+    years, ids = {}, {}
     for sh in shows:
         if not sh.get("year"):
             continue
@@ -518,8 +601,9 @@ def _sonarr_years():
         k = unorm(re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", sh.get("title") or ""))
         if k:
             years[k] = None if k in years and years[k] != sh["year"] else sh["year"]
+            ids[k] = None if k in ids else sh.get("id")
     with _ALIAS_LOCK:
-        _SERIES_YEAR = years
+        _SERIES_YEAR, _SERIES_ID = years, ids
     return years
 
 
@@ -535,6 +619,57 @@ def series_title(title):
         return title
     year = _sonarr_years().get(unorm(m["base"]))
     return f"{m['base']} ({year}){m['rest']}" if year else title
+
+
+def nudge_sonarr(titles):
+    """Ask Sonarr to refresh the shows whose recent releases cover episodes it doesn't list yet.
+
+    Sonarr only grabs episodes it knows, and it learns new ones at its scheduled series refresh
+    (every 12 h). Sites post a batch within hours of airing, so the release sat in the feed
+    until the next refresh (Heart Beat S03E37-E40: indexed 04:36, grabbed at the 07:07 refresh).
+    A refresh that adds already-aired episodes makes Sonarr search for them by itself, so the
+    refresh is all that's needed. `titles` = stored titles of recently indexed series releases.
+    Only shows in the Sonarr library, only when an episode is really missing, and at most one
+    refresh per show every SONARR_NUDGE_INTERVAL. Best-effort; returns the series ids refreshed."""
+    if SONARR_NUDGE_INTERVAL <= 0 or not (SONARR_URL and SONARR_API_KEY):
+        return []
+    _sonarr_years()
+    wanted = {}                                   # series id -> {(season, episode)}
+    for title in titles:
+        head, eps = SERIES_HEAD_RE.match(title), SERIES_EPS_RE.search(title)
+        sid = _SERIES_ID.get(unorm(head["base"])) if head and eps else None
+        if sid is None:
+            continue
+        first, last = int(eps.group(2)), int(eps.group(3) or eps.group(2))
+        wanted.setdefault(sid, set()).update((int(eps.group(1)), e) for e in range(first, last + 1))
+    done, now, hdr = [], time.time(), {"X-Api-Key": SONARR_API_KEY}
+    for sid, want in wanted.items():
+        if now - _NUDGED.get(sid, 0) < SONARR_NUDGE_INTERVAL:
+            continue
+        try:
+            r = requests.get(f"{SONARR_URL}/api/v3/episode", params={"seriesId": sid}, headers=hdr, timeout=30)
+            r.raise_for_status()
+            missing = want - {(e["seasonNumber"], e["episodeNumber"]) for e in r.json()}
+            if not missing:
+                continue
+            _NUDGED[sid] = now
+            requests.post(f"{SONARR_URL}/api/v3/command", json={"name": "RefreshSeries", "seriesId": sid},
+                          headers=hdr, timeout=30).raise_for_status()
+        except Exception as e:
+            log(f"sonarr nudge failed for series {sid}: {e}")
+            continue
+        done.append(sid)
+        s_, e_ = min(missing)
+        log(f"sonarr nudge: series {sid} lacks {len(missing)} episode(s) the feed has "
+            f"(from S{s_:02d}E{e_:02d}) -> RefreshSeries")
+    return done
+
+
+def recent_series_titles():
+    with DB_LOCK:
+        rows = db().execute("SELECT DISTINCT title FROM releases WHERE kind='series' AND added_at > ?",
+                            (time.time() - SONARR_NUDGE_DAYS * 86400,)).fetchall()
+    return [r[0] for r in rows]
 
 
 def search_terms(q):
@@ -555,24 +690,48 @@ def search_terms(q):
     ym = re.search(r"\b(?:19|20)\d{2}$", q)
     base, year = (q[:ym.start()].strip(), ym.group(0)) if ym else (q, "")
     aliases = _radarr_aliases().get(unorm(base)) or []
-    terms = [f"{t} {year}".strip() for t in aliases]
-    if norm(base):          # latin query: keep it, so unknown-to-Radarr searches still work
-        terms.append(q)
+    # the query itself comes FIRST (when latin, so unknown-to-Radarr searches still work):
+    # match_rank() orders results by the first term they match
+    terms = [q] if norm(base) else []
+    terms += [f"{t} {year}".strip() for t in aliases]
     return list(dict.fromkeys(terms))
 
 
-def query_matches(terms, title):
-    """True if the release title matches any resolved search term (None = no text filter)."""
+def match_rank(terms, title):
+    """Index of the first resolved search term the title matches (0 for no text filter), or
+    None. Results are ordered by it, so the query's own title outranks alias-only matches."""
     if terms is None:
-        return True
-    return any(title_matches(t, title) for t in terms)
+        return 0
+    return next((i for i, t in enumerate(terms) if title_matches(t, title)), None)
 
 
-def query_releases(t, q, season, cats):
-    """Select releases matching the search. Returns list of sqlite rows."""
+PAGE_MAX = 100   # matches caps_xml's <limits max>
+
+
+def page_args(qs):
+    """(offset, limit) of a Torznab request. Honouring them matters: Prowlarr pages on while a
+    page comes back full, and a server that ignores offset returns the same full page every time
+    -- Prowlarr walked offsets 0..900, ten slow scans per search, and timed the indexer out."""
+    def num(key, default):
+        try:
+            return max(0, int(qs.get(key, [default])[0]))
+        except (TypeError, ValueError):
+            return default
+    return num("offset", 0), min(num("limit", PAGE_MAX) or PAGE_MAX, PAGE_MAX)
+
+
+def page(ranked, offset=0, limit=PAGE_MAX):
+    """[(rank, row)] in newest-first order -> one page of rows, best rank first (stable sort, so
+    newest-first holds within a rank)."""
+    ranked = sorted(ranked, key=lambda x: x[0])
+    return [r for _, r in ranked[offset:offset + limit]]
+
+
+def query_releases(t, q, season, cats, offset=0, limit=PAGE_MAX):
+    """Select releases matching the search. Returns one page of sqlite rows."""
     with DB_LOCK:
         # scan the whole catalogue (no LIMIT) so old back-catalog stays searchable; the token
-        # matcher below is cheap and results are capped to 100.
+        # matcher below is cheap and results are paged (offset/limit, at most 100).
         rows = db().execute("SELECT * FROM releases ORDER BY added_at DESC").fetchall()
     terms = search_terms(q)
     out = []
@@ -590,12 +749,13 @@ def query_releases(t, q, season, cats):
                 continue
         # text filter (dup-collapsing, token-based -> matches transliteration variants),
         # widened to the movie's Radarr alternate titles
-        if not query_matches(terms, r["title"]):
+        rank = match_rank(terms, r["title"])
+        if rank is None:
             continue
         if season and r["kind"] == "series" and r["season"] and int(season) != r["season"]:
             continue
-        out.append(r)
-    return out[:100]
+        out.append((rank, r))
+    return page(out, offset, limit)
 
 
 def results_xml(rows):
@@ -671,7 +831,7 @@ class Handler(BaseHTTPRequestHandler):
         for c in qs.get("cat", []):
             cats += [int(x) for x in c.split(",") if x.strip().isdigit()]
         try:
-            rows = query_releases(t, q, season, cats)
+            rows = query_releases(t, q, season, cats, *page_args(qs))
             self._send(results_xml(rows))
         except Exception as e:
             log(f"torznab query error: {e}")

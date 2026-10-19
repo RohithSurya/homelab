@@ -39,7 +39,11 @@ def _bdecode(data, i):
 
 def read_torrent(path):
     """(raw info-dict bytes, decoded info dict, tracker URLs) of a .torrent file."""
-    data = path.read_bytes()
+    return parse_torrent(path.read_bytes())
+
+
+def parse_torrent(data):
+    """read_torrent for .torrent bytes already in memory (e.g. qBittorrent's /torrents/export)."""
     if data[:1] != b"d":
         raise ValueError("not a bencoded dict")
     i = 1
@@ -94,3 +98,31 @@ def magnet_btih(magnet):
         except Exception:
             return ""
     return h.lower()
+
+
+def torrent_meta(path):
+    """(btih, name, total bytes, tracker hosts) of a .torrent file."""
+    info_raw, info, trackers = read_torrent(path)
+    if b"length" in info:
+        size = info[b"length"]
+    else:
+        size = sum(f.get(b"length", 0) for f in info.get(b"files", []))
+    name = (info.get(b"name") or b"").decode("utf-8", "replace")
+    hosts = [_host(t.decode("utf-8", "replace")) for t in trackers]
+    return hashlib.sha1(info_raw).hexdigest(), name, size, [h for h in hosts if h]
+
+
+def magnet_meta(magnet):
+    """(btih, name, bytes or None, tracker hosts) of a magnet URI."""
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(magnet).query)
+    xl = (q.get("xl") or [""])[0]
+    size = int(xl) if xl.isdigit() else None
+    hosts = [_host(t) for t in q.get("tr", [])]
+    return magnet_btih(magnet), (q.get("dn") or [""])[0], size, [h for h in hosts if h]
+
+
+def _host(url):
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""

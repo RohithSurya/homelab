@@ -29,9 +29,12 @@ docker compose logs -f media-bridge               # follow its logs ([bridge]/[s
 docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun restart (see below)
 ```
 
-There is no build/lint/test tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its components as 8 supervised threads — 11 with daddylive re-enabled). To
-exercise a change, rebuild the service and watch its logs.
+There is no build/lint tooling — `media-bridge` is a small Python package run directly
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 11 supervised threads — 14 with daddylive re-enabled; 2 are pull workers). To
+exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
+`unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
+blocks the user for it):
+`docker run --rm --user 1000:1000 -v "$PWD/media-bridge:/app" -w /app --entrypoint python media-server-media-bridge -m unittest discover -s tests`
 Secrets come from `.env` (gitignored); see `.env.example` for the required keys.
 
 ## Architecture: the VPN namespace
@@ -50,6 +53,13 @@ Consequences that drive most edits here:
   (or `docker compose down && up -d`). `media-bridge` and `jellyfin` are unaffected — and the
   `media-bridge` host-published feeds (movierulz Torznab `8002`, youtube grabber `8003`, tamilmv Torznab `8005`; daddylive `8004` is disabled) keep serving,
   since they are published on the host, not on gluetun.
+- **Recreate ≠ restart**: the dependents join gluetun by container ID (`container:<id>`), so after
+  gluetun is *recreated* (compose change, image bump) `docker restart` can't fix them — recreate them
+  too: `docker compose up -d --force-recreate --no-deps gluetun`, wait for healthy, then
+  `docker compose up -d --force-recreate --no-deps prowlarr flaresolverr sonarr radarr`.
+- **gluetun's built-in HTTP proxy** (`HTTPPROXY=on`, `:8888`, since 2026-09-30) lets off-VPN containers
+  make individual requests from the VPN exit IP via `http://gluetun:8888` (tamilmv crawler:
+  `TAMILMV_HTTP_PROXY`). Not published on the host — reachable only from docker networks.
 - **Cross-service URLs inside the netns**: containers sharing gluetun's namespace talk to the *arr
   apps via the hostname **`gluetun`** (e.g. `http://gluetun:7878`), NOT `radarr`/`sonarr` (which don't
   resolve). `media-bridge` (on the default bridge net) reaches the *arr apps AND FlareSolverr the same
@@ -63,6 +73,19 @@ What runs **outside** the VPN: `media-bridge` (seedr does the torrenting in its 
 never joins a swarm; keeping it off-VPN also keeps Seedr CDN downloads direct/fast), `bazarr` and
 `jellyfin` (both `network_mode: host` for LAN/DLNA/Tailscale reach; they hit the *arr apps on
 `127.0.0.1` because gluetun publishes those ports on the host).
+
+**`home-egress` (tinyproxy, host `:8006`) — the one per-indexer VPN exception.** Some private trackers
+bind the login cookie to the IP it was issued to: **KrazyZone** (no opt-out; its login form has only
+"Remember Me") answers the VPN exit IP with an empty 200 + `Refresh: account-login.php` +
+`Set-Cookie: pass=deleted`, which Prowlarr reports as "Redirected to …account-login.php". Since the
+browser login happens from the home IPv4, those indexers go through this proxy: Prowlarr indexer proxy
+`home-egress` (HTTP `10.0.0.179:8006`) + tag `home-egress` on the indexer — Prowlarr only proxies
+indexers that carry the tag. Everything else stays on the VPN. Guards: `home-egress/filter` is a
+destination allowlist (`FilterDefaultDeny`; `prowlarr.servarr.com` is on it because Prowlarr won't save or
+health-check a proxy that can't reach it), and `Allow 172.16.0.0/12` admits only docker-bridge sources
+(gluetun's netns arrives as `172.22.0.1`), so LAN hosts get refused. Config is bind-mounted: edit
+the filter and `docker restart home-egress`. If Comcast changes the home IPv4, the cookie dies — re-login in
+the browser and paste the new cookie.
 
 ## The `/data` single-root convention
 
@@ -172,8 +195,149 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
 - **`BRIDGE_ROUTE`** (compose) picks the backend per drop, first match wins: `<private|public|*>:<backend>`,
   default `*:seedr`. State files carry `"backend"`; files without it (pre-2026-09-25) mean `seedr`.
   A backend named by a route or a live state file must stay registered until its transfers finish.
-- Planned (see `~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`): a qBittorrent+SFTP seedbox
-  backend with per-tracker seed rules, so private trackers with >48h H&R rules can be re-enabled.
+- `backends/qbit.py` — the **seedbox** backend (Pulsed Media PMSS box `3-229mighty`, qBittorrent 4.5.2). See
+  *seedbox backend* below. Log tag `[seedbox]`.
+- **`SEED_RULES`** (compose): per-private-tracker seeding rule, key = substring of the grab's indexer name
+  (from *arr history, retried a few polls since the *arr writes the drop first), `<h>h` or `<ratio>|<h>h`;
+  `private-default` (336h) covers anything unmatched. A drop whose rule exceeds its backend's cap
+  (`max_seed_hours`, Seedr 48) **waits in the blackhole** — never sent to a backend that would H&R it. A
+  magnet whose indexer matches a rule is private too (magnets carry no private flag). `iptorrents=48h` only
+  while the account is VIP (until 2026-10-25) → `1.0|336h` after.
+- **Staged delivery**: fetches land in `downloads/.incoming/<cat>/<release>` and are moved into the watch
+  folder with ONE `rename` only when complete (`deliver`: identical existing dir → keep; different → swap
+  whole, never mix). The *arr blackhole scan imports any watch-folder item idle ~30s, so fetching straight
+  into it let slow/retrying fetches be imported half-done.
+- **Never judge what you can't see**: `status()` may return `UNAVAILABLE` and `hold_over()` may return
+  `None` (torrent not in the listing, client restarting, `error`/`missingFiles`). Those never fail,
+  tombstone, reap, or release a hold — the bridge waits (deadlines frozen) and ntfys after
+  `UNAVAILABLE_ALERT` (2h). **A missing seedbox torrent is never a finished hold.**
+- **Clock freeze** (`freeze_clocks`, marker `.bridge-state/.seen-<backend>`): after any gap in observing a
+  backend (> `CLOCK_GAP`), deadlines that were already running are pushed back by the gap, so an outage
+  can't make every transfer look stalled. **Circuit breaker** (`may_fail`): `BREAKER_FAILS` (3) automatic
+  failures on one backend within 15 min pauses auto-failing there for 1h (+1 ntfy).
+- **Private partials** (`keep_private_partial`): a private torrent that downloaded > 50 MiB is never
+  cancelled on stall/supersede — it's failed in the *arr (re-grab) but kept seeding as an undelivered
+  hold (`no_deliver`), capped at `PARTIAL_HOLD` (7d). Trackers count partial snatches as H&R.
+
+- **Pull workers** (`puller.py`, threads `bridge-puller-N`): on `DONE` the bridge calls `be.prepare_fetch`
+  (API calls stay on the bridge thread) and queues a job; the worker runs `be.pull` with connections of
+  its own and writes only inside its `.incoming` stage dir; the bridge delivers + releases/holds when it
+  sees the job done. So a long pull no longer freezes the loop. **`PULL_WORKERS` (2) jobs at once** (since
+  2026-10-17: a 9 GB movie and its follow steps sat behind a 35 GB remux) — they share the box's uplink, so
+  total speed is unchanged, only who waits. A job that would leave < `PULL_MIN_FREE_GB` on the Jetson,
+  counting what the other running pulls still have to write, waits (`waiting_space`, never counted as a fetch failure). Supersede
+  cancels a running pull (the worker removes its own stage); `cleanup_local_partial` skips busy stages.
+  Seedr uses a per-thread requests session. `puller.run_pending()` runs jobs synchronously (tests).
+  **Scene RARs**: after a pull the worker extracts every RAR set in the stage (`extract_archives`: `.rar`+`.rNN`
+  or `.partNN.rar`, not inside `Sample/`) with Debian's non-free `unrar` (baked into the image), into a temp
+  dir moved in only on success, then deletes the volumes — Radarr/Sonarr never unpack archives, so a RAR'd
+  private release (IPTorrents SKYFiRE etc.) otherwise imports nothing but its sample.
+- **Event log** (`bridgelog.py`, `config/bridge.db`, WAL): append-only `events` (tid, type, phase,
+  release, detail) + `attempts` per movie/episode. Every transfer carries `rec["tid"]` (legacy states get
+  one on sight). Waiting drops are logged only when their reason changes (`drop_wait`). All writes are
+  swallowed on error — the log can never break a transfer. Look things up with
+  `docker exec media-bridge python -m bridgelog` (active + waiting), `... bridgelog <name>` (timeline),
+  `... bridgelog --attempts`.
+- **Grab info** (`grab_info`): the *arr's "grabbed" history rows for the drop give the indexer, the
+  history ids (all episodes of a pack) and attempt keys (`radarr:movie:<id>` / `sonarr:episode:<id>`).
+  `arr_mark_failed` marks by those ids (the name search sees only 100 rows and one episode of a pack).
+- **Slow rule** (`check_slow`, `SLOW_*`, public-only, **dry-run by default**): after 2h, <5% or a
+  projected ETA (the bridge's own ~1h rate — qBittorrent's `eta` is 8640000 whenever speed is 0) above
+  24h for 1h → fail + re-grab. **Give-up** (`record_failure`, `GIVE_UP_*`, **dry-run by default**): the
+  10th failed attempt for a movie/episode unmonitors it in the *arr BEFORE marking failed (marking failed
+  always re-searches), and later grabs of it are dropped. No ntfy for any of these (user decision).
+- **Fail-fast** (`check_failfast`, `FAILFAST*`, public-only, **dry-run by default**): a public download
+  with nothing downloaded after 10 min whose backend reports no metadata or 0 swarm seeds
+  (`Backend.swarm()`: qBittorrent's state/num_complete; Seedr's transfer entry has `seeders`, `leechers`,
+  `connected_to`, `download_rate`, and `size` once metadata is known) is failed + re-grabbed instead of waiting for
+  the 45-min stall. movierulz/tamilmv report a fake seeder count (`FAKE_SEEDERS`), so dead picks are common.
+- **Extra public trackers** (`trackers.py`, `PUBLIC_EXTRA_TRACKERS`): ngosang/trackerslist
+  `trackers_best.txt` (~20), refreshed daily, cached in `config/trackers_best.txt` (a failed fetch keeps the
+  cache). Appended to public magnets (`&tr=`) before any backend; public `.torrent`s on the seedbox get them
+  via `/torrents/addTrackers`. **Never for a private torrent** — public by BOTH checks only (no private flag,
+  indexer not a `SEED_RULES` tracker): announcing a private infohash to public trackers gets accounts banned.
+- **Import fix** (`check_imports`, `IMPORT_FIX`, default on): every delivery with grab-time ids (`arr_keys`) goes on
+  a watch-list (`.bridge-state/.import-watch.json`, 24h). Every 2 min the *arr queue is read; a watched item that is
+  `importBlocked` for **"title mismatch" / "Unknown Series/Movie"** (e.g. `Rewired with Joe Dispenza` vs Sonarr's
+  `Rewired`) gets a `ManualImport` command, mapped **only** to the recorded movie / episodes (Radarr: largest
+  video → `movieId`; Sonarr: `SxxEyy` in each filename → episode ids from the key set, anything unmappable is
+  skipped). Up to 3 tries, 10 min apart. Other block reasons (TBA title, not an upgrade) are only logged
+  (`import_blocked` event), never forced. The manualimport GET uses `folder=` only.
+
+- **Sonarr refresh nudges** (2026-10-02; Heart Beat S03E37-E40 took 28.5 h from airing to watchable with a
+  2-minute download, because Sonarr waited twice for its 12-hourly `Refresh Series`): (1) **grab side** —
+  `nudge_sonarr` (`movierulz.py`, run after every movierulz and tamilmv crawl pass): a series release indexed
+  in the last `SONARR_NUDGE_DAYS` (3) whose `SxxEa-Eb` covers episodes Sonarr doesn't list for a **library**
+  show → `RefreshSeries` for that show, at most every `SONARR_NUDGE_INTERVAL` (3600 s, in memory; 0 = off).
+  A refresh that adds already-aired episodes makes Sonarr search them itself. (2) **import side** —
+  `check_imports`: a delivery `importBlocked` for "TBA title" gets a `RefreshSeries` every
+  `TBA_REFRESH_INTERVAL` (3600 s, first one an hour after delivery; event `tba_refresh`) — still never
+  force-imported, so files get real names. If a site's episode numbering never matches TVDB, the nudge
+  repeats hourly until the release is 3 days old, then stops.
+
+- **Status page** (`bridgeweb.py`) on the youtube server: `http://10.0.0.179:8003/bridge` (HTML, 30s refresh),
+  `/bridge/status.json`, `/bridge/transfer/<tid>` (timeline). Same process as the bridge, so it reads the
+  pull worker's jobs and each backend's last poll snapshot — rendering never calls Seedr or the seedbox.
+  Shows where each transfer is + until when (qBit eta, else the bridge's own rate; pull ETA from staged
+  bytes; hold end from seeding_time vs rule), waiting drops with their reason, holds, last 7 days, and the
+  dry-run rule decisions. Names come from scraped sites → everything `html.escape`d + a script-free CSP.
+  LAN-only like `:8003` itself; never put it behind Caddy (it shows private-tracker names).
+
+### seedbox backend (`backends/qbit.py`) + vault (`vault.py`)
+
+**Status (2026-09-27):** live for **private** torrents (`BRIDGE_ROUTE=private:seedbox,public:seedr`). Public stays on
+Seedr: the box's **shared uplink**, not our client, caps pulls home — 32-40 MB/s evenings, **4 MB/s** at a busy hour
+(2026-09-26 04:20 EDT; a cached re-read was just as slow, so network, not disk; no PMSS throttle on the account),
+while the home line does ~127 MB/s from Helsinki. Research + numbers: plan file
+`~/.claude/plans/since-seedr-has-limitation-smooth-globe.md`.
+
+- **Secrets come from Bitwarden Secrets Manager** (cloud, US), never `.env`: `vault.py` shells out to the
+  pinned, checksum-verified `bws` CLI baked into the image; the only local secret is the machine-account
+  token `media-bridge/config/bws_token` (mode 600, gitignored). Values live in memory only. Names:
+  `SEEDBOX_ACCOUNT_PASSWORD` (admin use only — media-bridge never needs it), `SEEDBOX_SSH_KEY_SFTP`,
+  `SEEDBOX_SSH_KEY_QBIT`, `SEEDBOX_QBIT_PASSWORD`, `SEEDBOX_SSH_HOSTKEY`, `TRACKER_*`. `python -m vault check`
+  lists names, never values. `bws` parses values starting with `-` as options → `put` uses `--value=`/`--`.
+- **Two restricted SSH keys** on the box (`~/.ssh/authorized_keys`): SFTP key =
+  `restrict,command="/usr/lib/openssh/sftp-server -R"` (read-only SFTP: pulls, `~/.quota`, port file);
+  qBit key = `restrict,port-forwarding,permitopen="127.0.0.1:*",command="/bin/false"` (tunnel only).
+  Host key pinned in `media-bridge/config/seedbox_known_hosts` (+ vault copy); unknown/changed = refuse.
+- **qBittorrent** listens on the box's `127.0.0.1:<~/.qbittorrentPort>` (37301 today; PMSS may move it —
+  re-read on connection errors), reached through a paramiko direct-tcpip tunnel + a local forwarder.
+- **Pulls** (paramiko, one SSH connection per stream): big files (≥ 64 MiB) one at a time in `PULL_SEGMENTS` (2)
+  ranges, resumable via `<file>.part.map` (saved only after an fsync, atomically); small files
+  `PULL_PARALLEL_FILES` (4) at a time. Pull connections are tuned (`_sftp_transport`/`_sftp_client`/`_open_remote`):
+  16 MiB window (`SEEDBOX_SFTP_WINDOW_MB`; every SSH stack's 2 MiB default caps a stream at ~12 MB/s at 110 ms),
+  255 KiB requests (`SEEDBOX_SFTP_REQUEST`, **never above 261120** = OpenSSH's max read: a clamped reply makes
+  paramiko drop prefetch), AES-GCM preferred. Measured 2026-09-26: tuned = lftp+HPN-SSH speed (both hit the box
+  cap), 16 vs 34 CPU-s/GB; rclone/aria2 no better (aria2 needs the account password); **lftp `get1
+  --target-position` corrupts earlier-written ranges** — never use it to fill one file in several passes.
+- **Follow mode** (`backends/follow.py`, `FOLLOW=off|private|all`, **off by default**): while a seedbox torrent
+  downloads, `maybe_follow` (bridge thread, every `FOLLOW_INTERVAL` 60 s, once `FOLLOW_MIN_MB` 128 are ready) queues
+  a `kind="follow"` puller job that copies qBittorrent's **finished pieces** (`/torrents/pieceStates`) as byte ranges,
+  SHA-1-checks each against the torrent itself (`/torrents/export` — exact layout incl. BEP 47 pad files, which
+  `/torrents/files` hides), and writes **only verified pieces** into sparse `<file>.part` in the stage dir, at most
+  `FOLLOW_STEP_MB` (2048) per step so other pulls never wait long. State: `.follow.json` (bitmap, saved after
+  fsync) + `.follow.hashes`. At DONE the final pull (it waits for a running step) fetches only the missing
+  pieces (`FOLLOW_PASSES` tries: libtorrent reports pieces before they reach disk — a hash failure, re-read later),
+  renames, delivers as usual; **any failure there discards the follow state and pulls normally**. No export (old
+  qBittorrent) or a v2-only torrent → normal pull. Measured with the prototype: home 8–29 s after the box
+  finished vs ~2 min for 4 GB; status page shows "home X GiB" for followed downloads.
+  Its WebUI password is its own random one; **a password change in the Pulsed panel resets it to the
+  account password** (PMSS `changePw.php`) → the bridge stops at the FIRST refused login (qBittorrent bans
+  127.0.0.1 after repeated failures, which also locks the user's WebUI) and ntfys.
+- **PMSS watchdog flags** in the box home: `~/.qbittorrentEnable` (keeps qBittorrent up), `~/.rtorrentDisable`.
+  The watchdog rewrites only perf/CSRF keys in qBittorrent.conf while it's stopped — not share limits,
+  queueing, or the password. Rootless Docker (~200 MB of the 1 GB cgroup) is root-config; only PM support
+  can disable it.
+- **Space**: `~/.quota` (PMSS `quota -s` snapshot, 230G soft) minus bytes our downloads still need minus
+  this loop's adds; qBittorrent's `free_space_on_disk` is the whole shared disk — never use it. Magnets
+  without `xl=` need `SEEDBOX_UNKNOWN_SIZE_GB` (40) headroom. Full → the drop waits (no retry cap).
+- Adds always set `paused=false`/`stopped=false`, `ratioLimit=-1`, `seedingTimeLimit=-1`, category
+  `bridge-<cat>`, tag `media-bridge`; qBit 4.x `Ok.` and 5.2 JSON/409 both handled. Holds end on
+  qBittorrent's own `seeding_time` ≥ rule + `SEED_MARGIN_HOURS` (3) or ratio; a stopped/queued held
+  torrent is resumed. The reaper never deletes a hash a live record still owns.
+- **Server reboot 2026-09-25**: every port dead from home + "connects but never answers" via VPN looked
+  like an IP ban; it was a reboot. PMSS runs no fail2ban (ADR 0010). Check `uptime` before suspecting a ban.
 
 Seedr backend: HTTP Basic auth; password is base64 in `SEEDR_PASSWORD_B64` because a literal `$` breaks
 Docker/shell interpolation. Per magnet: add to Seedr → poll → download finished files into the watch
@@ -293,6 +457,15 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
   unset, the crawler disables itself but the Torznab feed still serves.
   **The domain rotates, and a dead one looks like a FlareSolverr fault, not a DNS one:** every page
   fetch fails with `500 Server Error ... /v1` from FlareSolverr, which reads as Cloudflare trouble.
+  **A rotation that still redirects is silent too** (`.solutions` → `.institute`, noticed 2026-09-30
+  after **10.7 days** of "scanned 1 page(s), 0 posts fetched" with no error): FlareSolverr follows the
+  301 and returns the new domain's listing, whose post links didn't match a `POST_RE` built from
+  BASE's host. `POST_RE` now matches **any `…movierulz.<tld>` host**, so the crawl keeps working through
+  the redirect and `crawl_once` logs `domain moved: post links point at <host> … update MOVIERULZ_BASE`
+  (meta `moved_to`). **Stale-feed ntfy** (`check_stale`, after every pass): when the newest post
+  (first-seen) is older than **`MOVIERULZ_STALE_ALERT_DAYS` (4)**, a high-priority push to the ops topic
+  names BASE, where it moved, and the last pass's result; it repeats at most daily
+  (`MOVIERULZ_STALE_ALERT_REPEAT`) and resets when posts flow again.
   Check `docker compose logs flaresolverr` for the real cause — `ERR_NAME_NOT_RESOLVED` means the
   domain is simply gone (`www.5movierulz.watch` went NXDOMAIN 2026-08-24 and the crawler indexed
   nothing for 11 days while FlareSolverr itself was healthy, still serving tamilmv fine). Fix is a
@@ -309,7 +482,10 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 - **Resumable backfill (`meta.backfill_done`):** until the catalogue has been fully walked once, *every*
   pass paginates to the real last page, so the long first backfill **survives restarts** (already-seen
   posts are skipped cheaply, making re-scans of early pages fast). On reaching the end it sets
-  `backfill_done=1` and switches to incremental: stop once a whole page is already-known, floored by
+  `backfill_done=1` and switches to incremental: stop once a whole page is already-known — known before
+  this pass **or seen on an earlier page of it** (every listing page repeats a sidebar of the NEWEST posts;
+  judged against "known before" alone, any new post made every page look new and each pass walked all
+  ~400 pages through FlareSolverr until 2026-09-30) — floored by
   `MIN_PAGES` (default 3, so a curated first page can't hide new posts sitting deeper) and capped by
   `MAX_PAGES` (1000, a safety net — the real stop is the last/empty page).
 - **Empty-post retry (`post_needs_fetch` + `posts.magnets`):** the site frequently publishes a movie's
@@ -351,7 +527,7 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
 - **Query resolution (`search_terms` + `unorm`) — alias-aware, and never "match everything":**
   Radarr searches a movie's **alternate titles**, which for Indian films are **native-script**
   (`கருப்பு`) — and it strips the vowel signs first (`கருப்பு` → `கர பப`). Two consequences, both
-  handled here and shared with tamilmv (which imports `search_terms`/`query_matches`):
+  handled here and shared with tamilmv (which imports `search_terms`/`match_rank`/`page`):
   - `norm()` keeps only `[a-z0-9]`, so a native-script query collapsed to `""` → zero tokens →
     `all([])` is **True** → the query matched the **whole catalogue** and each *arr search got 100
     unrelated releases (they showed up as ~300 `Unknown Movie` rejections per search). A query that
@@ -364,6 +540,14 @@ MediaFusion image and can't be taught a new site, so we scrape this one ourselve
     *Veerabhadrudu*, a name no Radarr query ever contains. A trailing year in the query is carried
     onto the alias terms. Radarr then maps the `Veerabhadrudu …` release back to Karuppu on its own,
     since `VeeraBhadrudu` is in its alternate titles — no title rewriting needed on our side.
+  - **Short aliases and paging** (2026-10-16, Athadu): Radarr lists *He* as an alternate title of
+    *Athadu*, and the token `he` substring-matched nearly every title, so the 100-item page was all
+    unrelated releases and Athadu itself never made it in. Query words of ≤ 2 chars must now be a
+    whole title word (`title_matches`); the query's own title is ranked ahead of alias-only matches
+    (`match_rank`); and both feeds honour Torznab `offset`/`limit` (`page_args`). Before that, a
+    full page made Prowlarr page on (offsets 0–900, the same 100 items each time, ~30 s a scan) until
+    it timed the indexer out (`tamilmv server is currently unavailable … Http request timed out`).
+    Collapsed titles are cached (`_title_key`), so only the first search after a restart is slow.
 - **Radarr-side settings these feeds depend on** (runtime config in the gitignored `radarr/`, so it is
   not version-controlled — re-apply after a Radarr rebuild):
   - `Settings → Indexers → Whitelisted Hardcoded Subs = esub,esubs,msub,msubs`. Every release on these
@@ -393,8 +577,7 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
 - **Domain rotation (the key bit): seeds + per-language forum maps come from MediaFusion's UPSTREAM
   GitHub `scraper_config.json`** (`TAMILMV_CONFIG_URL`), refreshed daily and cached to
   `config/tamilmv_config.json`. The **live domain** is found by following the seed's 301 redirect
-  (`resolve_base`, plain HTTP — the redirect resolves at Cloudflare's edge, no FlareSolverr). Only the
-  **content pages** are CF-walled and go through the same `FLARESOLVERR_URL` as movierulz. Recovery
+  (`resolve_base`, plain HTTP — the redirect resolves at Cloudflare's edge, no FlareSolverr). Recovery
   ladder when a base dies: re-resolve → force a GitHub config refresh for a newer `homepage` → still
   dead → ntfy (then set `TAMILMV_SEED_OVERRIDE`/`TAMILBLASTERS_SEED_OVERRIDE` as an emergency manual pin).
   **The dead-site ntfy is rate-limited** to one push per `TAMILMV_DEAD_ALERT_INTERVAL` (default 86400s)
@@ -405,10 +588,120 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   `docker compose logs media-bridge` still shows the true state hourly.
 - **Config shapes differ**: tamilmv uses `supported_search_forums` (33 forums), tamil_blasters uses
   `catalogs` (28) — `_parse_site_cfg` normalizes both to `[(forum_path, language)]`.
-- **Crawl**: per site → `resolve_base` → for each forum `…/index.php?/forums/forum/<id>/page/<n>/` via
-  FlareSolverr, extract full topic URLs (`TOPIC_RE`, slug required so nav links are ignored), fetch each
-  topic, `MAGNET_RE` + `parse_magnet` (language from the forum map). Bounded per pass by
-  `TAMILMV_MAX_PAGES` (per-forum cap) + incremental all-known stop; empty-post retry as in movierulz.
+- **tamilblasters has been down since 2026-08-23** (last crawl; last new release 08-07): the seed
+  `1tamilblasters.wtf` 301s to `.garden` (home IP) / `.gripe` (VPN), and those and `.land` all answer
+  Cloudflare **522** = origin offline. `1tamilblasters.tech` is a **fake** (WordPress SEO clone: every
+  URL returns its homepage, no magnets, no `sitemap.php`) — never pin it. The Telegram "Tamil Blasters"
+  channel now posts an unrelated Instagram account, not domains. When a real domain appears, verify it
+  serves a known topic (e.g. `…/forums/topic/16655-…`) with magnets before pinning it.
+- **Archive everything, extract from the archive, serve only what is flagged** (rebuilt 2026-09-30, after
+  Seethamma Vakitlo Sirimalle Chettu — a 2023 topic on page ~10 of Telugu forum 25 — was never indexed
+  while Radarr burned 16 dead public grabs). Measured on 1tamilmv then: ~33k topics, 68 forums; the old
+  crawler read 5 pages per forum (3,010 topics), and the default **last-post** sort moves old topics
+  around, so neither "stop at a known page" nor any resume point was sound.
+  - **Every topic read is archived** (`archive_view`: title, canonical, breadcrumb + every post on the
+    topic's first page, gzipped ≈ 6 KB) in **`config/tamilmv_archive.db`** (separate from the feed DB;
+    ~200 MB for the whole site). `extract()` works on that HTML, so a parser fix is
+    **`docker exec media-bridge python -m tamilmv reparse`** — no re-crawl. `PARSER_V` bump = older-parsed
+    topics are re-extracted locally (`topic_action` → `reparse`) as the walk reaches them. `WALK_EPOCH` bump
+    = the backfill walks every forum from page 1 again (only needed when the archive lacks something, e.g.
+    v2 on 2026-09-30: the ~5k topics read before the archive existed).
+  - **Walking** — three layers, all listings sorted **`&sortby=start_date&sortdirection=desc`**
+    (`listing_url`) so new topics only ever appear on top:
+    1. **head walk** (`crawl_site` → `crawl_forum`, hourly, `tamilmv-crawler` thread): release forums,
+       pages 1..`TAMILMV_MAX_PAGES`, incremental; FlareSolverr fallback on a challenge;
+    2. **backfill** (`run_backfill`, its own **`tamilmv-backfill`** thread): **all 68 forums** (from the
+       sitemap, `discover_forums` → `forums` table) to their **`data-pages` count**, `TAMILMV_BACKFILL_CHUNK`
+       pages per step, continuously; order = config forums → `TAMILMV_EXTRA_FORUMS` → every other forum.
+       Progress in meta `walk:<site>:<forum id>` / `walkdone:…`; a resume re-reads one page. **Never stop
+       on "empty page"**: IPS answers a page past the end with page 1. **Plain HTTP only**: a CF
+       challenge / 429 / 5xx / proxy error raises `PlainUnavailable` → pause `TAMILMV_BACKFILL_PAUSE`
+       (1800 s) — it never falls back to FlareSolverr (a multi-day crawl would starve movierulz); a 404
+       (deleted topic) doesn't pause. Measured 1.7 s/topic → the whole site ≈ 16–18 h. Logs a progress
+       line every 10 min (`backfill tamilmv: N pages, M topics …, K of 68 forum(s) left`);
+    3. **sitemap** (`sitemap_sweep`, daily): refreshes the forum list; unseen topics within
+       `TAMILMV_SITEMAP_DAYS` are read. Verified against 962 listing-walked topics: none missing;
+    4. **audit** (`audit`, once per walk epoch, after every forum is `walkdone`): every topic in the
+       FULL sitemap (no window) that isn't archived, is gone, or has a pending attachment gets one more
+       try; what still fails is logged `audit_missing`.
+  - **Parallel backfill without gaps**: the topics of ONE listing page are fetched by
+    `TAMILMV_BACKFILL_WORKERS` (3) threads (`run_topics`; each thread its own requests session; a
+    worker inherits the caller's plain-only mode and log role); the walk position moves **only after
+    every topic of that page is processed**. A transient failure anywhere on the page (network /
+    challenge / 429 / 5xx → `PlainUnavailable`) stops the not-yet-started topics, leaves the position,
+    and the page is re-read after the pause (topics already done are no-ops then). A topic that simply
+    isn't there (404/410, or a 200 page without `<article>` — moved/hidden stubs redirect home) is
+    marked **`posts.gone`** and does NOT block the page. A `.torrent` attachment that fails to download
+    sets **`posts.pending`** → the topic is re-extracted from the archive on its next visit, which
+    retries only that download. Measured 2026-09-30 (20 pages, 3 workers): 0.65 s/topic, 499 of 499
+    listed topics archived or gone, 0 missing → the whole site ≈ 6–7 h.
+  - **Uniqueness**: a topic is **(site, topic id)** everywhere — never its URL (the domain rotates and
+    the slug changes as series grow; `posts.url` just keeps the latest). `posts` and the archive's
+    `pages` are keyed by it (the archive keeps the latest copy: `INSERT OR REPLACE`); `releases` by
+    **infohash** (one row per torrent; the first topic keeps it → stable pubDate) with every topic it
+    was posted in in **`release_topics`**; `weblinks` by (site, topic, URL) + a stable `lid` hash (a
+    topic's links are replaced as a set on each extract); `attachments` by (site, attachment id).
+    Listing pages are never stored — only the walk position.
+  - **Error log** (`log_error` → **`config/tamilmv_errors.jsonl`**, one JSON object per line, rotates
+    to `.1` at 50 MB; never raises): `ts, site, post_id, url, forum, thread (backfill/head/sitemap/
+    active/audit/manual), stage (listing/fetch/attachment/extract/audit), type, status, detail,
+    outcome (retry/gone/pending/recorded)`. Types: transient `network`/`challenge`/`rate_limited`/
+    `server_error` (retry), `not_found`/`no_article`/`http_other` (gone), `attachment_failed` (pending),
+    and one-off findings written once per topic (`logged` table): `not_torrent`, `private_torrent`,
+    `magnet_unparsed`, `magnet_skipped` (scope rules: single episode / Part), `empty` (served topic with
+    no torrent and no link — a likely parser gap), `extract_error` (parser crash; topic archived, fix
+    + `reparse`); `listing_failed`, `audit_missing`.
+  - **Commands** (`docker exec media-bridge python -m tamilmv …`): `errors [--type T] [--since 24h|7d]
+    [--unresolved]` (counts per type, latest examples, resolved vs unresolved against the DB);
+    `refetch <topic id | URL> …` (fetch now, re-archive, re-extract, print torrents/links — searchable
+    immediately; clears `gone`); `recrawl [--forum ID …] [--refetch]` (reset the walk + audit for all or
+    some forums; `--refetch` = every topic archived before now is downloaded again as the walk reaches
+    it); `reparse [site]` (re-extract the whole archive, no network); `links <words>`.
+  - **Serving** (`is_served`): topic override `posts.serve` > forum override `forums.serve` > automatic =
+    a **release forum** (upstream config map + `TAMILMV_EXTRA_FORUMS`: `38`/`60`/`13` DVD9-DVD5, never
+    mapped upstream, and `92-post-share-here` with language `auto` = read from the title). Everything is
+    extracted from every forum; unserved forums (songs, news…) just never reach the feed. To serve/hide
+    by hand: `UPDATE forums SET serve=1|0 WHERE forum_id='18'` or `UPDATE posts SET serve=… WHERE post_id=…`
+    in `config/tamilmv.db` (NULL = back to automatic) — takes effect on the next query, no restart.
+- **What a topic yields** (`extract`): (a) `magnet:` links; (b) **mangled `http://magnet?xt=…`** links
+  (2023-era posts — Seethamma's only magnet) rewritten to `magnet:?`; (c) **`.torrent` attachments**
+  (`attachment.php?id=…`, downloadable as a guest) → parsed with `torrentfile.parse_torrent` into a
+  magnet with `xl=` + trackers; skipped when a magnet on the page has the same `dn` (same torrent),
+  cached in `attachments` so a re-read never downloads twice, and a **private torrent is never turned
+  into a magnet**. In forum 25, 246 of 600 topics were attachment-only — invisible before. (d) **web
+  links** (shortener / file-host links: gplinks, tnlink, nowshort, gdlink, gdflix, cyberloom…) from the
+  **opening post only** (`first_post`; replies post links to other movies, share buttons sit after it)
+  into `weblinks`. tamilmv lists each file as `.torrent` + MAGNET + **"DIRECT LINK"** button: a generic
+  label takes the name/size of the torrent just above it and records its **btih** ("same file as
+  torrent X"). Every link is ad/captcha-gated (cyberloom → countdown page, nowshort → reCAPTCHA; the
+  final URL carries a short-lived token), so links are **never downloaded** and saving the gate page is
+  useless — the link itself stays valid.
+- **`[DL-LINK]` items + topic pages (how links reach Radarr/Sonarr)**: a search (never the empty-query
+  RSS) also returns up to `TAMILMV_LINKS_MAX` (50) links as **`[DL-LINK] <file name>`** items — Radarr and
+  Sonarr parse `DL-LINK` as the release group (title/year/quality/language intact; `[LINK]`/`[DDL]` could
+  collide with real groups). They are **never grabbed and never penalize**: **0 seeders** (the tamilmv
+  indexer's minimum is 1 → always rejected "Not enough seeders", but listed in Interactive Search), no
+  `magneturl`, and the download URL `/nograb/<lid>.torrent` answers **404** = "release no longer
+  available" (not an indexer failure, no blocklist). Every item's `<comments>` (= the **info link** Prowlarr
+  passes to Radarr/Sonarr — click the release title) is **`TAMILMV_PUBLIC_URL/t/<site>/<topic id>`**
+  (`#l<lid>` highlights the link): the direct links, the live tamilmv link (current domain from meta
+  `base:<site>`), the topic's torrents, and the **saved copy** of the posts. `TAMILMV_PUBLIC_URL` is the
+  **Tailscale address** `http://100.122.87.20:8005` (Radarr/Sonarr are used the same way at home and
+  away; the Jetson does not advertise `10.0.0.0/24`, so a LAN-IP link would break away from home). The
+  page is scraped content: `sanitize` strips scripts/iframes/handlers/`javascript:` and a strict CSP
+  (`default-src 'none'`, no images — they'd tell image hosts who is looking) makes script impossible.
+- **DVD Remux rewrite** (`served_title`): Radarr reads "DVD9"/"DVD5" as a raw disc image (quality DVD-R)
+  and rejects it ("Raw Bluray/DVD release") — every tamilmv DVD9 release, though they are single `.mkv`
+  remuxes. A DVD9/DVD5 torrent whose magnet `dn` ends in a video extension is served as **"DVD Remux"**
+  (Radarr: DVD quality, accepted); an ISO / VIDEO_TS torrent keeps "DVD9" and stays rejected (unimportable).
+- **Plain HTTP, FlareSolverr fallback**: pages, sitemap and attachments answer plain requests (no CF
+  challenge, 2026-09-30), ~10× cheaper than FlareSolverr. Plain requests go only through
+  **`TAMILMV_HTTP_PROXY`** (gluetun's built-in proxy → VPN exit IP); unset = plain HTTP off (FlareSolverr
+  only; no attachments, sitemap or backfill) — media-bridge is off the VPN and must not scrape these sites
+  from the home IP.
+- **Re-read rules** (`topic_action`): new topic / slug changed / never archived → fetch; the empty-post
+  retry window is anchored on the topic's **post date** (`posts.posted_at`), not first-seen, or the
+  backfill's thousands of old link-only topics would each be re-read every pass for days.
 - **Slug-change refetch (`post_needs_fetch(site, pid, url)` + `_slug`)**: unlike movierulz (one post per
   episode batch), tamilmv posts a running season as **one topic** and appends each new batch to it,
   retitling it as it grows (`S03 EP (01-04)` → `S03 EP (01-32)`) — and the listing URL's slug follows. A
@@ -421,7 +714,7 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   even while it grows — Heart Beat S03 went `ep-01-32 → ep-01-36` on page 2 of the web-series forum and
   a full pass fetched 0 topics (2026-09-23). So every pass also fetches, **directly by id**, each series
   topic that gained a release in the last `TAMILMV_ACTIVE_DAYS` (21), each at most every
-  `TAMILMV_ACTIVE_REREAD` s (21600). The stored slug still resolves on the current domain, and
+  `TAMILMV_ACTIVE_REREAD` s (10800; 21600 until 2026-10-02). The stored slug still resolves on the current domain, and
   `process_topic` adopts the page's `<link rel=canonical>` so `posts.url` learns the new name. ~19 topics;
   adds ~2-3 min of FlareSolverr per pass. Log line: `active series: N re-read, M new`.
 - **New episodes can still stall at Sonarr, correctly**: Sonarr only grabs episodes its TVDB list has.
@@ -438,7 +731,7 @@ scraper (Cloudflare-Turnstile-walled, no config off-switch) 403-thrashed FlareSo
   **`http://10.0.0.179:8005/torznab`** (LAN IP, not `media-bridge:8005` — container names don't resolve in
   gluetun's netns; see movierulz's Prowlarr wiring). Querying it hits the local sqlite only (no CF), so keeping RSS
   enabled on this indexer is cheap — the CF cost is entirely in the background crawler.
-- **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`query_matches`,
+- **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`match_rank`,
   so the alias expansion and the "never match everything" guard described above apply here too.
 
 ### daddylive component (`media-bridge/daddylive.py`) — DISABLED 2026-09-24

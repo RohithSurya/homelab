@@ -485,17 +485,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet default logging
         pass
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
 
     def do_GET(self):
         if self.path.split("?")[0] in ("/", "/youtube"):
             self._send(200, _page())
+        elif self.path.startswith("/bridge"):
+            # the download bridge's status page shares this LAN-only server (see bridgeweb.py)
+            csp = "default-src 'none'"
+            try:
+                import bridgeweb
+                code, ctype, body = bridgeweb.handle(self.path)
+                csp = bridgeweb.CSP
+            except Exception as e:
+                code, ctype, body = 500, "text/plain", f"status page error: {e!r}"
+            self._send(code, body, ctype, {"Content-Security-Policy": csp,
+                                          "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
         else:
             self._send(404, "not found")
 

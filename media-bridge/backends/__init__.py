@@ -8,6 +8,7 @@ import importlib
 # route name -> "module:Class"
 REGISTRY = {
     "seedr": "backends.seedr:SeedrBackend",
+    "seedbox": "backends.qbit:QbitBackend",
 }
 
 _instances = {}
