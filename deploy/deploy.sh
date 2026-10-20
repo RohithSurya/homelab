@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# deploy.sh <stack> [--dry-run] [--src DIR] [--sha SHA] [--no-backup]
+# deploy.sh <stack> [--dry-run] [--if-changed] [--src DIR] [--sha SHA] [--no-backup]
 #
 # Copies stacks/<stack> to $DEPLOY_BASE/<stack> (runtime state listed in the stack's .gitignore
 # is never touched), renders .env from Bitwarden, backs up, builds and starts the stack, applies
 # the gluetun rule, then runs smoke.sh. Exit != 0 means the caller should run rollback.sh.
 # --dry-run: everything up to and including image builds, into $DEPLOY_BASE/.dryrun/<stack>,
 #            nothing is started or stopped (works for stacks not enabled yet).
+# --if-changed: do nothing when stacks/<stack> is unchanged since the last good deploy (.deployed).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 stack=${1:?usage: deploy.sh <stack> [--dry-run] [--src DIR] [--sha SHA] [--no-backup]}; shift
-dry=0; backup=1; src="$REPO/stacks/$stack"; sha=$(git -C "$REPO" rev-parse HEAD)
+dry=0; backup=1; if_changed=0; src="$REPO/stacks/$stack"; sha=$(git -C "$REPO" rev-parse HEAD)
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=1 ;;
     --no-backup) backup=0 ;;
+    --if-changed) if_changed=1 ;;
     --src) src=$2; shift ;;
     --sha) sha=$2; shift ;;
     *) die "unknown option $1" ;;
@@ -29,6 +31,14 @@ target "$stack"
 
 dir="$DEPLOY_BASE/$stack"
 [ "$dry" = 1 ] && dir="$DEPLOY_BASE/.dryrun/$stack"
+if [ "$if_changed" = 1 ] && [ "$dry" = 0 ] && [ -f "$dir/.deployed" ]; then
+  last=$(cat "$dir/.deployed")
+  if git -C "$REPO" cat-file -e "$last^{commit}" 2>/dev/null \
+     && git -C "$REPO" diff --quiet "$last" "$sha" -- "stacks/$stack"; then
+    log "$stack unchanged since ${last:0:7} -- nothing to deploy"
+    exit 0
+  fi
+fi
 mkdir -p "$dir"
 log "$stack @ ${sha:0:7} -> $dir ($T_ENV$([ "$dry" = 1 ] && echo ', DRY RUN'))"
 

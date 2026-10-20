@@ -56,7 +56,8 @@ jobs:
         with:
           fetch-depth: 0      # rollback needs the previous commit
       - name: deploy
-        run: deploy/deploy.sh "${{ matrix.stack }}" ${{ inputs.dry_run && '--dry-run' || '' }}
+        # push: only stacks changed since their last good deploy; manual run: always (or dry run)
+        run: deploy/deploy.sh "${{ matrix.stack }}" ${{ inputs.dry_run && '--dry-run' || '' }} ${{ github.event_name == 'push' && '--if-changed' || '' }}
       - name: rollback
         id: rollback
         if: failure() && !inputs.dry_run
