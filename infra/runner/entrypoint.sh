@@ -25,15 +25,21 @@ chown -R "$RUN_AS" /opt/runner /state
 
 if [ ! -e /state/.runner ]; then
   : "${RUNNER_TOKEN:?first start needs RUNNER_TOKEN}"
-  sudo -u "$USER_NAME" -H /opt/runner/config.sh --unattended --replace \
+  setpriv --reuid="$RUN_AS" --regid="$(id -g "$USER_NAME")" --init-groups \
+    env HOME="$(getent passwd "$RUN_AS" | cut -d: -f6)" /opt/runner/config.sh --unattended --replace \
     --url "$RUNNER_URL" --token "$RUNNER_TOKEN" --name "$RUNNER_NAME" \
     --labels "$RUNNER_LABELS" --work "$RUNNER_WORK"
   for f in .runner .credentials .credentials_rsaparams; do
     mv "/opt/runner/$f" "/state/$f" && ln -sf "/state/$f" "/opt/runner/$f"
   done
 fi
-# -H: the job's HOME is the runner user's own (not /root, which it can't read -> checkout fails)
-# keep an older registration's work folder in step with RUNNER_WORK
-tmp=$(mktemp); jq --arg w "$RUNNER_WORK" '.workFolder = $w' /state/.runner > "$tmp" && cat "$tmp" > /state/.runner && rm -f "$tmp"
-mkdir -p "$RUNNER_WORK" && chown "$RUN_AS" "$RUNNER_WORK"
-exec sudo -u "$USER_NAME" -H --preserve-env=HOMELAB_HOST,BWS_TOKEN_FILE /opt/runner/run.sh
+# setpriv (not sudo) so the runner IS this process: docker stop's SIGINT (STOPSIGNAL) reaches
+# Runner.Listener, which then ends its GitHub session cleanly. Through sudo + run.sh the signal
+# was lost, the old session lingered for minutes after every restart, and GitHub handed queued
+# jobs to that dead session where they sat forever.
+home=$(getent passwd "$RUN_AS" | cut -d: -f6)
+cd /opt/runner
+exec setpriv --reuid="$RUN_AS" --regid="$(id -g "$USER_NAME")" --init-groups \
+  env HOME="$home" USER="$USER_NAME" HOMELAB_HOST="${HOMELAB_HOST:-}" BWS_TOKEN_FILE="${BWS_TOKEN_FILE:-}" \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  /opt/runner/bin/Runner.Listener run

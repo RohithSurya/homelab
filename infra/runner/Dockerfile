@@ -14,7 +14,7 @@ ARG BWS_SHA256_AMD64=ba8233c3a4aee5d43e3c73bbd04d99e9bc5aba13bbbfd06d89b073abe73
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq rsync python3 sqlite3 gnupg sudo tini unzip \
+      ca-certificates curl git jq rsync python3 sqlite3 gnupg tini unzip \
  && install -m 0755 -d /etc/apt/keyrings \
  && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
@@ -38,4 +38,6 @@ COPY install_bws.py /tmp/install_bws.py
 RUN python3 /tmp/install_bws.py && rm /tmp/install_bws.py
 
 COPY entrypoint.sh /entrypoint.sh
+# Ctrl-C is the runner's clean exit (it deletes its GitHub session); tini passes it on.
+STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
