@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""homeops-docker: the ONLY thing Hermes' homeops (on the Jetson) can run on the HP.
+
+Installed as an SSH forced command (authorized_keys: restrict,command="~/bin/homeops-docker"),
+so the key can do nothing else -- no shell, no forwarding. The client sends "<METHOD> <PATH>" as the
+SSH command; this script lets through exactly four Docker Engine API calls:
+
+  GET  /containers/json?all=1
+  GET  /containers/<name>/json
+  GET  /containers/<name>/logs?stdout=..&stderr=..&timestamps=..&tail=..&since=..
+  POST /containers/<name>/restart?t=30        only for RESTART_ALLOW, never gluetun
+
+and answers "STATUS <code>\\n<body>". Same restart allowlist as homeops itself (defence in depth).
+"""
+import http.client
+import os
+import re
+import socket
+import sys
+import urllib.parse
+
+RESTART_ALLOW = {"media-bridge", "jellyfin", "bazarr", "flaresolverr", "prowlarr", "sonarr", "radarr",
+                 "immich_server", "immich_machine_learning", "next-cloud-app-1"}
+NEVER = {"gluetun"}
+NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+LOG_KEYS = {"stdout", "stderr", "timestamps", "tail", "since"}
+
+
+class Unix(http.client.HTTPConnection):
+    def __init__(self, path, timeout=120):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._path)
+
+
+def deny(why):
+    sys.stdout.write(f"STATUS 403\n{why}")
+    sys.exit(0)
+
+
+def allowed(method, path):
+    u = urllib.parse.urlsplit(path)
+    q = urllib.parse.parse_qs(u.query)
+    if method == "GET" and u.path == "/containers/json" and u.query in ("", "all=1"):
+        return True
+    m = re.fullmatch(rf"/containers/({NAME})/(json|logs|restart)", u.path)
+    if not m:
+        return False
+    name, verb = m.groups()
+    if method == "GET" and verb == "json" and not u.query:
+        return True
+    if method == "GET" and verb == "logs":
+        return set(q) <= LOG_KEYS and all(re.fullmatch(r"[0-9a-z]{1,12}", v[0]) for v in q.values())
+    if method == "POST" and verb == "restart":
+        return name in RESTART_ALLOW and name not in NEVER and u.query in ("", "t=30")
+    return False
+
+
+def main():
+    cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    parts = cmd.split()
+    if len(parts) != 2 or parts[0] not in ("GET", "POST"):
+        deny("usage: GET|POST <docker api path>")
+    method, path = parts
+    if not allowed(method, path):
+        deny(f"not allowed: {method} {path}")
+    conn = Unix("/var/run/docker.sock")
+    try:
+        conn.request(method, path)
+        resp = conn.getresponse()
+        body = resp.read()
+    finally:
+        conn.close()
+    sys.stdout.buffer.write(f"STATUS {resp.status}\n".encode() + body)
+
+
+if __name__ == "__main__":
+    main()

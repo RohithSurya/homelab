@@ -9,7 +9,7 @@ run() { if "$@"; then echo "   ok"; else echo "   FAILED"; fails=$((fails + 1));
 
 step "shell scripts (shellcheck)"
 run docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0 -x -S warning \
-  deploy/*.sh infra/runner/*.sh
+  deploy/*.sh infra/runner/*.sh infra/hosts/*/*.sh
 
 step "GitHub workflows (actionlint)"
 run docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -no-color -oneline
