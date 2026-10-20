@@ -6,7 +6,7 @@ Every self-hosted stack, its deploy tooling and the pipeline that ships it. Each
 ## Machines
 | Machine | Role | Runs |
 |---|---|---|
-| HP Pro Mini 400 G9 — `10.0.0.64`, Tailscale `100.110.179.59`, x86-64, Intel Quick Sync | **prod** | media-server, immich, nextcloud (after their cutover) |
+| HP Pro Mini 400 G9 — `10.0.0.64`, Tailscale `100.110.179.59`, x86-64, Intel Quick Sync | **prod** | media-server, immich, nextcloud (cut over 2026-10-20) |
 | Jetson Orin Nano Super — `10.0.0.179`, arm64 | **dev** + public edge | exposer (Caddy/DuckDNS/fail2ban/CrowdSec); router forwards 443 here |
 | Router: GL.iNet Flint 2 (OpenWrt) `10.0.0.1` | | static leases, 443 → Jetson, AdGuard DNS |
 
@@ -46,6 +46,16 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
 - Only the owner's merges deploy (`github.actor` check). Manual run: Actions → deploy → Run workflow
   (`dry_run` defaults to true and also works for stacks not enabled yet).
 - Runners are containers (`gh-runner`, host network, host Docker socket) — `infra/runner/install.sh`.
+
+## Status (2026-10-20)
+- **Live on the HP via the pipeline:** nextcloud, immich, media-server (`deploy/targets` enabled).
+- **exposer** is still applied on the Jetson by hand (`~/exposer`, files copied from `stacks/exposer`);
+  enabling it needs a Jetson Bitwarden token that can read `EXPOSER__*`.
+- The Jetson keeps stopped copies of the old stacks (`~/media-server`, `~/immich`, `~/next-cloud`) as
+  rollback until the owner says to delete them. **Never `git pull` in `~/media-server`.**
+- Follow-ups: Hermes `homeops` still restarts media containers on the Jetson's Docker; the updater
+  (wud/approver) doesn't see the HP; KrazyZone needs a fresh login cookie (home IPv4 changed with
+  the Flint 2).
 
 ## Rules
 - Never run a BitTorrent client on any home machine, not even for tests (the ISP blocks the user).

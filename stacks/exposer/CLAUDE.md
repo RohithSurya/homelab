@@ -4,7 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-The **public edge** for every self-hosted stack on this Jetson Nano Super (aarch64). Off-the-shelf
+The **public edge** for every self-hosted stack, running on the Jetson Orin Nano Super (aarch64,
+`10.0.0.179`; the router forwards 443 here). Since 2026-10-20 the application stacks run on the **HP**
+(`10.0.0.64`), so Caddy proxies Jellyfin/Immich/Nextcloud to `10.0.0.64:8096/2283/8081` over the LAN,
+the fail2ban jellyfin + nextcloud jails read **Caddy's** access logs (their app logs are on the HP),
+`caddy/sites.d/jellyfin-lan.caddy` passes old LAN clients on `:8096` through, and the Jetson's own
+DIUN + autoheal live in this stack. Deployed by the homelab pipeline once `exposer` is enabled in
+`deploy/targets` (still applied by hand on the Jetson as of 2026-10-20). Off-the-shelf
 containers, no custom code — the one local build (`crowdsec-bouncer`) only wraps an official
 release binary:
 
