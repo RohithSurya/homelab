@@ -15,7 +15,6 @@
     "dependencies"
   ],
   "ignorePaths": [
-    "stacks/exposer/**",
     "**/tests/**",
     "infra/runner/**"
   ],
@@ -127,6 +126,13 @@
       "schedule": [
         "before 9am on monday"
       ]
+    },
+    {
+      "description": "duckdns uses git-sha tags (no order) -- left to DIUN",
+      "matchPackageNames": [
+        "lscr.io/linuxserver/duckdns"
+      ],
+      "enabled": false
     }
   ]
 }

@@ -9,8 +9,9 @@ The **public edge** for every self-hosted stack, running on the Jetson Orin Nano
 (`10.0.0.64`), so Caddy proxies Jellyfin/Immich/Nextcloud to `10.0.0.64:8096/2283/8081` over the LAN,
 the fail2ban jellyfin + nextcloud jails read **Caddy's** access logs (their app logs are on the HP),
 `caddy/sites.d/jellyfin-lan.caddy` passes old LAN clients on `:8096` through, and the Jetson's own
-DIUN + autoheal live in this stack. Deployed by the homelab pipeline once `exposer` is enabled in
-`deploy/targets` (still applied by hand on the Jetson as of 2026-10-20). Off-the-shelf
+DIUN + autoheal live in this stack. **Deployed by the homelab pipeline** to `/srv/homelab/exposer` on
+the Jetson (Jetson runner; secrets from Bitwarden `homelab-dev`, `EXPOSER__*`, via the `jetson-dev`
+machine account). Image updates come as Renovate PRs. `~/exposer` is the retired hand-run copy. Off-the-shelf
 containers, no custom code — the one local build (`crowdsec-bouncer`) only wraps an official
 release binary:
 
