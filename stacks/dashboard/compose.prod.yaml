@@ -1,0 +1,7 @@
+# Prod (HP): the disks the resources widget reports on, read-only.
+services:
+  homepage:
+    volumes:
+      - /mnt/media:/mnt/media:ro
+      - /mnt/photos:/mnt/photos:ro
+      - /mnt/backups:/mnt/backups:ro

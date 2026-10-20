@@ -31,6 +31,8 @@ case $stack in
       radarr sonarr prowlarr bazarr jellyfin media-bridge/config diun ;;
   exposer)
     tarc exposer-state.tgz caddy/data fail2ban crowdsec/config ;;
+  dashboard)
+    echo "dashboard config lives in git (stacks/dashboard/config); nothing to back up" > "$dest/README" ;;
   *) die "no backup recipe for $stack" ;;
 esac
 

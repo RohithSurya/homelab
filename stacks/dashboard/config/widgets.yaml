@@ -1,0 +1,17 @@
+- resources:
+    label: HP
+    cpu: true
+    memory: true
+- resources:
+    label: Media disk
+    disk: /mnt/media
+- resources:
+    label: Photos disk
+    disk: /mnt/photos
+- resources:
+    label: Backups disk
+    disk: /mnt/backups
+- datetime:
+    format:
+      dateStyle: medium
+      timeStyle: short

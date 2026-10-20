@@ -1,0 +1,58 @@
+# Home-only names: the dashboard and the admin apps, with real Let's Encrypt certificates
+# (public DuckDNS resolves *.home.rosurya.duckdns.org, so TLS-ALPN on :443 works) but answering
+# only LAN and Tailscale clients. At home AdGuard rewrites home.rosurya.duckdns.org and
+# *.home.rosurya.duckdns.org to 10.0.0.179 (no hairpin, real client IPs); away, Tailscale's split
+# DNS sends these names to AdGuard over the Jetson's subnet route. Anyone else gets 403.
+(home_only) {
+	@outside not remote_ip 10.0.0.0/24 100.64.0.0/10 fd00::/8 fe80::/10
+	respond @outside "Not available outside the home network" 403
+	import access_log home
+}
+
+home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:3010
+}
+
+radarr.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:7878
+}
+
+sonarr.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:8989
+}
+
+prowlarr.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:9696
+}
+
+bazarr.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:6767
+}
+
+# media-bridge status page (same server as the YouTube form, under /bridge)
+bridge.home.rosurya.duckdns.org {
+	import home_only
+	redir / /bridge
+	reverse_proxy 10.0.0.64:8003
+}
+
+youtube.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:8003
+}
+
+# the router (GL.iNet Flint 2, OpenWrt): AdGuard Home UI and LuCI
+adguard.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.1:3000
+}
+
+router.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.1:80
+}

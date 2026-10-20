@@ -1,0 +1,25 @@
+---
+name: dashboard   # pinned: container names must not depend on the checkout folder
+# Homepage: one start page for everything -- https://home.rosurya.duckdns.org (LAN + Tailscale only,
+# served by the Jetson's Caddy). Config is the YAML in ./config (in git); API keys come from
+# Bitwarden as HOMEPAGE_VAR_* (env.tpl). No Docker socket: it only calls the apps' APIs.
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:v2.5.0
+    container_name: homepage
+    restart: unless-stopped
+    ports:
+      - "3010:3000"
+    env_file:
+      - .env
+    environment:
+      - HOMEPAGE_ALLOWED_HOSTS=home.rosurya.duckdns.org,127.0.0.1:3010,10.0.0.64:3010,localhost:3000
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - ./config:/app/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
