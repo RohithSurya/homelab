@@ -40,6 +40,16 @@
   ],
   "packageRules": [
     {
+      "description": "Caddy: the exposer image builds with caddy:<v>-builder and runs on caddy:<v> (stacks/exposer/caddy/image/Dockerfile) -- both FROM lines must move in one PR",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "caddy"
+      ],
+      "groupName": "caddy"
+    },
+    {
       "description": "media-bridge stays on Python 3.12 until a deliberate upgrade (and its tests) moves it",
       "matchDatasources": [
         "docker"

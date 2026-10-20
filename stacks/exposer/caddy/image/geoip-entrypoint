@@ -1,0 +1,14 @@
+#!/bin/sh
+# Make sure the live country database exists, start the monthly refresher, then run Caddy.
+set -eu
+
+# An empty allow list makes the plugin let EVERYONE in, without an error. Refuse to start
+# instead: the deploy's `up --wait` then fails and the pipeline rolls back.
+if ! echo "${GEO_ALLOW_COUNTRIES:-}" | grep -Eq '^[A-Z]{2}( [A-Z]{2})*$'; then
+  echo "[geoip] GEO_ALLOW_COUNTRIES='${GEO_ALLOW_COUNTRIES:-}' is not a list like 'US IN'; refusing to start" >&2
+  exit 1
+fi
+
+geoip seed
+geoip refresher &
+exec "$@"

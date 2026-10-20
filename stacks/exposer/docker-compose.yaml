@@ -24,22 +24,32 @@ services:
   # Vhosts live one-per-file in caddy/sites.d/ (imported by caddy/Caddyfile).
   # TLS: automatic Let's Encrypt. Port 80 is blocked by Comcast, so issuance
   # happens over TLS-ALPN-01 on :443 (Caddy falls back to it automatically).
+  #
+  # Built locally: stock Caddy + the country filter plugin + a baked DB-IP database
+  # (caddy/image/Dockerfile; the Caddy version is the FROM tags there, which Renovate bumps).
   caddy:
-    image: caddy:2.11.7                           # pinned: step versions deliberately (see ~/updater)
+    build: ./caddy/image
+    image: caddy-geo-local
     container_name: caddy
     network_mode: host                           # reach every backend on 127.0.0.1; own host :80/:443
+    init: true                                   # reaps the geoip refresher's children (wget, gunzip)
+    environment:
+      # Countries the public vhosts accept (ISO codes, space-separated). LAN + Tailscale always pass.
+      # Read by the Caddyfile's (geo_filter) and by `docker exec caddy geoip`. Abroad and locked
+      # out? See "Geo filter" in CLAUDE.md before editing this.
+      - GEO_ALLOW_COUNTRIES=US IN
     labels:
-      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
-      - 'updater.policy=approve'
       # autoheal lives in the media-server stack but matches by LABEL across all
       # compose projects, so it still restarts this container when it goes unhealthy.
       - "autoheal=true"
+      - "diun.enable=false"                       # local build: no registry to check
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/sites.d:/etc/caddy/sites.d:ro     # one .caddy file per exposed service
       - ./caddy/data:/data                        # Let's Encrypt certs + ACME account (KEEP: losing this re-issues)
       - ./caddy/config:/config                    # caddy's autosaved JSON config
       - ./caddy/logs:/var/log/caddy               # access logs (the fail2ban immich jail tails these)
+      - ./caddy/geoip:/geoip                      # live country database (seeded from the image, refreshed monthly)
     healthcheck:                                  # caddy admin API (localhost:2019) = process alive
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:2019/config/"]
       interval: 30s

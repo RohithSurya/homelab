@@ -1,0 +1,110 @@
+#!/bin/sh
+# geoip — the edge country filter's helper. Run it as `docker exec caddy geoip <command>`.
+#
+#   geoip <ip> [<ip>...]   country of each IP and whether the filter lets it in
+#   geoip blocked [N]      the last N (default 20) requests the filter refused, from Caddy's logs
+#   geoip audit            every client IP in Caddy's logs: country, allowed or not, request count
+#   geoip info             live database, its month, and the allowed countries
+#   geoip refresh          download this month's database now and reload Caddy
+#
+# Internal (used by the image): seed, refresher, verify.
+#
+# Allowed countries come from GEO_ALLOW_COUNTRIES (compose), the same variable the
+# Caddyfile reads, so this tool and Caddy can never disagree.
+set -eu
+
+DB=${GEOIP_DB:-/geoip/country.mmdb}
+BAKED=/usr/share/geoip/country.mmdb
+ALLOW=${GEO_ALLOW_COUNTRIES:-US IN}
+LOGS=/var/log/caddy
+
+log() { echo "[geoip] $*" >&2; }
+
+country() {  # country code of $1 in $2 (default: live db), or UNK
+  c=$(mmdblookup --file "${2:-$DB}" --ip "$1" country iso_code 2>/dev/null | sed -n 's/.*"\(..\)".*/\1/p')
+  echo "${c:-UNK}"
+}
+
+private() {  # the ranges the Caddyfile always lets in (LAN, loopback, Tailscale)
+  case "$1" in
+    10.*|127.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+    ::1|fd*|fe80:*) return 0 ;;
+  esac
+  return 1
+}
+
+verdict() {
+  if private "$1"; then echo "LAN/Tailscale (always allowed)"; return; fi
+  c=$(country "$1")
+  for a in $ALLOW; do [ "$a" = "$c" ] && { echo "$c allowed"; return; }; done
+  echo "$c BLOCKED (allowed: $ALLOW)"
+}
+
+verify() {  # a database must answer known US and Indian addresses before it goes live
+  f=${1:-$DB}
+  [ -s "$f" ] || { log "verify: $f missing or empty"; return 1; }
+  us=$(country 8.8.8.8 "$f"); in=$(country 49.36.0.1 "$f")
+  [ "$us" = US ] && [ "$in" = IN ] || { log "verify: $f answers 8.8.8.8=$us 49.36.0.1=$in (want US, IN)"; return 1; }
+}
+
+alllogs() {  # current + rolled Caddy access logs
+  cat "$LOGS"/*.log 2>/dev/null || true
+  for g in "$LOGS"/*.gz; do [ -e "$g" ] && zcat "$g"; done 2>/dev/null || true
+}
+
+month_of() { cat "$(dirname "$1")/month" 2>/dev/null || echo unknown; }
+
+refresh() {  # download this month's database (or last month's), verify, swap, reload Caddy
+  m=$(date -u +%Y-%m)
+  tmp=$(mktemp -d /geoip/.new.XXXXXX)
+  if wget -q -T 60 -O "$tmp/db.gz" "https://download.db-ip.com/free/dbip-country-lite-$m.mmdb.gz" \
+     && gunzip -c "$tmp/db.gz" > "$tmp/country.mmdb" && verify "$tmp/country.mmdb"; then
+    mv "$tmp/country.mmdb" /geoip/country.mmdb.next && mv /geoip/country.mmdb.next "$DB"
+    echo "$m" > /geoip/month
+    rm -rf "$tmp"
+    # the plugin keeps the old file open until its config is reloaded; --force reloads
+    # even though the Caddyfile itself didn't change
+    if caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force >/dev/null 2>&1; then
+      log "database updated to $m, Caddy reloaded"
+    else
+      log "database updated to $m, but the Caddy reload failed (it takes effect on the next restart)"
+    fi
+  else
+    rm -rf "$tmp"
+    log "refresh to $m failed; keeping $(month_of "$DB")"
+    return 1
+  fi
+}
+
+case "${1:-}" in
+  seed)
+    mkdir -p /geoip
+    if verify "$DB" 2>/dev/null; then exit 0; fi
+    cp "$BAKED" "$DB.next" && mv "$DB.next" "$DB" && cp /usr/share/geoip/month /geoip/month
+    log "live database seeded from the image ($(cat /geoip/month))" ;;
+  refresher)
+    sleep 120   # let Caddy start first
+    while :; do
+      [ "$(month_of "$DB")" = "$(date -u +%Y-%m)" ] || refresh || true
+      sleep 21600
+    done ;;
+  verify) verify "${2:-$DB}" ;;
+  refresh) refresh ;;
+  info)
+    echo "database:  $DB ($(month_of "$DB"), DB-IP country lite)"
+    echo "allowed:   $ALLOW  + LAN 10/8 172.16/12 192.168/16, loopback, Tailscale 100.64/10"
+    echo "self-test: 8.8.8.8=$(country 8.8.8.8) 49.36.0.1=$(country 49.36.0.1)" ;;
+  blocked)
+    n=${2:-20}
+    alllogs \
+      | jq -r 'select(.resp_headers["X-Blocked-By"] == ["geo"])
+               | "\(.ts | if type=="number" then todate else . end)  \(.request.client_ip)  \(.request.host)\(.request.uri)"' \
+      | sort | tail -n "$n" \
+      | while read -r ts ip rest; do echo "$ts  $ip $(country "$ip")  $rest"; done ;;
+  audit)
+    alllogs | jq -r '.request.client_ip // empty' | sort | uniq -c | sort -rn \
+      | while read -r n ip; do printf '%6s  %-40s %s\n' "$n" "$ip" "$(verdict "$ip")"; done ;;
+  ''|-h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) for ip in "$@"; do echo "$ip  $(verdict "$ip")"; done ;;
+esac
