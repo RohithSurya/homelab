@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# backup.sh <stack> <deploy dir> [sha]: what a rollback (or a bad day) needs, taken from the
-# running stack before every deploy. Keeps the newest $BACKUP_KEEP per stack.
+# backup.sh <stack> <deploy dir> [sha|nightly]: what a rollback (or a bad day) needs, taken from
+# the running stack before every deploy and nightly (.github/workflows/nightly.yml). Keeps the
+# newest $BACKUP_KEEP per stack. Jellyfin's artwork (data/metadata, ~2.7 GB) is re-downloadable
+# and left out.
 # Files are read through a throwaway root container: some state is owned by root/www-data.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -24,7 +26,7 @@ case $stack in
       > "$dest/nextcloud-config.tgz" ;;
   media-server)
     tarc media-server-config.tgz \
-      --exclude=jellyfin/config/cache --exclude=jellyfin/config/metadata \
+      --exclude=jellyfin/config/cache --exclude=jellyfin/config/data/metadata \
       --exclude=jellyfin/config/data/transcodes --exclude='*/logs' --exclude='*/log' \
       radarr sonarr prowlarr bazarr jellyfin media-bridge/config diun ;;
   exposer)
