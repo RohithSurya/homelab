@@ -1,0 +1,108 @@
+# Links use the friendly names (Caddy on the Jetson, LAN + Tailscale only); widgets talk to the
+# apps directly on the HP's LAN address.
+- Watch:
+    - Jellyfin:
+        icon: jellyfin.png
+        href: https://jellyfin.rosurya.duckdns.org
+        description: Movies and TV
+        widget:
+          type: jellyfin
+          url: http://10.0.0.64:8096
+          key: "{{HOMEPAGE_VAR_JELLYFIN_KEY}}"
+          enableBlocks: true
+          enableNowPlaying: true
+    - Downloads:
+        icon: mdi-download-network
+        href: https://bridge.home.rosurya.duckdns.org
+        description: Seedbox / Seedr bridge
+        widget:
+          type: customapi
+          url: http://10.0.0.64:8003/bridge/status.json
+          refreshInterval: 30000
+          mappings:
+            - field: active
+              label: Downloading
+              format: size
+            - field: waiting
+              label: Waiting
+              format: size
+            - field: holds
+              label: Seeding
+              format: size
+    - YouTube grabber:
+        icon: youtube.png
+        href: https://youtube.home.rosurya.duckdns.org
+        description: Pull a full movie from YouTube into Radarr
+- Media automation:
+    - Radarr:
+        icon: radarr.png
+        href: https://radarr.home.rosurya.duckdns.org
+        description: Movies
+        widget:
+          type: radarr
+          url: http://10.0.0.64:7878
+          key: "{{HOMEPAGE_VAR_RADARR_KEY}}"
+    - Sonarr:
+        icon: sonarr.png
+        href: https://sonarr.home.rosurya.duckdns.org
+        description: TV
+        widget:
+          type: sonarr
+          url: http://10.0.0.64:8989
+          key: "{{HOMEPAGE_VAR_SONARR_KEY}}"
+    - Prowlarr:
+        icon: prowlarr.png
+        href: https://prowlarr.home.rosurya.duckdns.org
+        description: Indexers
+        widget:
+          type: prowlarr
+          url: http://10.0.0.64:9696
+          key: "{{HOMEPAGE_VAR_PROWLARR_KEY}}"
+    - Bazarr:
+        icon: bazarr.png
+        href: https://bazarr.home.rosurya.duckdns.org
+        description: Subtitles
+        widget:
+          type: bazarr
+          url: http://10.0.0.64:6767
+          key: "{{HOMEPAGE_VAR_BAZARR_KEY}}"
+- Photos & files:
+    - Immich:
+        icon: immich.png
+        href: https://immich.rosurya.duckdns.org
+        description: Photos
+        widget:
+          type: immich
+          url: http://10.0.0.64:2283
+          key: "{{HOMEPAGE_VAR_IMMICH_KEY}}"
+          version: 2
+    - Nextcloud:
+        icon: nextcloud.png
+        href: https://nextcloud.rosurya.duckdns.org
+        description: Files
+- Home & network:
+    - Home Assistant:
+        icon: home-assistant.png
+        href: https://ha.rosurya.duckdns.org
+        description: Home automation
+    - AdGuard:
+        icon: adguard-home.png
+        href: https://adguard.home.rosurya.duckdns.org
+        description: DNS filtering (router)
+    - Router:
+        icon: openwrt.png
+        href: https://router.home.rosurya.duckdns.org
+        description: GL.iNet Flint 2 (OpenWrt)
+- Homelab:
+    - GitHub repo:
+        icon: github.png
+        href: https://github.com/RohithSurya/homelab
+        description: Code + pipeline
+    - Deploys:
+        icon: mdi-rocket-launch
+        href: https://github.com/RohithSurya/homelab/actions
+        description: CI, deploys, nightly backups
+    - Updates:
+        icon: mdi-update
+        href: https://github.com/RohithSurya/homelab/issues/20
+        description: Renovate dependency dashboard

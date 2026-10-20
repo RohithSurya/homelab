@@ -37,6 +37,8 @@ case $stack in
   nextcloud)
     nc_ok() { local s; s=$(get http://127.0.0.1:8081/status.php); echo "$s" | grep -q '"installed":true' && echo "$s" | grep -q '"maintenance":false'; }
     check "nextcloud status.php" nc_ok ;;
+  dashboard)
+    check "homepage answers" has http://127.0.0.1:3010/api/healthcheck up ;;
   exposer)
     check "caddy config valid" docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
     check "fail2ban answers"   docker exec fail2ban fail2ban-client ping

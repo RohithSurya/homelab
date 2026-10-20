@@ -1,0 +1,19 @@
+title: Home
+headerStyle: clean
+layout:
+  Watch:
+    style: row
+    columns: 3
+  Media automation:
+    style: row
+    columns: 4
+  Photos & files:
+    style: row
+    columns: 2
+  Home & network:
+    style: row
+    columns: 3
+  Homelab:
+    style: row
+    columns: 3
+hideVersion: true
