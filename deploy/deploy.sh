@@ -81,7 +81,13 @@ if dc config --services | grep -qx gluetun; then
   fi
 fi
 
-# 6. checks
+# 6. stack hook: services that only re-read bind-mounted config on reload (exposer: Caddy, fail2ban)
+if [ -x "$dir/post-deploy.sh" ]; then
+  log "running $stack/post-deploy.sh"
+  "$dir/post-deploy.sh"
+fi
+
+# 7. checks
 "$DEPLOY_DIR_SELF/smoke.sh" "$stack"
 
 [ -f "$dir/.deployed" ] && cp "$dir/.deployed" "$dir/.previous"
