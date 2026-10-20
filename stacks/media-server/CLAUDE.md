@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on a
-**Jetson Nano Super (aarch64)**. Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
+A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on the
+**HP Pro Mini 400 G9 (x86-64, `10.0.0.64`)** since 2026-10-20 (Jetson Orin Nano Super before). Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
 `media-bridge/` (five responsibilities in one container: blackhole bridge (Seedr/seedbox backends) + jellyfin-reaper + movierulz
 scraper/Torznab feed + tamilmv scraper/Torznab feed + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
@@ -18,6 +18,27 @@ restartable. Jellyfin needs nothing here to be reachable at `jellyfin.rosurya.du
 Caddy proxies to `127.0.0.1:8096` (Jellyfin is `network_mode: host`) and exposer's fail2ban tails
 `./jellyfin/config/log` by absolute path. To change how Jellyfin is exposed, edit
 `~/exposer/caddy/sites.d/jellyfin.caddy` — see `~/exposer/CLAUDE.md`.
+
+## Where it runs (since 2026-10-20)
+
+Deployed by the **homelab pipeline** (repo root `CLAUDE.md`): merge to `main` → GitHub Actions on the
+HP runner → `deploy/deploy.sh media-server` (render `.env` from Bitwarden, backup, build, `up --wait`,
+gluetun rule, smoke checks, auto-rollback). On the HP the stack lives in **`/srv/homelab/media-server`**
+(code + app state on NVMe); compose runs with `compose.prod.yaml` + `env/prod.env`.
+- `data/` = **`/mnt/media/data`** (USB HDD, 2 TB partition) — `DATA_ROOT`/`DATA_HOST_PATH`.
+- **Old movies stay on the Jetson**: `data/media/movies` and `movies-private` are the Jetson's folders
+  over **NFSv3** (automount, `soft` — an unreachable Jetson is an error, never an empty folder; `/data`
+  is bound `rslave` so the mount shows inside containers). **New movies** go to `movies-new` /
+  `movies-private-new` on the HP (Radarr root folders 3/4; Hermes' mediaops adds to `movies-new`;
+  Jellyfin's Movies/Private libraries hold both folders). The reaper still deletes old ones over NFS.
+- **Jellyfin uses Intel Quick Sync** (`/dev/dri`, QSV decode H.264/HEVC/HEVC-10/VP9/AV1, encode
+  H.264/HEVC low-power, VPP/VA-API tone-mapping; 4K HDR → 1080p ≈ 250 fps). `KnownProxies` =
+  127.0.0.1 + **10.0.0.179** (the Jetson's Caddy).
+- Public reach is unchanged: router 443 → **Jetson** Caddy → `10.0.0.64:8096`; the Jetson also passes
+  LAN `http://10.0.0.179:8096` through for old clients. fail2ban (on the Jetson) reads **Caddy's**
+  jellyfin log now, not Jellyfin's.
+- Below, "the Jetson" in historical notes means the box the stack ran on before; the commands are
+  the same on the HP (run them in `/srv/homelab/media-server`, or let the pipeline do it).
 
 ## Commands
 
@@ -78,7 +99,7 @@ bind the login cookie to the IP it was issued to: **KrazyZone** (no opt-out; its
 "Remember Me") answers the VPN exit IP with an empty 200 + `Refresh: account-login.php` +
 `Set-Cookie: pass=deleted`, which Prowlarr reports as "Redirected to …account-login.php". Since the
 browser login happens from the home IPv4, those indexers go through this proxy: Prowlarr indexer proxy
-`home-egress` (HTTP `10.0.0.179:8006`) + tag `home-egress` on the indexer — Prowlarr only proxies
+`home-egress` (HTTP `10.0.0.64:8006`; `10.0.0.179` before the HP move) + tag `home-egress` on the indexer — Prowlarr only proxies
 indexers that carry the tag. Everything else stays on the VPN. Guards: `home-egress/filter` is a
 destination allowlist (`FilterDefaultDeny`; `prowlarr.servarr.com` is on it because Prowlarr won't save or
 health-check a proxy that can't reach it), and `Allow 172.16.0.0/12` admits only docker-bridge sources
@@ -268,7 +289,7 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
   force-imported, so files get real names. If a site's episode numbering never matches TVDB, the nudge
   repeats hourly until the release is 3 days old, then stops.
 
-- **Status page** (`bridgeweb.py`) on the youtube server: `http://10.0.0.179:8003/bridge` (HTML, 30s refresh),
+- **Status page** (`bridgeweb.py`) on the youtube server: `http://10.0.0.64:8003/bridge` (HTML, 30s refresh),
   `/bridge/status.json`, `/bridge/transfer/<tid>` (timeline). Same process as the bridge, so it reads the
   pull worker's jobs and each backend's last poll snapshot — rendering never calls Seedr or the seedbox.
   Shows where each transfer is + until when (qBit eta, else the bridge's own rate; pull ETA from staged
@@ -508,7 +529,7 @@ generic Torznab indexer for Prowlarr (no public indexer carries the site).
   `<item>` MUST carry a `<pubDate>` (Prowlarr drops items without it) and emits a configurable
   `FAKE_SEEDERS` (movierulz exposes no seeders) so Radarr/Sonarr minimum-seeders doesn't filter everything.
 - **Prowlarr wiring**: add as a generic Torznab indexer, `apiPath=/api`, apiKey `= MOVIERULZ_APIKEY`,
-  baseUrl **`http://10.0.0.179:8002/torznab`** — the reserved Ethernet IP, NOT `media-bridge:8002`.
+  baseUrl **`http://10.0.0.64:8002/torznab`** — the host's reserved LAN IP (the HP's since 2026-10-20), NOT `media-bridge:8002`.
   Prowlarr lives in gluetun's netns, and gluetun resolves DNS itself (`DNS_ADDRESS=9.9.9.9`), not via
   Docker's embedded resolver, so **container names do not resolve** there (the `172.17.0.1` bridge
   gateway is unreachable too); the LAN IP works because `FIREWALL_OUTBOUND_SUBNETS` allows 10.0.0.0/24.
@@ -672,7 +693,7 @@ Prowlarr.
   passes to Radarr/Sonarr — click the release title) is **`TAMILMV_PUBLIC_URL/t/<site>/<topic id>`**
   (`#l<lid>` highlights the link): the direct links, the live tamilmv link (current domain from meta
   `base:<site>`), the topic's torrents, and the **saved copy** of the posts. `TAMILMV_PUBLIC_URL` is the
-  **Tailscale address** `http://100.122.87.20:8005` (Radarr/Sonarr are used the same way at home and
+  **Tailscale address** of the host (`http://100.110.179.59:8005`, the HP; `TAMILMV_PUBLIC_URL` in `env/prod.env`) (Radarr/Sonarr are used the same way at home and
   away; the Jetson does not advertise `10.0.0.0/24`, so a LAN-IP link would break away from home). The
   page is scraped content: `sanitize` strips scripts/iframes/handlers/`javascript:` and a strict CSP
   (`default-src 'none'`, no images — they'd tell image hosts who is looking) makes script impossible.
@@ -714,7 +735,7 @@ Prowlarr.
   `?downloadId=…&seriesId=…`, which returns the series' already-imported library files). Files get
   `TBA` names; Series → Rename Files fixes them once TVDB has titles.
 - **Prowlarr wiring**: generic Torznab indexer, `apiPath=/api`, apiKey `= TAMILMV_APIKEY`, baseUrl
-  **`http://10.0.0.179:8005/torznab`** (LAN IP, not `media-bridge:8005` — container names don't resolve in
+  **`http://10.0.0.64:8005/torznab`** (LAN IP, not `media-bridge:8005` — container names don't resolve in
   gluetun's netns; see movierulz's Prowlarr wiring). Querying it hits the local sqlite only (no CF), so keeping RSS
   enabled on this indexer is cheap — the CF cost is entirely in the background crawler.
 - **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`match_rank`,
@@ -760,7 +781,7 @@ that no indexer carries (e.g. Vaaranam Aayiram's Telugu dub "Surya S/o Krishnan"
   whole tail and bury the one `ERROR:` line the UI and ntfy show.
 - **Queue/resume:** jobs live in `config/youtube.db` (sqlite); one download at a time. A restart mid-job
   resets `downloading → queued` and yt-dlp `--continue` resumes the partial. `[youtube]` log tag.
-- **Usage:** open `http://10.0.0.179:8003/` (the reserved Ethernet IP; it also answers on the Wi-Fi address), pick a Radarr movie from the dropdown (add it in Radarr
+- **Usage:** open `http://10.0.0.64:8003/` (the HP), pick a Radarr movie from the dropdown (add it in Radarr
   first if missing), paste the YouTube URL, Queue. The form also lists recent job status, with a **retry**
   button on failed rows (`POST /retry` → `requeue()`, which clears the error and sets `queued`; guarded to
   `status='failed'` so a finished movie is never re-downloaded). `:8003` is an **unauthenticated LAN
