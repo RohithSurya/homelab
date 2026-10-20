@@ -9,8 +9,7 @@ DB_DATA_LOCATION={{vault:IMMICH__DB_DATA_LOCATION}}
 # Timezone (matches the rest of the media-server stack).
 TZ={{vault:IMMICH__TZ}}
 
-# Pin the major version; DIUN notifies on new images and you update deliberately.
-IMMICH_VERSION={{vault:IMMICH__IMMICH_VERSION}}
+# IMMICH_VERSION lives in env/prod.env (not a secret; Renovate updates it there by PR).
 
 # Database credentials (alphanumeric password — Immich rejects special characters here).
 DB_PASSWORD={{vault:IMMICH__DB_PASSWORD}}

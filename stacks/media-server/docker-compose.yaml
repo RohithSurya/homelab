@@ -1,6 +1,5 @@
-name: media-server   # pinned: container/volume names must not depend on the checkout folder
-
 ---
+name: media-server   # pinned: container/volume names must not depend on the checkout folder
 # Per-service log rotation (mirrors the global default in /etc/docker/daemon.json,
 # but applies immediately to services that carry it, without a daemon restart).
 x-logging: &default-logging

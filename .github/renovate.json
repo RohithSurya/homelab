@@ -1,0 +1,132 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+  "description": "Image and action updates arrive as PRs; CI tests them, and the owner's merge deploys them (deploy.yml only deploys owner merges, so nothing here auto-merges).",
+  "timezone": "America/New_York",
+  "schedule": [
+    "after 7am and before 11pm"
+  ],
+  "prConcurrentLimit": 6,
+  "labels": [
+    "dependencies"
+  ],
+  "ignorePaths": [
+    "stacks/exposer/**",
+    "**/tests/**",
+    "infra/runner/**"
+  ],
+  "docker-compose": {
+    "managerFilePatterns": [
+      "/(^|/)docker-compose\\.ya?ml$/",
+      "/(^|/)compose\\.[a-z]+\\.ya?ml$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Immich release pinned in stacks/immich/env/prod.env",
+      "managerFilePatterns": [
+        "/^stacks/immich/env/prod\\.env$/"
+      ],
+      "matchStrings": [
+        "IMMICH_VERSION=(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "ghcr.io/immich-app/immich-server",
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "media-bridge stays on Python 3.12 until a deliberate upgrade (and its tests) moves it",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "python"
+      ],
+      "allowedVersions": "/^3\\.12/"
+    },
+    {
+      "description": "LinuxServer tags: <app version>-ls<build>",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "lscr.io/linuxserver/radarr",
+        "lscr.io/linuxserver/sonarr",
+        "lscr.io/linuxserver/prowlarr"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)\\.(?<build>\\d+)-ls(?<revision>\\d+)$"
+    },
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "lscr.io/linuxserver/bazarr"
+      ],
+      "versioning": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-ls(?<build>\\d+)$"
+    },
+    {
+      "description": "Jellyfin dated builds (12.2.20261005-225228); its DB migrations are one-way, so every bump is a reviewed PR",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "jellyfin/jellyfin"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d{8})-(?<build>\\d{6})$"
+    },
+    {
+      "description": "Nextcloud can't skip a major (34 -> 35 -> 36): one major per PR",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "nextcloud"
+      ],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)-apache$",
+      "separateMultipleMajor": true
+    },
+    {
+      "description": "MariaDB stays on the 10.11 LTS line; a new LTS is a deliberate move",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "mariadb"
+      ],
+      "allowedVersions": "/^10\\.11\\./"
+    },
+    {
+      "description": "Immich: server + ML + its postgres together, never a major without reading the notes",
+      "matchPackageNames": [
+        "ghcr.io/immich-app/**"
+      ],
+      "groupName": "immich"
+    },
+    {
+      "description": "Digest-pinned helper images (valkey, Immich's postgres) and autoheal's moving :latest are left to their maintainers' cadence",
+      "matchPackageNames": [
+        "willfarrell/autoheal",
+        "docker.io/valkey/valkey",
+        "ghcr.io/immich-app/postgres"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "GitHub Actions: one weekly PR",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "github actions",
+      "schedule": [
+        "before 9am on monday"
+      ]
+    }
+  ]
+}
