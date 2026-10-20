@@ -206,7 +206,9 @@ class ExtractTest(unittest.TestCase):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.fake = self.tmp / "fake-unrar"
         # fake unrar: "x -o+ -y -idq <first> <dest>/" -> writes <dest>/<stem>.mkv, or fails for "bad"
-        self.fake.write_text("#!/bin/sh\ncase \"$5\" in *bad*) echo 'CRC failed' >&2; exit 3;; esac\n"
+        # match on the archive's FILE name only: the full path holds a random temp-dir name,
+        # which now and then contains "bad" and made this test fail at random (CI run 39393448852)
+        self.fake.write_text("#!/bin/sh\ncase \"$(basename \"$5\")\" in *bad*) echo 'CRC failed' >&2; exit 3;; esac\n"
                              "n=$(basename \"$5\"); n=${n%.rar}; n=${n%.part01}\nprintf movie > \"$6$n.mkv\"\n")
         self.fake.chmod(0o755)
 
