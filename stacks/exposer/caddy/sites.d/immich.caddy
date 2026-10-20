@@ -7,5 +7,5 @@
 immich.rosurya.duckdns.org {
 	import security_headers
 	import access_log immich
-	reverse_proxy 127.0.0.1:2283
+	reverse_proxy 10.0.0.64:2283   # Immich runs on the HP (homelab pipeline)
 }

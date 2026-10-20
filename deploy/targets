@@ -2,6 +2,6 @@
 # A stack is switched on in its cutover PR (Phase 4), so merging can never start a half-moved stack.
 # stack         host     env    enabled
 media-server    hp       prod   no
-immich          hp       prod   no
+immich          hp       prod   yes
 nextcloud       hp       prod   yes
 exposer         jetson   prod   no

@@ -1,6 +1,7 @@
 # Immich — self-hosted photo/video library (Google Photos alternative).
 # Standalone stack (like ../next-cloud), separate from the media-server compose.
-# Public reach is via the media-server Caddy (immich.rosurya.duckdns.org -> 127.0.0.1:2283).
+# Public reach is via the exposer Caddy on the Jetson (immich.rosurya.duckdns.org -> 10.0.0.64:2283
+# since 2026-10-20, when Immich moved to the HP; compose.prod.yaml + env/prod.env hold the HP settings).
 # The raw port is bound to loopback only (never 0.0.0.0), matching the media-bridge
 # hardening convention, so it stays off the public internet even if the router forward changes.
 #
