@@ -21,3 +21,6 @@ crowdsec/data/
 
 # DIUN state (bolt db of seen digests)
 diun/
+
+# Live country database for the geo filter (downloaded at runtime by the caddy image)
+caddy/geoip/

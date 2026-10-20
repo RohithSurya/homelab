@@ -77,3 +77,7 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
 - Never run a BitTorrent client on any home machine, not even for tests (the ISP blocks the user).
 - A stack is moved to the HP by its own cutover PR, which sets `enabled=yes` in `deploy/targets`.
 - Port 443 is the only thing forwarded from the internet; keep every other port LAN/Tailscale-only.
+- Public vhosts answer only clients in the **US and India** (plus LAN + Tailscale): Caddy's geo filter,
+  `GEO_ALLOW_COUNTRIES` in `stacks/exposer/docker-compose.yaml`. Every new public vhost must
+  `import geo_filter`. Locked out abroad → "Geo filter" in `stacks/exposer/CLAUDE.md`
+  (`docker exec caddy geoip blocked`, Tailscale + LAN addresses, how to allow a country).

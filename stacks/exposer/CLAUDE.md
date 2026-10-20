@@ -12,12 +12,12 @@ the old LAN pass-through on `:8096` was removed on 2026-10-20 (clients use the p
 DIUN + autoheal live in this stack. **Deployed by the homelab pipeline** to `/srv/homelab/exposer` on
 the Jetson (Jetson runner; secrets from Bitwarden `homelab-dev`, `EXPOSER__*`, via the `jetson-dev`
 machine account). Image updates come as Renovate PRs. `~/exposer` is the retired hand-run copy. Off-the-shelf
-containers, no custom code — the one local build (`crowdsec-bouncer`) only wraps an official
-release binary:
+containers, no custom code — two local builds: `crowdsec-bouncer` only wraps an official
+release binary, and `caddy` is stock Caddy + one plugin for the country filter (see *Geo filter*):
 
 | service | role |
 |---|---|
-| `caddy` | TLS termination (Let's Encrypt) + reverse proxy; owns host `:80`/`:443` |
+| `caddy` | TLS termination (Let's Encrypt) + reverse proxy + **US/India-only geo filter**; owns host `:80`/`:443` |
 | `duckdns` | keeps `rosurya.duckdns.org` pointed at the dynamic Comcast WAN IP |
 | `fail2ban` | tails the public-facing auth logs and bans brute-forcers via host iptables |
 | `crowdsec` | reads Caddy's access logs for scans/probes/CVE attempts; pulls the community blocklist |
@@ -46,14 +46,90 @@ docker exec crowdsec cscli decisions list     # local bans (add -a to include th
 docker exec crowdsec cscli alerts list        # what triggered them
 docker exec crowdsec cscli decisions delete --ip 1.2.3.4
 docker exec crowdsec cscli metrics show acquisition   # is it actually reading the Caddy logs?
+docker exec caddy geoip blocked 50            # last 50 requests the geo filter refused
+docker exec caddy geoip 1.2.3.4               # country of an IP + allowed or not
 ```
 
 Validate a Caddyfile edit *without* touching the running server:
 
 ```bash
-docker run --rm -v ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro -v ./caddy/sites.d:/etc/caddy/sites.d:ro \
-  caddy:latest caddy validate --config /etc/caddy/Caddyfile
+docker run --rm -e GEO_ALLOW_COUNTRIES="US IN" -v ./caddy:/etc/caddy:ro \
+  caddy-geo-local caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 ```
+
+(Stock `caddy:*` images can't validate it any more: they don't know `maxmind_geolocation`.)
+
+## Geo filter: public vhosts answer only the US and India
+
+**Rule (since 2026-10-20): every public vhost (`jellyfin`, `immich`, `nextcloud`, `ha`) serves only
+clients that geolocate to `GEO_ALLOW_COUNTRIES` — `US IN` — plus LAN (10/8, 172.16/12,
+192.168/16), loopback and Tailscale (100.64/10), which always pass.** Everyone else gets a plain
+`403 Not available from your location (your IP: x.x.x.x). [geo filter]` with the response
+header `X-Blocked-By: geo`. The `*.home.rosurya.duckdns.org` names are stricter still
+(`home_only`: LAN + Tailscale only) and don't use it; the plain-HTTP short names are LAN-only.
+
+How it works:
+- `(geo_filter)` in `caddy/Caddyfile`, imported first in each public site file. **A new public
+  vhost must `import geo_filter`** — CI fails a site file that imports `security_headers` more
+  often than `geo_filter`.
+- The list lives in ONE place: `GEO_ALLOW_COUNTRIES` in `docker-compose.yaml` (caddy service).
+  The Caddyfile reads it as `{$GEO_ALLOW_COUNTRIES}`, and so does the `geoip` helper. An empty or
+  malformed list would make the plugin **let everyone in silently**, so the container refuses to
+  start instead (`geoip-entrypoint`), and the deploy rolls back.
+- Plugin: `porech/caddy-maxmind-geolocation`, built in by `caddy/image/Dockerfile` (xcaddy).
+  It's pinned to a **commit**, because its `v1.0.0` tag was moved after release and Go's checksum
+  database rejects it. Never bypass that check.
+- Database: **DB-IP "IP to Country Lite"** (free, CC BY 4.0, no account, monthly). A copy is
+  baked into the image so Caddy always starts, even offline. The live copy is
+  `caddy/geoip/country.mmdb` (gitignored). The container's refresher downloads each new month's
+  file, checks that it maps 8.8.8.8 → US and 49.36.0.1 → IN, swaps it in, then runs
+  `caddy reload --force`. The plugin keeps the old file open until a reload.
+- **Fails closed**: if the database can't be read, every non-LAN/Tailscale client is refused.
+  A geo 403 for *everyone*, US included, means `docker exec caddy geoip info` / `geoip verify`.
+- Certificate renewal is unaffected: TLS-ALPN-01 completes in the TLS handshake, before any
+  HTTP handler runs, so Let's Encrypt's validators abroad still get through.
+- **CrowdSec ignores geo 403s** (third rule in `crowdsec/parsers/edge-apps-whitelist.yaml`,
+  keyed on that header). Otherwise a phone app retrying 10× in 10 s would trip `http-probing` and
+  turn the readable 403 into a silent firewall ban. fail2ban never sees them either: refused
+  requests never reach a login.
+- Nextcloud's `.well-known` `redir`s run before `respond` (Caddy's directive order), so a refused
+  client can still get those 301s. They only point back at the same host, which then 403s.
+- The test run on 2026-10-20, over every Caddy log back to late July: every successful login came
+  from the US or the LAN except one — Safari on an iPhone with **iCloud Private Relay**, whose
+  relay address (`172.225.236.249`) DB-IP places in Greenland. Everything else refused was scanners
+  (`/wp-config.php~`, `/actuator/heapdump`, …).
+
+### Abroad and something doesn't load — debug it in this order
+
+1. **Is it the geo filter?** Open the site in a browser. The geo filter's 403 page says
+   `[geo filter]` and shows your IP. No answer at all (a timeout) is **not** the geo filter. It's a
+   firewall ban: `docker exec crowdsec cscli decisions list --ip <ip>`,
+   `docker exec fail2ban fail2ban-client banned`. An app (Jellyfin/Immich/HA) usually just says
+   "can't connect", so check with a browser or step 2.
+2. **What does the box see?** SSH to the Jetson over Tailscale (`ssh rosurya@100.122.87.20`), then:
+   ```bash
+   docker exec caddy geoip blocked 50     # recent refusals: time, IP, country, host+path
+   docker exec caddy geoip <your ip>      # e.g. "203.0.113.7  GB BLOCKED (allowed: US IN)"
+   docker exec caddy geoip info           # database month, allowed list, self-test
+   docker logs caddy 2>&1 | grep geoip    # refresher activity / failures
+   ```
+3. **Get in without changing anything** — Tailscale is already set up (subnet route `10.0.0.0/24`):
+   turn it on and use the LAN addresses, which skip the filter: Jellyfin `http://10.0.0.64:8096`,
+   Immich `http://10.0.0.64:2283`, Home Assistant `http://10.0.0.179:8123`. The public names still
+   resolve to the public IP even over Tailscale, so they stay blocked. Split DNS covers only
+   `home.rosurya.duckdns.org`, and the Jetson is not a Tailscale exit node (making it one would let
+   every public name work abroad: `sudo tailscale set --advertise-exit-node` + approve in the
+   admin console — not done).
+4. **Wrong country for a good reason?** iCloud Private Relay (Safari, and Mail's privacy protection)
+   and VPN apps exit from relay IPs that can geolocate anywhere. Turn them off for the site.
+   Roaming mobile data usually exits in the SIM's home country, so it normally passes.
+5. **Allow another country**: add its ISO code to `GEO_ALLOW_COUNTRIES` in `docker-compose.yaml`
+   (e.g. `US IN GB`), then open a PR and merge. The deploy recreates `caddy` (a few seconds of
+   downtime). Emergency, from SSH: edit `/srv/homelab/exposer/docker-compose.yaml` the same way,
+   then `cd /srv/homelab/exposer && docker compose up -d caddy`. The next pipeline deploy reverts
+   it unless the change is also in git.
+6. **Database looks wrong or stale**: `docker exec caddy geoip refresh` (downloads, verifies,
+   reloads). If the downloads keep failing, the baked copy still works; it's just older.
 
 ## Exposing a new service
 
@@ -72,6 +148,7 @@ This is the whole point of the repo — it must not require editing shared files
 
    ```caddy
    <name>.rosurya.duckdns.org {
+       import geo_filter             # REQUIRED on a public vhost (CI checks); see "Geo filter"
        import security_headers
        import access_log <name>      # only if something needs the access log
        reverse_proxy 127.0.0.1:<port>
@@ -81,7 +158,7 @@ This is the whole point of the repo — it must not require editing shared files
    cert on first request. No DuckDNS change is needed — the subdomain is covered.
 4. Optionally add a `fail2ban/jail.d/<name>.conf` + `filter.d/<name>.conf` pair.
 
-`caddy/Caddyfile` holds only global options and the `(security_headers)` / `(access_log)`
+`caddy/Caddyfile` holds only global options and the `(geo_filter)` / `(security_headers)` / `(access_log)`
 snippets, then `import sites.d/*.caddy`. Don't add vhosts to it directly.
 
 ## Architecture: why host networking

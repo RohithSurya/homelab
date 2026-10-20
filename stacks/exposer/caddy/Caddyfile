@@ -18,6 +18,27 @@
 	}
 }
 
+# Country filter. Import into every PUBLIC vhost (CI fails a site file that imports
+# security_headers but not this). See "Geo filter" in ../CLAUDE.md for how to debug it.
+# LAN, loopback and Tailscale (100.64/10) always pass. Everyone else must geolocate to a
+# country in GEO_ALLOW_COUNTRIES (compose, e.g. "US IN"); the database is DB-IP's, kept
+# fresh by the image (`docker exec caddy geoip info`). A refused request gets a plain 403
+# naming its IP, plus the response header X-Blocked-By: geo — the access log records that
+# header, `docker exec caddy geoip blocked` lists them, and CrowdSec ignores them.
+# TLS-ALPN-01 (certificate renewal) happens in the TLS handshake, before any of this, so
+# Let's Encrypt's validators abroad are never affected.
+(geo_filter) {
+	@geo_blocked {
+		not client_ip private_ranges 100.64.0.0/10
+		not maxmind_geolocation {
+			db_path /geoip/country.mmdb
+			allow_countries {$GEO_ALLOW_COUNTRIES}
+		}
+	}
+	header @geo_blocked X-Blocked-By geo
+	respond @geo_blocked "Not available from your location (your IP: {client_ip}). [geo filter]" 403
+}
+
 # Rolling JSON access log for a public vhost. Pass the log basename, e.g.
 #   import access_log immich
 # Caddy is the internet-facing edge, so "client_ip" here is the real client IP —

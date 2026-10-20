@@ -3,10 +3,17 @@
 # reads such a burst as a scan and bans a real, logged-in user — a replay of two
 # months of Caddy logs caught exactly that. Hub whitelists exist for Jellyfin and
 # Nextcloud (installed via PARSERS in docker-compose.yaml) but not for these two.
+#
+# The third rule drops requests Caddy's geo filter already refused (403 + X-Blocked-By: geo).
+# They never reach an app, and counting them would turn a 403 page into a silent firewall
+# ban (http-probing fires on 10 403s in 10 s, e.g. a phone app retrying) — so someone
+# locked out abroad keeps seeing a readable 403 instead of a timeout, and allowing their
+# country later works at once (see "Geo filter" in ../../CLAUDE.md).
 name: local/edge-apps-whitelist
 description: "Ignore expected 404s from the Immich and Home Assistant apps"
 whitelist:
-  reason: "expected app 404s (Immich assets, Home Assistant iOS config)"
+  reason: "expected app 404s (Immich assets, Home Assistant iOS config) + geo-filter 403s"
   expression:
     - evt.Meta.service == 'http' && evt.Meta.http_status == '404' && evt.Meta.target_fqdn == 'immich.rosurya.duckdns.org' && evt.Meta.http_path startsWith '/api/assets/'
     - evt.Meta.service == 'http' && evt.Meta.http_status == '404' && evt.Meta.target_fqdn == 'ha.rosurya.duckdns.org' && evt.Meta.http_path startsWith '/api/ios/config'
+    - evt.Meta.service == 'http' && evt.Meta.http_status == '403' && 'geo' in (get(evt.Unmarshaled.caddy.resp_headers, 'X-Blocked-By') ?? [])

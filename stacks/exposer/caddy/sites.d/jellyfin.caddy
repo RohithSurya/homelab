@@ -2,6 +2,7 @@
 # Access log (real client IP + negotiated protocol) so remote-streaming problems are
 # diagnosable: h3 vs h2, status codes, bytes served, and where a stream cuts out.
 jellyfin.rosurya.duckdns.org {
+	import geo_filter
 	import security_headers
 	import access_log jellyfin
 	reverse_proxy 10.0.0.64:8096   # Jellyfin runs on the HP (homelab pipeline)
