@@ -46,13 +46,21 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
 - Only the owner's merges deploy (`github.actor` check). Manual run: Actions → deploy → Run workflow
   (`dry_run` defaults to true and also works for stacks not enabled yet).
 - Runners are containers (`gh-runner`, host network, host Docker socket) — `infra/runner/install.sh`.
+- `nightly.yml` (04:17 New York, HP): `backup.sh` for every enabled stack (keep 30 per stack in
+  `/mnt/backups`), then `mirror.sh` copies `/mnt/photos/{immich-library,nextcloud-data}` and
+  `/mnt/backups` to the Jetson (`~/backups/hp-mirror`) — the only second copy of the photos. It refuses
+  to run if a USB partition isn't mounted or a source is empty. ntfy only on failure.
+- Renovate (`.github/renovate.json`, GitHub App) opens image/action update PRs for the HP stacks; CI
+  tests them and the owner's merge deploys them. The Immich version is in `stacks/immich/env/prod.env`.
+  exposer + the Jetson's other stacks still get updates from `~/updater` (wud/approver) on the Jetson.
 
 ## Status (2026-10-20)
 - **Live on the HP via the pipeline:** nextcloud, immich, media-server (`deploy/targets` enabled).
 - **exposer** is still applied on the Jetson by hand (`~/exposer`, files copied from `stacks/exposer`);
   enabling it needs a Jetson Bitwarden token that can read `EXPOSER__*`.
-- The Jetson keeps stopped copies of the old stacks (`~/media-server`, `~/immich`, `~/next-cloud`) as
-  rollback until the owner says to delete them. **Never `git pull` in `~/media-server`.**
+- The Jetson's old copies were deleted 2026-10-20 (it went from 98 % to 69 % full). It still holds the old
+  movies (NFS-shared to the HP) and `~/backups/hp-mirror` (below). `~/media-server` is a dead checkout --
+  **never `git pull` there**.
 - Follow-ups: Hermes `homeops` still restarts media containers on the Jetson's Docker; the updater
   (wud/approver) doesn't see the HP; KrazyZone needs a fresh login cookie (home IPv4 changed with
   the Flint 2).
