@@ -9,11 +9,11 @@ host=${1:?usage: install.sh <hp|jetson> <token>}; token=${2:-}
 cd "$(dirname "$0")"
 case $host in
   hp)     labels=hp,prod;    mounts=(-v /srv/homelab:/srv/homelab -v /mnt:/mnt) ;;
-  jetson) labels=jetson,dev; mounts=() ;;
+  jetson) labels=jetson,dev; mounts=(-v /srv/homelab:/srv/homelab -v "$HOME/backups/homelab:$HOME/backups/homelab") ;;
   *) echo "host must be hp or jetson"; exit 1 ;;
 esac
 work=$HOME/.homelab-runner/work                 # same path inside the container (see entrypoint)
-mkdir -p "$work"
+mkdir -p "$work"; [ "$host" = jetson ] && mkdir -p "$HOME/backups/homelab"
 mounts+=(-v "$work:$work")
 tok_file=$HOME/.config/homelab/bws_token        # this machine's Bitwarden machine-account token
 [ -f "$tok_file" ] && mounts+=(-v "$tok_file:/run/secrets/bws_token:ro")

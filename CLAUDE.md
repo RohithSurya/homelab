@@ -52,12 +52,12 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
   to run if a USB partition isn't mounted or a source is empty. ntfy only on failure.
 - Renovate (`.github/renovate.json`, GitHub App) opens image/action update PRs for the HP stacks; CI
   tests them and the owner's merge deploys them. The Immich version is in `stacks/immich/env/prod.env`.
-  exposer + the Jetson's other stacks still get updates from `~/updater` (wud/approver) on the Jetson.
+  exposer too. Only the Jetson's non-repo stacks (bedroom-agent) still use `~/updater` (wud/approver).
 
 ## Status (2026-10-20)
 - **Live on the HP via the pipeline:** nextcloud, immich, media-server (`deploy/targets` enabled).
-- **exposer** is still applied on the Jetson by hand (`~/exposer`, files copied from `stacks/exposer`);
-  enabling it needs a Jetson Bitwarden token that can read `EXPOSER__*`.
+- **exposer** is deployed by the pipeline on the Jetson (`/srv/homelab/exposer`; token
+  `~/.config/homelab/bws_token` = machine account `jetson-dev`, reads `homelab-dev` only).
 - The Jetson's old copies were deleted 2026-10-20 (it went from 98 % to 69 % full). It still holds the old
   movies (NFS-shared to the HP) and `~/backups/hp-mirror` (below). `~/media-server` is a dead checkout --
   **never `git pull` there**.

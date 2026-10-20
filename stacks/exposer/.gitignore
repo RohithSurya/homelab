@@ -9,6 +9,7 @@ caddy/logs/
 
 # fail2ban ban-state database (root-owned sqlite, runtime data not config)
 fail2ban/db/
+fail2ban/action.d/
 
 # Compose backups
 docker-compose.yaml.bak.*
