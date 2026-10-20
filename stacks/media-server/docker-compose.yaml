@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
 
   prowlarr:
-    image: lscr.io/linuxserver/prowlarr:2.6.5.5623-ls161   # pinned (see ~/updater)
+    image: lscr.io/linuxserver/prowlarr:2.6.5.5623-ls164   # pinned (see ~/updater)
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+\.\d+-ls\d+$$'
       # 4-part lsio tags are not valid semver and wud mis-orders them (it offered
