@@ -40,7 +40,9 @@ def bws(*args):
         r = subprocess.run(["bws", "--output", "json", "--color", "no", *args],
                            env=env, capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
-            return json.loads(r.stdout or "null")
+            # strict=False: secret values (SSH keys...) can hold raw line breaks, which some bws
+            # builds emit unescaped -- strict JSON would refuse the whole listing
+            return json.loads(r.stdout or "null", strict=False)
         err = (r.stderr or "").replace(tok, "<token>")
         last = next((l for l in reversed(err.splitlines()) if "error" in l.lower()), err[-200:])
         time.sleep(2 * (attempt + 1))
