@@ -1,0 +1,28 @@
+# Short names for typing at home: http://jellyfin.home, http://radarr.lan, http://home.lan ...
+# AdGuard (router) points *.home and a list of *.lan names at the Jetson; this only REDIRECTS to the
+# real HTTPS name, so certificates, logins and the access rules of the target all still apply
+# (e.g. jellyfin.home lands on jellyfin.rosurya.duckdns.org, which the night curfew blocks).
+# Plain HTTP on port 80, LAN only (the router forwards only 443). Unknown names -> the dashboard.
+http://*.home, http://*.lan {
+	map {labels.1} {short_target} {
+		home       home.rosurya.duckdns.org
+		dashboard  home.rosurya.duckdns.org
+		radarr     radarr.home.rosurya.duckdns.org
+		sonarr     sonarr.home.rosurya.duckdns.org
+		prowlarr   prowlarr.home.rosurya.duckdns.org
+		bazarr     bazarr.home.rosurya.duckdns.org
+		downloads  bridge.home.rosurya.duckdns.org
+		bridge     bridge.home.rosurya.duckdns.org
+		youtube    youtube.home.rosurya.duckdns.org
+		adguard    adguard.home.rosurya.duckdns.org
+		router     router.home.rosurya.duckdns.org
+		jellyfin   jellyfin.rosurya.duckdns.org
+		photos     immich.rosurya.duckdns.org
+		immich     immich.rosurya.duckdns.org
+		files      nextcloud.rosurya.duckdns.org
+		nextcloud  nextcloud.rosurya.duckdns.org
+		ha         ha.rosurya.duckdns.org
+		default    home.rosurya.duckdns.org
+	}
+	redir https://{short_target}{uri} 302
+}
