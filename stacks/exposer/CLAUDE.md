@@ -8,7 +8,7 @@ The **public edge** for every self-hosted stack, running on the Jetson Orin Nano
 `10.0.0.179`; the router forwards 443 here). Since 2026-10-20 the application stacks run on the **HP**
 (`10.0.0.64`), so Caddy proxies Jellyfin/Immich/Nextcloud to `10.0.0.64:8096/2283/8081` over the LAN,
 the fail2ban jellyfin + nextcloud jails read **Caddy's** access logs (their app logs are on the HP),
-`caddy/sites.d/jellyfin-lan.caddy` passes old LAN clients on `:8096` through, and the Jetson's own
+the old LAN pass-through on `:8096` was removed on 2026-10-20 (clients use the public name or `10.0.0.64:8096`), and the Jetson's own
 DIUN + autoheal live in this stack. **Deployed by the homelab pipeline** to `/srv/homelab/exposer` on
 the Jetson (Jetson runner; secrets from Bitwarden `homelab-dev`, `EXPOSER__*`, via the `jetson-dev`
 machine account). Image updates come as Renovate PRs. `~/exposer` is the retired hand-run copy. Off-the-shelf

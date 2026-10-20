@@ -1,7 +1,0 @@
-# LAN pass-through for clients still set to the Jetson's address (http://10.0.0.179:8096): TVs, phones
-# and apps configured before Jellyfin moved to the HP (2026-10-20). Plain HTTP on the LAN only --
-# the router forwards nothing but 443 here. Jellyfin trusts 10.0.0.179 as a proxy (KnownProxies), so
-# it still sees each client's own LAN address. Remove once every client points at 10.0.0.64:8096.
-http://:8096 {
-	reverse_proxy 10.0.0.64:8096
-}

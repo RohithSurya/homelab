@@ -34,8 +34,8 @@ gluetun rule, smoke checks, auto-rollback). On the HP the stack lives in **`/srv
 - **Jellyfin uses Intel Quick Sync** (`/dev/dri`, QSV decode H.264/HEVC/HEVC-10/VP9/AV1, encode
   H.264/HEVC low-power, VPP/VA-API tone-mapping; 4K HDR → 1080p ≈ 250 fps). `KnownProxies` =
   127.0.0.1 + **10.0.0.179** (the Jetson's Caddy).
-- Public reach is unchanged: router 443 → **Jetson** Caddy → `10.0.0.64:8096`; the Jetson also passes
-  LAN `http://10.0.0.179:8096` through for old clients. fail2ban (on the Jetson) reads **Caddy's**
+- Public reach is unchanged: router 443 → **Jetson** Caddy → `10.0.0.64:8096`. (The LAN pass-through on
+  `10.0.0.179:8096` for old clients was removed the same day; use the public name or `10.0.0.64:8096`.) fail2ban (on the Jetson) reads **Caddy's**
   jellyfin log now, not Jellyfin's.
 - Below, "the Jetson" in historical notes means the box the stack ran on before; the commands are
   the same on the HP (run them in `/srv/homelab/media-server`, or let the pipeline do it).
