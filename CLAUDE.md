@@ -65,6 +65,14 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
   (wud/approver) doesn't see the HP; KrazyZone needs a fresh login cookie (home IPv4 changed with
   the Flint 2).
 
+## Names at home
+- Dashboard: `https://home.rosurya.duckdns.org`; admin apps: `https://<app>.home.rosurya.duckdns.org`
+  (Caddy `sites.d/home.caddy`, LAN + Tailscale only, real certificates).
+- Short names to type: `<app>.home` or `<app>.lan` (e.g. `jellyfin.home`, `radarr.lan`, `home.lan`) --
+  plain-HTTP redirects to the real names (`sites.d/short-names.caddy`). DNS for all of these is AdGuard
+  on the router (rewrites: `home.rosurya.duckdns.org`, `*.home.rosurya.duckdns.org`, `*.home` and a list
+  of `<app>.lan` names -> 10.0.0.179). A new app needs a line in both Caddy files (and a `.lan` rewrite).
+
 ## Rules
 - Never run a BitTorrent client on any home machine, not even for tests (the ISP blocks the user).
 - A stack is moved to the HP by its own cutover PR, which sets `enabled=yes` in `deploy/targets`.
