@@ -9,6 +9,7 @@ prowlarr/
 radarr/
 sonarr/
 media-bridge/config/
+diun/
 
 # Compose backups
 docker-compose.yaml.bak.*

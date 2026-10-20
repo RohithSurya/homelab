@@ -4,5 +4,5 @@
 jellyfin.rosurya.duckdns.org {
 	import security_headers
 	import access_log jellyfin
-	reverse_proxy 127.0.0.1:8096
+	reverse_proxy 10.0.0.64:8096   # Jellyfin runs on the HP (homelab pipeline)
 }
