@@ -1,0 +1,37 @@
+name: nightly
+# Every night on the HP: back up each enabled stack (databases + app state, deploy/backup.sh),
+# then mirror the photos, files and backup folder to the Jetson (deploy/mirror.sh), so one
+# failed disk can't lose them. ntfy only on failure.
+on:
+  schedule:
+    - cron: "17 8 * * *"         # 04:17 New York (EDT); GitHub cron is UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: [self-hosted, hp]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: back up enabled stacks on this host
+        run: |
+          set -euo pipefail
+          . deploy/lib.sh
+          awk -v h="$HOMELAB_HOST" '$0 !~ /^#/ && $2==h && $4=="yes" {print $1}' deploy/targets |
+          while read -r s; do
+            deploy/backup.sh "$s" "$DEPLOY_BASE/$s" nightly
+          done
+      - name: mirror to the Jetson
+        run: deploy/mirror.sh
+      - name: notify on failure
+        if: failure()
+        run: |
+          . deploy/lib.sh
+          notify "NIGHTLY BACKUP FAILED" "The nightly backup/mirror on $HOMELAB_HOST failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" high
