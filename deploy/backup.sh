@@ -11,8 +11,21 @@ dest="$BACKUP_BASE/$stack/$(date +%Y%m%d-%H%M%S)-${sha:0:7}"
 mkdir -p "$dest"
 envval() { grep -m1 "^$1=" "$dir/.env" | cut -d= -f2-; }
 tarc() {  # tarc <out.tgz> <dir relative to $dir>...
-  local out=$1; shift
-  docker run --rm -v "$dir":/s:ro alpine tar -C /s -czf - --numeric-owner "$@" > "$dest/$out"
+  # The apps keep running while this reads their state. SQLite's *-shm files are a cache that
+  # SQLite deletes and recreates as connections close and open (rebuilt on open, never needed
+  # for a restore), and busybox tar fails on any file that vanishes mid-read: a vanished
+  # jellyfin.db-shm failed the 2026-10-20 media-server deploy. So skip them, and retry a read
+  # that still races a live write.
+  local out=$1 try; shift
+  for try in 1 2 3; do
+    if docker run --rm -v "$dir":/s:ro alpine tar -C /s -czf - --numeric-owner \
+         --exclude='*.db-shm' --exclude='*.sqlite-shm' --exclude='*.sqlite3-shm' "$@" > "$dest/$out"; then
+      return 0
+    fi
+    log "backup: reading $out failed (try $try of 3; a file changed while it was read)"
+    sleep 5
+  done
+  die "backup: could not read $out after 3 tries"
 }
 
 case $stack in
