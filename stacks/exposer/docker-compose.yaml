@@ -91,7 +91,6 @@ services:
     volumes:
       - ./fail2ban:/data                                            # jail.d/ filter.d/ + f2b state db
       - ./caddy/logs:/var/log/caddy:ro                              # caddy access log (immich jail)
-      - /home/rosurya/media-server/jellyfin/config/log:/var/log/jellyfin:ro
       # HA's whole config dir, read-only. Mounting just home-assistant.log does NOT
       # work: HA rotates it to .log.1 on every restart, replacing the inode, which
       # would pin a single-file bind mount to the stale one.
@@ -156,5 +155,64 @@ services:
     depends_on:
       crowdsec:
         condition: service_healthy
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ── DIUN + autoheal for this machine (the Jetson) ─────────────────────────────
+  # They lived in media-server until it moved to the HP (2026-10-20); the HP runs its own pair
+  # from stacks/media-server. DIUN posts to NTFY_TOPIC_DIUN (its own topic, see media-server's
+  # CLAUDE.md "ntfy: two topics"); autoheal restarts any container labelled autoheal=true.
+  diun:
+    image: crazymax/diun:4.33.0                  # pinned
+    labels:
+      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
+      - 'updater.policy=approve'
+    container_name: diun
+    command: serve
+    group_add:
+      - "${DOCKER_GID:-994}"                      # host 'docker' gid -> read /var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./diun/data:/data                          # bolt db of seen image digests
+    environment:
+      - TZ=America/New_York
+      - LOG_LEVEL=info
+      - DIUN_WATCH_SCHEDULE=0 8 * * *              # check daily at 08:00
+      - DIUN_WATCH_JITTER=30s
+      - DIUN_WATCH_FIRSTCHECKNOTIF=false           # don't alert on the initial inventory
+      - DIUN_PROVIDERS_DOCKER=true
+      - DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true  # watch all containers, not just labelled ones
+      - DIUN_NOTIF_NTFY_ENDPOINT=https://ntfy.sh
+      - DIUN_NOTIF_NTFY_TOPIC=${NTFY_TOPIC_DIUN}   # own topic, not the shared NTFY_TOPIC (see above)
+      - DIUN_NOTIF_NTFY_PRIORITY=3                 # ntfy priority: 1=min .. 3=default .. 5=max
+    logging: *default-logging
+    restart: unless-stopped
+
+  # autoheal — restarts any container that reports "unhealthy" (a hung-but-Up app that
+  # `restart: unless-stopped` can't catch). SCOPED via label: only containers carrying
+  # autoheal=true are watched. It matches by label ACROSS compose projects, so the set
+  # spans stacks: jellyfin/media-bridge here, caddy in ../exposer, immich_server in
+  # ../immich, app in ../next-cloud. The gluetun-netns stack is deliberately NOT
+  # labelled — blind restarts there break the shared namespace.
+  autoheal:
+    # NOT pinned, deliberately: autoheal's newest version tag is 1.2.0 from 2021-07-08, while
+    # :latest is still rebuilt (it moved as recently as 2026-09-12). Pinning would be a
+    # five-year downgrade, so this is the one service with no version gate. Upstream CI
+    # rebuilds :latest every midnight (fresh Alpine, no code change), so instead of a daily
+    # Approve it auto-applies at most every 10 days (the interval replaces the semver gate).
+    image: willfarrell/autoheal:latest
+    labels:
+      - 'wud.tag.include=^latest$$'
+      - 'wud.watch.digest=true'
+      - 'updater.policy=auto'
+      - 'updater.min-interval=10d'
+    container_name: autoheal
+    environment:
+      - TZ=America/New_York
+      - AUTOHEAL_CONTAINER_LABEL=autoheal          # only watch containers labelled autoheal=true
+      - AUTOHEAL_INTERVAL=15                        # check health every 15s
+      - AUTOHEAL_START_PERIOD=60                    # give a fresh container 60s before acting
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     logging: *default-logging
     restart: unless-stopped

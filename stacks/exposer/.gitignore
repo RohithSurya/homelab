@@ -17,3 +17,6 @@ docker-compose.yaml.bak.*
 # decisions database. acquis.d/ and bouncer/ are the tracked parts.
 crowdsec/config/
 crowdsec/data/
+
+# DIUN state (bolt db of seen digests)
+diun/
