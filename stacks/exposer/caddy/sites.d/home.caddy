@@ -37,7 +37,12 @@ bazarr.home.rosurya.duckdns.org {
 # media-bridge status page (same server as the YouTube form, under /bridge)
 bridge.home.rosurya.duckdns.org {
 	import home_only
-	redir / /bridge
+	# redir runs before respond in Caddy's order, so it carries the same LAN/Tailscale condition
+	@home_root {
+		path /
+		remote_ip 10.0.0.0/24 100.64.0.0/10 fd00::/8 fe80::/10
+	}
+	redir @home_root /bridge
 	reverse_proxy 10.0.0.64:8003
 }
 

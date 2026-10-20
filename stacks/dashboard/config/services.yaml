@@ -5,12 +5,10 @@
         icon: jellyfin.png
         href: https://jellyfin.rosurya.duckdns.org
         description: Movies and TV
-        widget:
-          type: jellyfin
-          url: http://10.0.0.64:8096
-          key: "{{HOMEPAGE_VAR_JELLYFIN_KEY}}"
-          enableBlocks: true
-          enableNowPlaying: true
+        # No live widget: Homepage's Jellyfin widget still sends ?api_key= to /emby/..., which
+        # Jellyfin 12 disabled (it accepts only "Authorization: MediaBrowser Token=..."), and on
+        # the error Homepage logs the full URL -- key included. Add it back once Homepage supports
+        # the header form.
     - Downloads:
         icon: mdi-download-network
         href: https://bridge.home.rosurya.duckdns.org
