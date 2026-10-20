@@ -1,0 +1,25 @@
+# CrowdSec firewall bouncer — pulls ban decisions from the crowdsec LAPI every
+# 10s and drops those IPs with one ipset-backed rule per chain.
+mode: iptables
+update_frequency: 10s
+log_mode: stdout
+log_level: info
+# LAPI is published on loopback :8089 (NOT its default 8080: zigbee2mqtt owns that).
+api_url: http://127.0.0.1:8089/
+api_key: ${CROWDSEC_BOUNCER_KEY}
+insecure_skip_verify: false
+disable_ipv6: false
+deny_action: DROP
+deny_log: false
+supported_decisions_types:
+  - ban
+blacklists_ipv4: crowdsec-blacklists
+blacklists_ipv6: crowdsec6-blacklists
+ipset_type: nethash
+# INPUT is where inbound :443 lands, because Caddy is network_mode: host.
+iptables_chains:
+  - INPUT
+iptables_add_rule_comments: true
+
+prometheus:
+  enabled: false

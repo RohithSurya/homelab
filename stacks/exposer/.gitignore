@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Caddy runtime state. caddy/data holds the Let's Encrypt certs and ACME account
+# key — back it up, but never commit it.
+caddy/data/
+caddy/config/
+caddy/logs/
+
+# fail2ban ban-state database (root-owned sqlite, runtime data not config)
+fail2ban/db/
+
+# Compose backups
+docker-compose.yaml.bak.*
+
+# CrowdSec generated config (holds local + central API credentials) and its
+# decisions database. acquis.d/ and bouncer/ are the tracked parts.
+crowdsec/config/
+crowdsec/data/

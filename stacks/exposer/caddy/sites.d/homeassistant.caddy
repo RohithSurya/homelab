@@ -1,0 +1,17 @@
+# Home Assistant — bedroom-agent stack, network_mode: host on :8123.
+#
+# REQUIRES the http: block in that stack's ha_config/configuration.yaml
+# (use_x_forwarded_for + trusted_proxies 127.0.0.1). Without it HA returns 400 to
+# every request arriving through here, because they all carry X-Forwarded-For.
+# If this vhost suddenly 400s everywhere, check that block first.
+#
+# reverse_proxy upgrades the websocket automatically, which the HA frontend needs
+# for live entity state — a plain 200 on / does not prove that path works.
+#
+# The access log is not optional: it is the audit trail for a host that controls
+# physical devices, and there is no second auth factor behind it.
+ha.rosurya.duckdns.org {
+	import security_headers
+	import access_log ha
+	reverse_proxy 127.0.0.1:8123
+}

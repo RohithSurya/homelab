@@ -1,0 +1,36 @@
+# Prod overrides: HP Pro Mini 400 G9 (x86-64, Intel UHD 730 Quick Sync).
+#   docker compose -f docker-compose.yaml -f compose.prod.yaml --env-file .env --env-file env/prod.env ...
+#
+# /data is bound with rslave propagation: the Jetson's old movies are NFS-mounted on the host at
+# data/media/movies{,-private}, and a mount that appears (or re-appears) after a container started
+# must still show up inside it.
+
+x-data: &data
+  type: bind
+  source: ${DATA_ROOT}
+  target: /data
+  bind:
+    propagation: rslave
+
+services:
+  sonarr:
+    volumes: [*data]
+  radarr:
+    volumes: [*data]
+  media-bridge:
+    volumes: [*data]
+  bazarr:
+    volumes: [*data]
+  jellyfin:
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT}/media
+        target: /data/media
+        read_only: true
+        bind:
+          propagation: rslave
+    devices:
+      - /dev/dri:/dev/dri                  # Quick Sync (QSV/VA-API)
+    group_add:
+      - "${RENDER_GID}"
+      - "${VIDEO_GID}"

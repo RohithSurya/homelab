@@ -1,0 +1,84 @@
+name: next-cloud   # pinned: keeps the existing volume names (next-cloud_db_data, next-cloud_nextcloud_app)
+
+services:
+  db:
+    image: mariadb:10.11.19          # pinned (see ~/updater); majors/minors stepped deliberately
+    labels:
+      - 'wud.tag.include=^10\.11\.\d+$$'
+      - 'updater.policy=approve'
+    restart: unless-stopped
+    command: >-
+      --transaction-isolation=READ-COMMITTED
+      --log-bin=ROW
+    volumes:
+      - db_data:/var/lib/mysql
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MYSQL_DATABASE}
+      MARIADB_USER: ${MYSQL_USER}
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD}
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8.10.2-alpine3.23   # pinned
+    labels:
+      - 'wud.tag.include=^\d+\.\d+\.\d+-alpine\d+\.\d+$$'
+      - 'updater.policy=approve'
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  app:
+    image: nextcloud:35.0-apache     # pinned. NEXTCLOUD CANNOT SKIP A MAJOR: 34 -> 35 -> 36, one at a time
+    restart: unless-stopped
+    labels:
+      - 'wud.tag.include=^\d+\.\d+-apache$$'
+      - 'wud.tag.transform=^(\d+)\.(\d+)-apache$$ => $$1.$$2.0'
+      - 'updater.policy=approve'
+      - "autoheal=true"                           # autoheal (in the media-server stack) restarts it if unhealthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/status.php"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      # 8081, not 8080: zigbee2mqtt (bedroom-agent stack) runs network_mode: host
+      # with its frontend enabled, which defaults to :8080 and takes the port first.
+      # Reached publicly via the exposer stack's Caddy -> ../exposer/caddy/sites.d/nextcloud.caddy.
+      - "8081:80"
+    volumes:
+      - nextcloud_app:/var/www/html
+      - ${NEXTCLOUD_DATA:-./data}:/var/www/html/data
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      NEXTCLOUD_TRUSTED_DOMAINS: "nextcloud.rosurya.duckdns.org 10.0.0.179 localhost"
+      TRUSTED_PROXIES: "${NC_TRUSTED_PROXIES:-127.0.0.1}"
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: nextcloud.rosurya.duckdns.org
+      OVERWRITECONDADDR: "${NC_OVERWRITECONDADDR:-^127\\.0\\.0\\.1$$}"
+      PHP_MEMORY_LIMIT: 1G
+      PHP_UPLOAD_LIMIT: 16G
+
+volumes:
+  db_data:
+  nextcloud_app:

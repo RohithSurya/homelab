@@ -1,0 +1,19 @@
+name: ci
+# Every branch push and PR: the checks a change must pass before it may deploy.
+# Runs on the Jetson (dev) runner. Never touches a running stack, needs no secrets.
+on:
+  pull_request:                  # once per PR (a push trigger as well would run everything twice)
+  workflow_call:                 # deploy.yml runs these first on every merge to main
+  workflow_dispatch:             # by hand, on any branch
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: [self-hosted, jetson]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: CI checks
+        run: deploy/ci-checks.sh

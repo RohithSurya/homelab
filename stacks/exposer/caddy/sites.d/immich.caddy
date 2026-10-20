@@ -1,0 +1,11 @@
+# Immich photo library — standalone stack in ~/immich, published on 127.0.0.1:2283
+# (loopback + LAN only, never 0.0.0.0, so it stays off the public internet even if
+# the router forward changes). reverse_proxy handles the websocket upgrade automatically.
+#
+# The access log is not optional here: the fail2ban `immich` jail tails it, because
+# Immich has no clean auth log of its own.
+immich.rosurya.duckdns.org {
+	import security_headers
+	import access_log immich
+	reverse_proxy 127.0.0.1:2283
+}

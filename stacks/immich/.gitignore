@@ -1,0 +1,5 @@
+.env
+library/
+postgres/
+watchdog.log
+docker-compose.yml.bak*

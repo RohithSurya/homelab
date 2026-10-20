@@ -1,0 +1,73 @@
+name: deploy
+# Merge to main -> checks -> deploy every changed, enabled stack to its machine -> smoke checks
+# -> automatic rollback on failure. ntfy reports either way.
+# Manual run (Actions tab -> deploy -> Run workflow): one stack or all, dry run by default.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "Stack to deploy (media-server, immich, nextcloud, exposer) or all"
+        default: all
+      dry_run:
+        description: "Dry run: copy, render, validate and build only -- start nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prod                 # never two deploys at once
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  plan:
+    needs: test
+    # Only merges/runs by the owner deploy (agents or other accounts can open PRs, never ship).
+    if: github.actor == 'RohithSurya'
+    runs-on: [self-hosted, jetson]
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: plan
+        run: deploy/plan.sh "${{ github.event_name }}" "${{ github.event.before }}" "${{ github.sha }}" "${{ inputs.stack || 'all' }}" "${{ inputs.dry_run || false }}" | tee -a "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: deploy ${{ matrix.stack }} -> ${{ matrix.host }}
+    runs-on: [self-hosted, "${{ matrix.host }}"]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0      # rollback needs the previous commit
+      - name: deploy
+        run: deploy/deploy.sh "${{ matrix.stack }}" ${{ inputs.dry_run && '--dry-run' || '' }}
+      - name: rollback
+        id: rollback
+        if: failure() && !inputs.dry_run
+        run: deploy/rollback.sh "${{ matrix.stack }}"
+      - name: notify
+        if: always() && !inputs.dry_run
+        run: |
+          . deploy/lib.sh
+          sha=$(git rev-parse --short HEAD)
+          case "${{ job.status }}/${{ steps.rollback.outcome }}" in
+            success/*)        notify "deployed ${{ matrix.stack }}" "${{ matrix.stack }} @ $sha is live on ${{ matrix.host }}" ;;
+            */success)        notify "ROLLED BACK ${{ matrix.stack }}" "${{ matrix.stack }} @ $sha failed its checks and was rolled back. Pre-deploy backup: $BACKUP_BASE/${{ matrix.stack }}/ . Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" high ;;
+            *)                notify "DEPLOY FAILED ${{ matrix.stack }}" "${{ matrix.stack }} @ $sha failed and the rollback did not finish -- check now. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" urgent ;;
+          esac
