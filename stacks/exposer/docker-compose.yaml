@@ -92,7 +92,6 @@ services:
       - ./fail2ban:/data                                            # jail.d/ filter.d/ + f2b state db
       - ./caddy/logs:/var/log/caddy:ro                              # caddy access log (immich jail)
       - /home/rosurya/media-server/jellyfin/config/log:/var/log/jellyfin:ro
-      - /home/rosurya/next-cloud/data:/var/log/nextcloud:ro         # nextcloud.log (dir, read-only)
       # HA's whole config dir, read-only. Mounting just home-assistant.log does NOT
       # work: HA rotates it to .log.1 on every restart, replacing the inode, which
       # would pin a single-file bind mount to the stale one.

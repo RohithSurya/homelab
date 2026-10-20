@@ -79,6 +79,28 @@ services:
       PHP_MEMORY_LIMIT: 1G
       PHP_UPLOAD_LIMIT: 16G
 
+  # Background jobs (mode "cron"): the image's /cron.sh runs cron.php as www-data every 5 min.
+  # Replaces the Jetson's host crontab line (docker compose exec ... cron.php), so the stack
+  # carries its own scheduler wherever it runs.
+  cron:
+    image: nextcloud:35.0-apache     # same image as app
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    labels:
+      - 'wud.watch=false'
+      - 'updater.policy=never'
+    volumes:
+      - nextcloud_app:/var/www/html
+      - ${NEXTCLOUD_DATA:-./data}:/var/www/html/data
+    depends_on:
+      app:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   db_data:
   nextcloud_app:

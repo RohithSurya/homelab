@@ -3,5 +3,5 @@
 # stack         host     env    enabled
 media-server    hp       prod   no
 immich          hp       prod   no
-nextcloud       hp       prod   no
+nextcloud       hp       prod   yes
 exposer         jetson   prod   no
