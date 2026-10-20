@@ -90,7 +90,7 @@ services:
     restart: unless-stopped
 
   sonarr:
-    image: lscr.io/linuxserver/sonarr:4.0.20.3014-ls325   # pinned
+    image: lscr.io/linuxserver/sonarr:4.0.20.3014-ls329   # pinned
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+\.\d+-ls\d+$$'
       # 4-part lsio tags are not valid semver and wud mis-orders them (it offered
