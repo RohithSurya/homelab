@@ -315,7 +315,7 @@ services:
     restart: unless-stopped
 
   bazarr:
-    image: lscr.io/linuxserver/bazarr:v1.6.2-ls368   # pinned
+    image: lscr.io/linuxserver/bazarr:v1.6.2-ls369   # pinned
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+-ls\d+$$'
       - 'updater.policy=auto'
