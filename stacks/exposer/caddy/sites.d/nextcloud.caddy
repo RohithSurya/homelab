@@ -3,6 +3,7 @@
 # defaults to :8080, so it claims that port first and Nextcloud fails to bind.
 nextcloud.rosurya.duckdns.org {
 	import geo_filter
+	import waf
 	import security_headers
 	import access_log nextcloud   # the fail2ban nextcloud jail reads this (nextcloud.log is on the HP)
 	# Nextcloud service-discovery redirects.

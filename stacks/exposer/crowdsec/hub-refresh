@@ -1,0 +1,33 @@
+#!/bin/bash
+# CrowdSec's entrypoint, wrapped: keep the hub items current, then start CrowdSec as usual.
+#
+# The image upgrades hub items (parsers, scenarios, the WAF's virtual-patching rules) only
+# when the container starts, and this one runs for weeks. Virtual patching is only worth
+# anything while it is fresh -- new CVE rules land in the hub within days of an exploit going
+# public -- so once a day this updates the index, upgrades what's installed and, only if
+# something changed, sends CrowdSec SIGHUP (a reload: same process, decisions kept).
+# A failed update (offline, hub down) changes nothing. Logs: docker logs crowdsec | grep hub-refresh
+set -u
+log() { echo "[hub-refresh] $*" >&2; }
+
+(
+  sleep "${HUB_REFRESH_DELAY:-600}"   # let CrowdSec finish starting first
+  while :; do
+    before=$(cscli hub list -o raw 2>/dev/null | md5sum)
+    if cscli hub update >/dev/null 2>&1 && cscli hub upgrade >/dev/null 2>&1; then
+      after=$(cscli hub list -o raw 2>/dev/null | md5sum)
+      if [ "$before" != "$after" ]; then
+        if pid=$(pidof crowdsec) && kill -HUP "$pid"; then
+          log "hub items upgraded, CrowdSec reloaded"
+        else
+          log "hub items upgraded, but CrowdSec wasn't found to reload (applies on next restart)"
+        fi
+      fi
+    else
+      log "hub update failed; keeping the current rules"
+    fi
+    sleep "${HUB_REFRESH_INTERVAL:-86400}"
+  done
+) &
+
+exec /bin/bash /docker_start.sh "$@"

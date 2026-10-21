@@ -81,3 +81,6 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
   `GEO_ALLOW_COUNTRIES` in `stacks/exposer/docker-compose.yaml`. Every new public vhost must
   `import geo_filter`. Locked out abroad → "Geo filter" in `stacks/exposer/CLAUDE.md`
   (`docker exec caddy geoip blocked`, Tailscale + LAN addresses, how to allow a country).
+- Every public vhost also passes the **WAF** (CrowdSec AppSec): a new public vhost must
+  `import waf` too (CI checks both). A 403 saying `[waf]` → "WAF" in `stacks/exposer/CLAUDE.md`
+  (which rule, how to switch one off, emergency off switch).

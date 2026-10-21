@@ -10,7 +10,8 @@ run() { if "$@"; then echo "   ok"; else echo "   FAILED"; fails=$((fails + 1));
 step "shell scripts (shellcheck)"
 run docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0 -x -S warning \
   deploy/*.sh infra/runner/*.sh infra/hosts/*/*.sh stacks/*/post-deploy.sh \
-  stacks/exposer/caddy/image/geoip stacks/exposer/caddy/image/geoip-entrypoint
+  stacks/exposer/caddy/image/geoip stacks/exposer/caddy/image/geoip-entrypoint \
+  stacks/exposer/crowdsec/hub-refresh
 
 step "GitHub workflows (actionlint)"
 run docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -no-color -oneline
@@ -43,19 +44,21 @@ run docker build -q -t homelab-media-bridge:ci stacks/media-server/media-bridge 
 run docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/stacks/media-server/media-bridge:/app" -w /app \
   --entrypoint python homelab-media-bridge:ci -m unittest discover -s tests
 
-step "Caddy config (exposer; the local image with the geo filter plugin)"
+step "Caddy config (exposer; the local image with the geo filter + WAF plugins)"
 run docker build -q -t caddy-geo-local:ci stacks/exposer/caddy/image >/dev/null
 geo=$(sed -n 's/^ *- GEO_ALLOW_COUNTRIES=//p' stacks/exposer/docker-compose.yaml)
-run docker run --rm -e GEO_ALLOW_COUNTRIES="$geo" -v "$PWD/stacks/exposer/caddy:/etc/caddy:ro" caddy-geo-local:ci \
+run docker run --rm -e GEO_ALLOW_COUNTRIES="$geo" -e CROWDSEC_CADDY_BOUNCER_KEY=ci-placeholder -v "$PWD/stacks/exposer/caddy:/etc/caddy:ro" caddy-geo-local:ci \
   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
-step "every public vhost imports geo_filter (exposer)"
-geo_imports() {  # a site file with security_headers (= public) must import geo_filter as often
-  local f ok=0
+step "every public vhost imports geo_filter and waf (exposer)"
+geo_imports() {  # a site file with security_headers (= public) must import geo_filter and waf as often
+  local f s ok=0
   for f in stacks/exposer/caddy/sites.d/*.caddy; do
-    if [ "$(grep -c 'import security_headers' "$f")" != "$(grep -c 'import geo_filter' "$f")" ]; then
-      echo "   $f: a public site block without 'import geo_filter'"; ok=1
-    fi
+    for s in geo_filter waf; do
+      if [ "$(grep -c 'import security_headers' "$f")" != "$(grep -c "import $s\$" "$f")" ]; then
+        echo "   $f: a public site block without 'import $s'"; ok=1
+      fi
+    done
   done
   return "$ok"
 }

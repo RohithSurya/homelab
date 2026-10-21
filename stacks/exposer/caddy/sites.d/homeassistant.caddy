@@ -12,6 +12,7 @@
 # physical devices, and there is no second auth factor behind it.
 ha.rosurya.duckdns.org {
 	import geo_filter
+	import waf
 	import security_headers
 	import access_log ha
 	reverse_proxy 127.0.0.1:8123
