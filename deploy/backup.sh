@@ -31,6 +31,12 @@ case $stack in
       radarr sonarr prowlarr bazarr jellyfin media-bridge/config diun ;;
   exposer)
     tarc exposer-state.tgz caddy/data fail2ban crowdsec/config ;;
+  logging)
+    # Grafana's DB (users, dashboards, alert state). The logs themselves are not backed up.
+    docker run --rm -v logging_grafana_data:/v:ro alpine tar -C /v -czf - --numeric-owner . \
+      > "$dest/grafana-data.tgz" ;;
+  log-agent)
+    echo "log-agent holds only read positions; config lives in git" > "$dest/README" ;;
   dashboard)
     echo "dashboard config lives in git (stacks/dashboard/config); nothing to back up" > "$dest/README" ;;
   *) die "no backup recipe for $stack" ;;

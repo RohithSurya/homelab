@@ -6,3 +6,5 @@ immich          hp       prod   yes
 nextcloud       hp       prod   yes
 exposer         jetson   prod   yes
 dashboard       hp       prod   yes
+logging         hp       prod   yes
+log-agent       jetson   prod   yes
