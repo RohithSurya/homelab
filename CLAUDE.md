@@ -30,7 +30,7 @@ infra/runner/                         the self-hosted GitHub Actions runner imag
 
 ## Secrets
 Bitwarden Secrets Manager. Projects: `homelab-prod`, `homelab-dev` (same names, dev values), `Hermes`.
-Secret names are `<STACK>__<KEY>` (MEDIA, IMMICH, NEXTCLOUD, EXPOSER, LOGGING) plus media-bridge's own
+Secret names are `<STACK>__<KEY>` (MEDIA, IMMICH, NEXTCLOUD, EXPOSER, LOGGING, LANGFUSE) plus media-bridge's own
 `SEEDBOX_*` / `TRACKER_*`. Deploys render `.env` (mode 600) from `env.tpl` with
 `deploy/envvault.py render`; nothing secret is ever committed or sent to GitHub. Each machine's
 machine-account token lives in `~/.config/homelab/bws_token` (mode 600).
@@ -69,6 +69,7 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
 Every machine's container logs + journal, the router's syslog and the Jetson's Caddy access logs go
 to Loki on the HP (`stacks/logging`, 90 days); read them in Grafana `http://10.0.0.64:3020`. The
 Jetson and pc5090 run `stacks/log-agent` (pc5090 by hand -- it has no runner).
+LLM calls (Hermes) are traced in Langfuse on the HP (`stacks/langfuse`), `http://10.0.0.64:3040`.
 
 ## Names at home
 - Dashboard: `https://home.rosurya.duckdns.org`; admin apps: `https://<app>.home.rosurya.duckdns.org`
