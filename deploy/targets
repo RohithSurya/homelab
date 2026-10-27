@@ -8,3 +8,4 @@ exposer         jetson   prod   yes
 dashboard       hp       prod   yes
 logging         hp       prod   yes
 log-agent       jetson   prod   yes
+langfuse        hp       prod   yes

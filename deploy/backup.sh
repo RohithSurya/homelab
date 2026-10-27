@@ -35,6 +35,9 @@ case $stack in
     # Grafana's DB (users, dashboards, alert state). The logs themselves are not backed up.
     docker run --rm -v logging_grafana_data:/v:ro alpine tar -C /v -czf - --numeric-owner . \
       > "$dest/grafana-data.tgz" ;;
+  langfuse)
+    # users, projects, API keys, prompts. The traces (ClickHouse) are not backed up.
+    docker exec langfuse-postgres pg_dumpall --clean --if-exists -U postgres | gzip > "$dest/langfuse-db.sql.gz" ;;
   log-agent)
     echo "log-agent holds only read positions; config lives in git" > "$dest/README" ;;
   dashboard)

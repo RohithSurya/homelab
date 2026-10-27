@@ -1,0 +1,60 @@
+// OTLP relay in front of Langfuse, for senders whose span attributes Langfuse can't read as-is.
+// Clients POST OTLP/HTTP to http://10.0.0.64:4318/v1/traces with the SAME basic auth as Langfuse
+// (public key : secret key); the relay checks it, rewrites the spans and forwards them.
+//
+// Claude Code CLI (`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`, spans claude_code.interaction ->
+// claude_code.llm_request) puts token counts in input_tokens / output_tokens /
+// cache_read_tokens / cache_creation_tokens; Langfuse reads usage only from gen_ai.usage.*, so
+// without this every Claude call shows 0 tokens. Its spans also carry the Anthropic account's
+// e-mail and ids (user.*) -- dropped here, they add nothing to a trace.
+
+otelcol.auth.basic "clients" {
+  username = sys.env("LANGFUSE_PUBLIC_KEY")
+  password = sys.env("LANGFUSE_SECRET_KEY")
+}
+
+otelcol.receiver.otlp "in" {
+  http {
+    endpoint = "0.0.0.0:4318"
+    auth     = otelcol.auth.basic.clients.handler
+  }
+  output { traces = [otelcol.processor.transform.claude_code.input] }
+}
+
+otelcol.processor.transform "claude_code" {
+  error_mode = "ignore"
+  trace_statements {
+    context    = "span"
+    statements = [
+      // Anthropic's input_tokens EXCLUDE cached tokens, but Langfuse subtracts the cache counts from
+      // gen_ai.usage.input_tokens (OpenAI semantics), so hand it the sum.
+      `set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"] + attributes["cache_read_tokens"] + attributes["cache_creation_tokens"]) where attributes["input_tokens"] != nil and attributes["cache_read_tokens"] != nil and attributes["cache_creation_tokens"] != nil and attributes["gen_ai.usage.input_tokens"] == nil`,
+      `set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil and attributes["gen_ai.usage.input_tokens"] == nil`,
+      `set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil and attributes["gen_ai.usage.output_tokens"] == nil`,
+      `set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil`,
+      `set(attributes["gen_ai.usage.cache_creation_input_tokens"], attributes["cache_creation_tokens"]) where attributes["cache_creation_tokens"] != nil`,
+      `delete_matching_keys(attributes, "^user\\.")`,
+    ]
+  }
+  trace_statements {
+    context    = "resource"
+    statements = [`delete_matching_keys(attributes, "^user\\.")`]
+  }
+  output { traces = [otelcol.processor.batch.out.input] }
+}
+
+otelcol.processor.batch "out" {
+  output { traces = [otelcol.exporter.otlphttp.langfuse.input] }
+}
+
+otelcol.auth.basic "langfuse" {
+  username = sys.env("LANGFUSE_PUBLIC_KEY")
+  password = sys.env("LANGFUSE_SECRET_KEY")
+}
+
+otelcol.exporter.otlphttp "langfuse" {
+  client {
+    endpoint = "http://langfuse-web:3000/api/public/otel"   // the exporter appends /v1/traces
+    auth     = otelcol.auth.basic.langfuse.handler
+  }
+}

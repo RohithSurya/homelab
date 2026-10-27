@@ -10,7 +10,8 @@ run() { if "$@"; then echo "   ok"; else echo "   FAILED"; fails=$((fails + 1));
 step "shell scripts (shellcheck)"
 run docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0 -x -S warning \
   deploy/*.sh infra/runner/*.sh infra/hosts/*/*.sh stacks/*/post-deploy.sh \
-  stacks/exposer/caddy/image/geoip stacks/exposer/caddy/image/geoip-entrypoint
+  stacks/exposer/caddy/image/geoip stacks/exposer/caddy/image/geoip-entrypoint \
+  stacks/langfuse/retention/retention.sh
 
 step "GitHub workflows (actionlint)"
 run docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -no-color -oneline
@@ -61,7 +62,7 @@ geo_imports() {  # a site file with security_headers (= public) must import geo_
 }
 run geo_imports
 
-step "Alloy configs (logging, log-agent)"
+step "Alloy configs (logging, log-agent, langfuse otel-relay)"
 run cmp stacks/logging/alloy/common.alloy stacks/log-agent/alloy/common.alloy
 alloy_img=$(sed -n 's/^ *image: *\(grafana\/alloy:[^ ]*\).*/\1/p' stacks/log-agent/docker-compose.yml)
 alloy_ok() {  # alloy_ok <file>...: the files as one config dir, as the stack mounts them
@@ -72,6 +73,11 @@ alloy_ok() {  # alloy_ok <file>...: the files as one config dir, as the stack mo
 }
 run alloy_ok stacks/logging/alloy/*.alloy
 run alloy_ok stacks/log-agent/alloy/*.alloy
+relay_ok() {
+  docker run --rm -e LANGFUSE_PUBLIC_KEY=x -e LANGFUSE_SECRET_KEY=x \
+    -v "$PWD/stacks/langfuse/otel-relay:/etc/relay:ro" "$alloy_img" validate /etc/relay
+}
+run relay_ok
 
 step "result"
 [ "$fails" = 0 ] && echo "all checks passed" || { echo "$fails check(s) failed"; exit 1; }
