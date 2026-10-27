@@ -51,6 +51,17 @@ youtube.home.rosurya.duckdns.org {
 	reverse_proxy 10.0.0.64:8003
 }
 
+# central logs (Grafana) and LLM traces (Langfuse) on the HP -- homelab stacks/logging, stacks/langfuse
+logs.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:3020
+}
+
+langfuse.home.rosurya.duckdns.org {
+	import home_only
+	reverse_proxy 10.0.0.64:3040
+}
+
 # the router (GL.iNet Flint 2, OpenWrt): AdGuard Home UI and LuCI
 adguard.home.rosurya.duckdns.org {
 	import home_only

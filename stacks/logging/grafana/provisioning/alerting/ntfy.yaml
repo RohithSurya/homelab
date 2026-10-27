@@ -1,0 +1,37 @@
+# Alerts go to the ops ntfy topic (Bitwarden MEDIA__NTFY_TOPIC, env NTFY_TOPIC) -- the same topic as
+# media-bridge's and the pipeline's alerts. ntfy's built-in "grafana" template turns Grafana's
+# webhook JSON into a readable title + message. Grouped per alert + host and repeated at most
+# every 12 h, so a noisy rule can't bury the topic (see media-server CLAUDE.md "ntfy: two topics").
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: ntfy-ops
+    receivers:
+      - uid: ntfy-ops
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: https://ntfy.sh/$NTFY_TOPIC?template=grafana&priority=default&tags=mag
+          httpMethod: POST
+  - orgId: 1
+    name: ntfy-ops-high
+    receivers:
+      - uid: ntfy-ops-high
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: https://ntfy.sh/$NTFY_TOPIC?template=grafana&priority=high&tags=rotating_light
+          httpMethod: POST
+
+policies:
+  - orgId: 1
+    receiver: ntfy-ops
+    group_by: [alertname, host]
+    group_wait: 1m
+    group_interval: 30m
+    repeat_interval: 12h
+    routes:
+      - receiver: ntfy-ops-high
+        object_matchers:
+          - [severity, "=", high]

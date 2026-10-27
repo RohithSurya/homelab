@@ -1,8 +1,10 @@
 # langfuse — LLM call tracing (self-hosted Langfuse v4)
 
 LangSmith-style traces of Hermes's LLM calls: each Hermes turn, the model calls inside it,
-prompts, replies, tokens, latency, cost. Runs on the **HP**. UI + API: `http://10.0.0.64:3040`
-(login `rosurya@home.lan` / Bitwarden `LANGFUSE__INIT_USER_PASSWORD`). Organisation **Home**,
+prompts, replies, tokens, latency, cost. Runs on the **HP**. UI: `https://langfuse.home.rosurya.duckdns.org`
+(short `http://traces.home`; LAN + Tailscale only; login `rosurya@home.lan` / Bitwarden
+`LANGFUSE__INIT_USER_PASSWORD`). `NEXTAUTH_URL` is that name, so the login does NOT work over
+`http://10.0.0.64:3040` (secure cookies); the API does. Organisation **Home**,
 project **Hermes** (id `hermes`); its API keys are `LANGFUSE__INIT_PROJECT_PUBLIC_KEY` /
 `..._SECRET_KEY`.
 
@@ -18,6 +20,10 @@ project **Hermes** (id `hermes`); its API keys are `LANGFUSE__INIT_PROJECT_PUBLI
 | `retention` | daily ClickHouse partition drop (`retention/retention.sh`) |
 
 ## Sending traces
+**Wired today:** Hermes (`~/hermes` on the Jetson, environment `production`) -- both the plugin
+and its Claude CLI spans (see `~/hermes/docker-compose.yaml`). Hermes's image pins langfuse SDK
+4.15.6, the newest that fits its OpenTelemetry 1.39.1.
+
 - **Langfuse SDK / Hermes's `observability/langfuse` plugin**: base URL `http://10.0.0.64:3040`,
   public + secret key.
 - **Any OTLP exporter**: `http://10.0.0.64:3040/api/public/otel/v1/traces`, header

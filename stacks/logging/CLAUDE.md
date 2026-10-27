@@ -1,7 +1,8 @@
 # logging — central logs (Loki + Grafana + Alloy)
 
 All machines' logs in one place, kept 90 days. Runs on the **HP**; the other machines run the
-`log-agent` stack (`stacks/log-agent`). Read logs in **Grafana**: `http://10.0.0.64:3020`
+`log-agent` stack (`stacks/log-agent`). Read logs in **Grafana**: `https://logs.home.rosurya.duckdns.org`
+(short `http://logs.home`; LAN + Tailscale only, via the Jetson's Caddy; direct `http://10.0.0.64:3020`)
 (user `admin`, password = Bitwarden `LOGGING__GRAFANA_ADMIN_PASSWORD`) → Explore → Loki.
 
 ```
@@ -38,6 +39,21 @@ Examples: `{host="hp", container="media-bridge"} |= "[seedr]"`,
 - **alloy** — the HP's agent (`alloy/common.alloy` + `journal-run.alloy`: the HP's journald is
   **volatile**, `/run/log/journal`) and the router's syslog receiver (`syslog.alloy`, host
   `:1514` tcp+udp). Debug UI on `127.0.0.1:12345` (`ssh -L 12345:127.0.0.1:12345 hp`).
+
+## Alerts (`grafana/provisioning/alerting/`, folder "Homelab")
+Provisioned from files -- edit them here; the UI shows them read-only. All go to the **ops ntfy
+topic** (`NTFY_TOPIC` = Bitwarden `MEDIA__NTFY_TOPIC`) through ntfy's built-in `grafana` template;
+grouped by alert + host, sent after 1 min, repeated at most every 12 h (`ntfy.yaml`).
+
+| alert | fires when | priority |
+|---|---|---|
+| No logs from hp / jetson / pc5090 | no line for 30 min (5 min `for`) | high |
+| No logs from router | no syslog line for 60 min | high |
+| Python traceback | `Traceback (most recent call last)` in `media-bridge` or `hermes` | default |
+| Failed logins | > 5 failed SSH/dropbear logins in 10 min on one host | high |
+
+A Loki/query failure raises Grafana's own `DatasourceError` alert on the same route.
+Silence one: the alert's "Silence" link (in the ntfy message) or Alerting → Silences.
 
 ## Rules
 - Keep Grafana LAN + Tailscale only: the logs carry private-tracker names, release names, IPs and

@@ -59,6 +59,8 @@ services:
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false
       - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
       - GF_NEWS_NEWS_FEED_ENABLED=false
+      - GF_SERVER_ROOT_URL=https://logs.home.rosurya.duckdns.org/   # links in alerts (exposer home.caddy)
+      - NTFY_TOPIC=${NTFY_TOPIC:?}            # alert contact points (provisioning/alerting/ntfy.yaml)
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana

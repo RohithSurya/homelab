@@ -92,6 +92,16 @@
         href: https://router.home.rosurya.duckdns.org
         description: GL.iNet Flint 2 (OpenWrt)
 - Homelab:
+    - Logs:
+        icon: grafana.png
+        href: https://logs.home.rosurya.duckdns.org/explore
+        description: All machines' logs + alerts (Grafana / Loki)
+        siteMonitor: http://10.0.0.64:3020/api/health
+    - LLM traces:
+        icon: mdi-chart-timeline-variant
+        href: https://langfuse.home.rosurya.duckdns.org
+        description: Hermes conversations, tokens, latency (Langfuse)
+        siteMonitor: http://10.0.0.64:3040/api/public/health
     - GitHub repo:
         icon: github.png
         href: https://github.com/RohithSurya/homelab
