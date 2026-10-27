@@ -1,0 +1,6 @@
+# Jetson: also Caddy's access logs (exposer stack, same machine).
+services:
+  alloy:
+    volumes:
+      - ./alloy/caddy.alloy:/etc/alloy-agent/caddy.alloy:ro
+      - /srv/homelab/exposer/caddy/logs:/hostlogs/caddy:ro

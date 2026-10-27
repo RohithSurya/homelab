@@ -61,5 +61,17 @@ geo_imports() {  # a site file with security_headers (= public) must import geo_
 }
 run geo_imports
 
+step "Alloy configs (logging, log-agent)"
+run cmp stacks/logging/alloy/common.alloy stacks/log-agent/alloy/common.alloy
+alloy_img=$(sed -n 's/^ *image: *\(grafana\/alloy:[^ ]*\).*/\1/p' stacks/log-agent/docker-compose.yml)
+alloy_ok() {  # alloy_ok <file>...: the files as one config dir, as the stack mounts them
+  local tmp rc=0; tmp=$(mktemp -d); cp "$@" "$tmp/"; chmod -R a+rX "$tmp"
+  docker run --rm -e LOKI_URL=http://x/loki/api/v1/push -e LOKI_PASSWORD=x -e HOST_LABEL=ci \
+    -v "$tmp:/etc/alloy:ro" "$alloy_img" validate /etc/alloy || rc=1
+  rm -rf "$tmp"; return "$rc"
+}
+run alloy_ok stacks/logging/alloy/*.alloy
+run alloy_ok stacks/log-agent/alloy/*.alloy
+
 step "result"
 [ "$fails" = 0 ] && echo "all checks passed" || { echo "$fails check(s) failed"; exit 1; }

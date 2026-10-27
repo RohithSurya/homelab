@@ -1,0 +1,19 @@
+// Jetson only (compose.prod.yaml mounts it): Caddy JSON access logs from the exposer stack, one
+// file per vhost -- the filename label says which.
+local.file_match "caddy" {
+  path_targets = [{ "__path__" = "/hostlogs/caddy/*.log", source = "caddy" }]
+}
+loki.source.file "caddy" {
+  targets       = local.file_match.caddy.targets
+  tail_from_end = true                 // first start: don't replay months of history
+  forward_to    = [loki.process.caddy.receiver]
+}
+// Use Caddy's own timestamp (ISO 8601), not the time Alloy read the line.
+loki.process "caddy" {
+  stage.json { expressions = { ts = "ts" } }
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339Nano"
+  }
+  forward_to = [loki.write.central.receiver]
+}
