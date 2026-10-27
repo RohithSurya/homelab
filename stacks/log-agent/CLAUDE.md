@@ -16,9 +16,10 @@ only. Read the logs in Grafana (`stacks/logging/CLAUDE.md`).
 From a checkout on the Jetson (the password goes through a pipe, never onto the screen):
 ```bash
 rsync -a --delete --exclude=/.env stacks/log-agent/ pc5090:log-agent/
-ssh hp 'docker exec gh-runner sh -c "cd \$RUNNER_WORK/homelab/homelab && python3 deploy/envvault.py get LOGGING__LOKI_PUSH_PASSWORD"' \
+ssh hp 'docker exec -i gh-runner python3 - get LOGGING__LOKI_PUSH_PASSWORD' < deploy/envvault.py \
   | ssh pc5090 'umask 077; { printf "LOKI_PASSWORD="; cat; echo; } > log-agent/.env'
 ssh pc5090 'cd log-agent && docker compose --env-file .env --env-file env/pc5090.env up -d'
 ```
-(Any way of getting the value out of Bitwarden works; `envvault.py get` prints just the value.)
+(`envvault.py get` runs inside the HP runner, which has `bws` and the prod token, and prints just
+the value into the pipe. Any other way of getting the value out of Bitwarden works too.)
 After a Renovate bump of the Alloy image, repeat the rsync + `up -d` on pc5090.
