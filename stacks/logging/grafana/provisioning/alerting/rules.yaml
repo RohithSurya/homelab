@@ -1,0 +1,256 @@
+# Grafana-managed alert rules on the Loki logs -> ntfy (ntfy.yaml). Provisioned: edit here, not in
+# the UI. "No logs" uses `or vector(0)` so a silent host gives 0 (data), not "no data".
+apiVersion: 1
+groups:
+- orgId: 1
+  name: logs
+  folder: Homelab
+  interval: 1m
+  rules:
+  - uid: silent-hp
+    title: No logs from hp
+    condition: C
+    data:
+    - refId: A
+      datasourceUid: loki
+      relativeTimeRange:
+        from: 1800
+        to: 0
+      model:
+        refId: A
+        expr: sum(count_over_time({host="hp"}[30m])) or vector(0)
+        queryType: instant
+        editorMode: code
+    - refId: B
+      datasourceUid: __expr__
+      model:
+        refId: B
+        type: reduce
+        expression: A
+        reducer: last
+        settings:
+          mode: dropNN
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 1
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    labels:
+      severity: high
+    annotations:
+      summary: 'No log lines from hp for 30 minutes: the machine, its Alloy agent is down.'
+  - uid: silent-jetson
+    title: No logs from jetson
+    condition: C
+    data:
+    - refId: A
+      datasourceUid: loki
+      relativeTimeRange:
+        from: 1800
+        to: 0
+      model:
+        refId: A
+        expr: sum(count_over_time({host="jetson"}[30m])) or vector(0)
+        queryType: instant
+        editorMode: code
+    - refId: B
+      datasourceUid: __expr__
+      model:
+        refId: B
+        type: reduce
+        expression: A
+        reducer: last
+        settings:
+          mode: dropNN
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 1
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    labels:
+      severity: high
+    annotations:
+      summary: 'No log lines from jetson for 30 minutes: the machine, its Alloy agent is down.'
+  - uid: silent-pc5090
+    title: No logs from pc5090
+    condition: C
+    data:
+    - refId: A
+      datasourceUid: loki
+      relativeTimeRange:
+        from: 1800
+        to: 0
+      model:
+        refId: A
+        expr: sum(count_over_time({host="pc5090"}[30m])) or vector(0)
+        queryType: instant
+        editorMode: code
+    - refId: B
+      datasourceUid: __expr__
+      model:
+        refId: B
+        type: reduce
+        expression: A
+        reducer: last
+        settings:
+          mode: dropNN
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 1
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    labels:
+      severity: high
+    annotations:
+      summary: 'No log lines from pc5090 for 30 minutes: the machine, its Alloy agent is down.'
+  - uid: silent-router
+    title: No logs from router
+    condition: C
+    data:
+    - refId: A
+      datasourceUid: loki
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      model:
+        refId: A
+        expr: sum(count_over_time({host="router"}[60m])) or vector(0)
+        queryType: instant
+        editorMode: code
+    - refId: B
+      datasourceUid: __expr__
+      model:
+        refId: B
+        type: reduce
+        expression: A
+        reducer: last
+        settings:
+          mode: dropNN
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: B
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 1
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    labels:
+      severity: high
+    annotations:
+      summary: 'No log lines from router for 60 minutes: the machine, its Alloy agent or the router''s remote syslog is down.'
+  - uid: python-traceback
+    title: Python traceback
+    condition: C
+    data:
+    - refId: A
+      datasourceUid: loki
+      relativeTimeRange:
+        from: 300
+        to: 0
+      model:
+        refId: A
+        expr: sum by (host, container) (count_over_time({container=~"media-bridge|hermes"} |= "Traceback (most recent call last)" [5m]))
+        queryType: instant
+        editorMode: code
+    - refId: B
+      datasourceUid: __expr__
+      model:
+        refId: B
+        type: reduce
+        expression: A
+        reducer: last
+        settings:
+          mode: dropNN
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    labels:
+      severity: default
+    annotations:
+      summary: 'A Python traceback in {{ $labels.container }} on {{ $labels.host }}. Grafana: {container="{{ $labels.container }}"} |= "Traceback"'
+  - uid: failed-logins
+    title: Failed logins
+    condition: C
+    data:
+    - refId: A
+      datasourceUid: loki
+      relativeTimeRange:
+        from: 600
+        to: 0
+      model:
+        refId: A
+        expr: sum by (host) (count_over_time({ident=~"sshd.*|dropbear"} |~ "Failed password|Invalid user|authentication failure|Bad password attempt|nonexistent user|Max auth tries|maximum authentication
+          attempts" [10m]))
+        queryType: instant
+        editorMode: code
+    - refId: B
+      datasourceUid: __expr__
+      model:
+        refId: B
+        type: reduce
+        expression: A
+        reducer: last
+        settings:
+          mode: dropNN
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: B
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 5
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    labels:
+      severity: high
+    annotations:
+      summary: More than 5 failed SSH logins in 10 minutes on {{ $labels.host }} (SSH is LAN-only, so this is a device at home).

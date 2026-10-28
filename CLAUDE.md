@@ -67,9 +67,12 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
 
 ## Logs
 Every machine's container logs + journal, the router's syslog and the Jetson's Caddy access logs go
-to Loki on the HP (`stacks/logging`, 90 days); read them in Grafana `http://10.0.0.64:3020`. The
-Jetson and pc5090 run `stacks/log-agent` (pc5090 by hand -- it has no runner).
-LLM calls (Hermes) are traced in Langfuse on the HP (`stacks/langfuse`), `http://10.0.0.64:3040`.
+to Loki on the HP (`stacks/logging`, 90 days); read them in Grafana `https://logs.home.rosurya.duckdns.org`
+(short: `logs.home`; direct `http://10.0.0.64:3020`). Log alerts (silent host, Python tracebacks,
+failed-login bursts) go to the ops ntfy topic. The Jetson and pc5090 run `stacks/log-agent`
+(pc5090 by hand -- it has no runner). The router sends its syslog itself (uci `log_ip`).
+LLM calls (Hermes, `~/hermes` on the Jetson) are traced in Langfuse on the HP (`stacks/langfuse`),
+`https://langfuse.home.rosurya.duckdns.org` (short: `traces.home`); its API stays on `http://10.0.0.64:3040`.
 
 ## Names at home
 - Dashboard: `https://home.rosurya.duckdns.org`; admin apps: `https://<app>.home.rosurya.duckdns.org`
