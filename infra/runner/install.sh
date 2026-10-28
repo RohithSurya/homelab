@@ -28,5 +28,6 @@ docker run -d --name gh-runner --restart unless-stopped --network host \
   -e RUNNER_TOKEN="$token" -e RUN_AS_UID="$(id -u)" -e DOCKER_GID="$(getent group docker | cut -d: -f3)" \
   -e HOMELAB_HOST="$host" -e RUNNER_WORK="$work" -e BWS_TOKEN_FILE=/run/secrets/bws_token \
   -v /var/run/docker.sock:/var/run/docker.sock -v gh-runner-state:/state "${mounts[@]}" \
+  --log-opt max-size=10m --log-opt max-file=3 \
   --label autoheal=false homelab-runner:latest >/dev/null
 sleep 15; docker logs --tail 5 gh-runner
