@@ -445,6 +445,21 @@ class QbitBackend(Backend):
             params["hashes"] = "|".join(hashes)
         return self._api("GET", "/torrents/info", params=params).json()
 
+    def _find(self, btih):
+        """qBittorrent's listing entry for a v1 infohash, or None. qBittorrent on libtorrent 2
+        keys a hybrid v1+v2 torrent by its v2 hash cut to 40 hex chars, so `hashes=<v1>` finds
+        nothing for it (2026-10-29: a hybrid Heart Beat pack finished on the box while every
+        re-add answered 'Fails.' as a duplicate the bridge couldn't see). Falls back to matching
+        `infohash_v1` across the whole listing; the entry's `hash` is the id every API call needs."""
+        btih = btih.lower()
+        ts = self._info([btih])
+        if ts:
+            return ts[0]
+        for t in self._info():
+            if (t.get("infohash_v1") or "").lower() == btih:
+                return t
+        return None
+
     def _delete(self, h):
         if not h:
             return
@@ -504,7 +519,7 @@ class QbitBackend(Backend):
             btih, tname, size, _ = torrent_meta(drop)
         else:
             btih, tname, size, _ = magnet_meta(magnet)
-        if btih and self._info([btih]):
+        if btih and self._find(btih):
             raise Exists()
         need = size or UNKNOWN_SIZE
         free = self._free()
@@ -542,32 +557,37 @@ class QbitBackend(Backend):
             except ValueError:
                 ok = False
         if not ok:
-            if btih and self._info([btih]):
+            if btih and self._find(btih):
                 raise Exists()
             raise RuntimeError(f"qBittorrent refused the add ({body[:60]!r})")
+        t = None
         for _ in range(10):  # adds are asynchronous for magnets
-            if not btih or self._info([btih]):
+            if not btih:
+                break
+            t = self._find(btih)
+            if t:
                 break
             time.sleep(0.5)
         else:
             raise RuntimeError("qBittorrent accepted the add but doesn't list the torrent")
         self.reserved += need
         # Titled after the *arr's release name (the drop): supersede's movie_key and the logs work
-        # from it. The torrent's own name is kept too.
-        return {"title": drop.stem, "torrent_hash": btih, "torrent_name": tname, "size": size}
+        # from it. The torrent's own name is kept too. torrent_hash = qBittorrent's id (differs
+        # from the v1 btih for hybrid torrents); btih = v1, for the bridge's duplicate check.
+        qid = (t["hash"].lower() if t else btih) or None
+        return {"title": drop.stem, "torrent_hash": qid, "btih": btih or None, "torrent_name": tname, "size": size}
 
     def locate(self, btih, title):
         try:
-            ts = self._info([btih]) if btih else []
+            t = self._find(btih) if btih else None
         except Exception as e:
             log(f"    already on the seedbox but listing it failed ({e}); will retry next loop")
             return None
-        if not ts:
+        if not t:
             log("    seedbox refused a duplicate but doesn't list it; will retry next loop")
             return None
-        t = ts[0]
         where = "complete" if t.get("progress", 0) >= 1 else f"in progress {t.get('progress', 0) * 100:.0f}%"
-        return {"torrent_hash": btih, "torrent_name": t.get("name")}, where
+        return {"torrent_hash": t["hash"].lower(), "btih": btih, "torrent_name": t.get("name")}, where
 
     def begin_loop(self, records):
         self.reserved = 0
