@@ -105,8 +105,14 @@ class Handler(BaseHTTPRequestHandler):
             S.adds.append(form)
             if S.add_mode == "409":
                 return self._send(409, "")
-            h = urllib.parse.parse_qs(urllib.parse.urlsplit(form["urls"]).query)["xt"][0].split(":")[-1]
-            S.torrents[h] = dict(hash=h, name="x", progress=0.0, state="metaDL", amount_left=1, tags=form.get("tags", ""))
+            xts = urllib.parse.parse_qs(urllib.parse.urlsplit(form["urls"]).query)["xt"]
+            v1 = next(x.split(":")[-1] for x in xts if x.startswith("urn:btih:"))
+            v2 = next((x.split(":")[-1][4:] for x in xts if x.startswith("urn:btmh:1220")), None)
+            h = v2[:40] if v2 else v1  # libtorrent 2: a hybrid torrent's id is its truncated v2 hash
+            if h in S.torrents:  # qBittorrent 4.x answers a duplicate with "Fails."
+                return self._send(200, "Fails.")
+            S.torrents[h] = dict(hash=h, infohash_v1=v1, infohash_v2=v2 or "", name="x", progress=0.0,
+                                 state="metaDL", amount_left=1, tags=form.get("tags", ""))
             if S.add_mode == "json5":
                 return self._send(200, json.dumps({"success_count": 1, "failure_count": 0}), "application/json")
             return self._send(200, "Ok.")
@@ -277,6 +283,22 @@ class QbitTest(unittest.TestCase):
         self.qb.add_mode = "409"
         with self.assertRaises(Exists):
             self.be.add(*self.drop("R9", magnet("2" * 40, GiB)))
+
+    def test_hybrid_torrent_found_by_v1_hash(self):
+        v1, v2 = "a6" * 20, "2b" * 32
+        m = magnet(v1, GiB) + f"&xt=urn:btmh:1220{v2}"
+        keys = self.be.add(*self.drop("H1", m))
+        self.assertEqual((keys["torrent_hash"], keys["btih"]), (v2[:40], v1),
+                         "the record keeps qBittorrent's id, plus the v1 hash for duplicate checks")
+        with self.assertRaises(Exists):  # the pre-check sees it by infohash_v1
+            self.be.add(*self.drop("H2", m))
+        self.assertEqual(len(self.qb.adds), 1)
+        found, where = self.be.locate(v1, "H2")
+        self.assertEqual((found["torrent_hash"], found["btih"], where), (v2[:40], v1, "in progress 0%"))
+        self.qb.torrents[v2[:40]].update(progress=1.0, state="uploading")
+        r = self.rec(v2[:40])
+        self.loop(r)
+        self.assertEqual(self.be.status(r)[0], DONE)
 
     # --- status / holds --------------------------------------------------------------------------
 
