@@ -25,7 +25,7 @@ services:
     logging: *logging
 
   loki-gateway:
-    image: nginx:1.30.6-alpine
+    image: nginx:1.31.8-alpine
     container_name: loki-gateway
     restart: unless-stopped
     depends_on: [loki]
