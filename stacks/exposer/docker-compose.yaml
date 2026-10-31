@@ -173,7 +173,7 @@ services:
   # from stacks/media-server. DIUN posts to NTFY_TOPIC_DIUN (its own topic, see media-server's
   # CLAUDE.md "ntfy: two topics"); autoheal restarts any container labelled autoheal=true.
   diun:
-    image: crazymax/diun:4.33.0                  # pinned
+    image: crazymax/diun:4.33.1                  # pinned
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+$$'
       - 'updater.policy=approve'

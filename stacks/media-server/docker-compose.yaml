@@ -395,7 +395,7 @@ services:
   # scraper domain re-alerts every crawl pass) buried DIUN's once-daily batch. Keep them
   # split — the two feeds have completely different cadences and urgencies.
   diun:
-    image: crazymax/diun:4.33.0                  # pinned
+    image: crazymax/diun:4.33.1                  # pinned
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+$$'
       - 'updater.policy=approve'
