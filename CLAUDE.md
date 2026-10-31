@@ -90,3 +90,6 @@ LLM calls (Hermes, `~/hermes` on the Jetson) are traced in Langfuse on the HP (`
   `GEO_ALLOW_COUNTRIES` in `stacks/exposer/docker-compose.yaml`. Every new public vhost must
   `import geo_filter`. Locked out abroad → "Geo filter" in `stacks/exposer/CLAUDE.md`
   (`docker exec caddy geoip blocked`, Tailscale + LAN addresses, how to allow a country).
+- Every compose service caps its log (`logging:` json-file, `max-size: "10m"`, `max-file: "3"`; most stacks
+  use an `x-logging` anchor). CI fails a service without it: Docker's default log grows without limit
+  (bazarr wrote 300 MB in 6 days), and the full history is in Loki anyway (see "Logs").

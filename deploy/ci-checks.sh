@@ -35,6 +35,12 @@ for d in stacks/*/; do
     fi
     printf '   %-14s %-8s' "$s" "$env"
     if docker compose "${a[@]}" config -q 2>"$tmp/err"; then echo ok; else echo "FAILED: $(tail -1 "$tmp/err")"; fails=$((fails + 1)); fi
+    # every container caps its log: docker's json-file default grows without limit (bazarr: 300 MB in 6 days)
+    uncapped=$(docker compose "${a[@]}" config --format json 2>/dev/null | python3 -c '
+import json, sys
+svc = json.load(sys.stdin)["services"]
+print(" ".join(n for n, s in svc.items() if not (s.get("logging") or {}).get("options", {}).get("max-size")))')
+    if [ -n "$uncapped" ]; then echo "   $s $env: no logging max-size on: $uncapped"; fails=$((fails + 1)); fi
     rm -rf "$tmp"
   done
 done
