@@ -118,7 +118,7 @@ services:
   # loopback only so the host-net bouncer can reach it — on 8089, not the default
   # 8080, which zigbee2mqtt already owns.
   crowdsec:
-    image: crowdsecurity/crowdsec:v1.8.1         # pinned
+    image: crowdsecurity/crowdsec:v1.8.2         # pinned
     container_name: crowdsec
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+$$'
