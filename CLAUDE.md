@@ -51,7 +51,9 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
   `/mnt/backups` to the Jetson (`~/backups/hp-mirror`) — the only second copy of the photos. It refuses
   to run if a USB partition isn't mounted or a source is empty. ntfy only on failure.
 - Renovate (`.github/renovate.json`, GitHub App) opens image/action update PRs for the HP stacks; CI
-  tests them and the owner's merge deploys them. The Immich version is in `stacks/immich/env/prod.env`.
+  tests them. **Minor/patch bumps with green CI are merged by Renovate itself** (07:00-23:00 NY) and
+  deploy.yml deploys `renovate[bot]` merges too; majors, digest bumps, 0.x minors and Jellyfin (one-way
+  DB migrations) still need the owner's merge. The Immich version is in `stacks/immich/env/prod.env`.
   exposer too. Only the Jetson's non-repo stacks (bedroom-agent) still use `~/updater` (wud/approver).
 
 ## Status (2026-10-20)
