@@ -28,8 +28,9 @@ jobs:
 
   plan:
     needs: test
-    # Only merges/runs by the owner deploy (agents or other accounts can open PRs, never ship).
-    if: github.actor == 'RohithSurya'
+    # Only merges/runs by the owner deploy (agents or other accounts can open PRs, never ship) --
+    # plus Renovate's own auto-merges of minor/patch image bumps that passed CI (.github/renovate.json).
+    if: github.actor == 'RohithSurya' || github.actor == 'renovate[bot]'
     runs-on: [self-hosted, jetson]
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}

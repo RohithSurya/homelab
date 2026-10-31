@@ -5,7 +5,7 @@
     ":dependencyDashboard",
     "helpers:pinGitHubActionDigestsToSemver"
   ],
-  "description": "Image and action updates arrive as PRs; CI tests them, and the owner's merge deploys them (deploy.yml only deploys owner merges, so nothing here auto-merges).",
+  "description": "Image and action updates arrive as PRs and CI tests them. Minor and patch updates whose checks pass are merged by Renovate itself (automergeSchedule below) and deploy.yml deploys them (it accepts renovate[bot] merges); majors, digest bumps and Jellyfin still wait for the owner's merge.",
   "timezone": "America/New_York",
   "schedule": [
     "after 7am and before 11pm"
@@ -143,6 +143,34 @@
         "lscr.io/linuxserver/duckdns"
       ],
       "enabled": false
+    },
+    {
+      "description": "Auto-merge minor + patch updates once CI passes (Renovate never merges red or pending checks). Majors stay manual.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": false
+    },
+    {
+      "description": "0.x: a minor bump may break (semver), so it stays manual",
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "matchCurrentVersion": "/^v?0\\./",
+      "automerge": false
+    },
+    {
+      "description": "Jellyfin DB migrations are one-way: every bump stays a reviewed PR",
+      "matchPackageNames": [
+        "jellyfin/jellyfin"
+      ],
+      "automerge": false
     }
+  ],
+  "automergeSchedule": [
+    "after 7am and before 11pm"
   ]
 }
