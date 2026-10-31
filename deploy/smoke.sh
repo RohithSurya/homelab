@@ -39,6 +39,37 @@ case $stack in
     check "nextcloud status.php" nc_ok ;;
   dashboard)
     check "homepage answers" has http://127.0.0.1:3010/api/healthcheck up ;;
+  logging)
+    check "loki ready (via gateway)" has http://127.0.0.1:3100/ready ready
+    check "grafana /api/health"      has http://127.0.0.1:3020/api/health '"database": *"ok"'
+    push_locked() { [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST http://127.0.0.1:3100/loki/api/v1/push)" = 401 ]; }
+    check "gateway refuses a push without the password" push_locked
+    query_locked() { [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:3100/loki/api/v1/labels)" = 403 ]; }
+    check "gateway refuses queries" query_locked
+    hp_logs() {  # the HP's own agent has written something in the last 10 minutes
+      local q
+      q=$(python3 -c 'import urllib.parse; print(urllib.parse.quote("sum(count_over_time({host=\"hp\"}[10m]))"))')
+      docker exec grafana wget -qO- "http://loki:3100/loki/api/v1/query?query=$q" | grep -q '"result":\[{'
+    }
+    check "loki holds recent HP logs" hp_logs ;;
+  langfuse)
+    check "langfuse /api/public/health" has http://127.0.0.1:3040/api/public/health '"status":"OK"'
+    lf_keys() {  # the project's API keys (from .env) are accepted
+      local f=$DEPLOY_BASE/langfuse/.env pk sk
+      pk=$(grep -m1 '^INIT_PROJECT_PUBLIC_KEY=' "$f" | cut -d= -f2-); sk=$(grep -m1 '^INIT_PROJECT_SECRET_KEY=' "$f" | cut -d= -f2-)
+      curl -fsS -m 10 -u "$pk:$sk" http://127.0.0.1:3040/api/public/projects | grep -q hermes
+    }
+    check "langfuse accepts the Hermes project keys" lf_keys
+    relay_locked() { [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:4318/v1/traces)" = 401 ]; }
+    check "otel relay refuses a request without the keys" relay_locked ;;
+  log-agent)
+    agent_ready() { curl -fsS -m 10 http://127.0.0.1:12345/-/ready | grep -qi ready; }
+    check "alloy ready" agent_ready
+    no_push_errors() {  # loki.write reports failed pushes on its metrics; none since start
+      ! curl -fsS -m 10 http://127.0.0.1:12345/metrics \
+        | grep -E '^loki_write_dropped_entries_total\{.*reason="(http|ingester_error|rate_limited)' | grep -vq ' 0$'
+    }
+    check "alloy pushes reach the HP" no_push_errors ;;
   exposer)
     check "caddy config valid" docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
     check "fail2ban answers"   docker exec fail2ban fail2ban-client ping

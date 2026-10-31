@@ -30,7 +30,7 @@ infra/runner/                         the self-hosted GitHub Actions runner imag
 
 ## Secrets
 Bitwarden Secrets Manager. Projects: `homelab-prod`, `homelab-dev` (same names, dev values), `Hermes`.
-Secret names are `<STACK>__<KEY>` (MEDIA, IMMICH, NEXTCLOUD, EXPOSER) plus media-bridge's own
+Secret names are `<STACK>__<KEY>` (MEDIA, IMMICH, NEXTCLOUD, EXPOSER, LOGGING, LANGFUSE) plus media-bridge's own
 `SEEDBOX_*` / `TRACKER_*`. Deploys render `.env` (mode 600) from `env.tpl` with
 `deploy/envvault.py render`; nothing secret is ever committed or sent to GitHub. Each machine's
 machine-account token lives in `~/.config/homelab/bws_token` (mode 600).
@@ -65,6 +65,15 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
   (wud/approver) doesn't see the HP; KrazyZone needs a fresh login cookie (home IPv4 changed with
   the Flint 2).
 
+## Logs
+Every machine's container logs + journal, the router's syslog and the Jetson's Caddy access logs go
+to Loki on the HP (`stacks/logging`, 90 days); read them in Grafana `https://logs.home.rosurya.duckdns.org`
+(short: `logs.home`; direct `http://10.0.0.64:3020`). Log alerts (silent host, Python tracebacks,
+failed-login bursts) go to the ops ntfy topic. The Jetson and pc5090 run `stacks/log-agent`
+(pc5090 by hand -- it has no runner). The router sends its syslog itself (uci `log_ip`).
+LLM calls (Hermes, `~/hermes` on the Jetson) are traced in Langfuse on the HP (`stacks/langfuse`),
+`https://langfuse.home.rosurya.duckdns.org` (short: `traces.home`); its API stays on `http://10.0.0.64:3040`.
+
 ## Names at home
 - Dashboard: `https://home.rosurya.duckdns.org`; admin apps: `https://<app>.home.rosurya.duckdns.org`
   (Caddy `sites.d/home.caddy`, LAN + Tailscale only, real certificates).
@@ -84,3 +93,6 @@ Never print secret values: list names only (`bws secret list` in TSV form dumps 
 - Every public vhost also passes the **WAF** (CrowdSec AppSec): a new public vhost must
   `import waf` too (CI checks both). A 403 saying `[waf]` → "WAF" in `stacks/exposer/CLAUDE.md`
   (which rule, how to switch one off, emergency off switch).
+- Every compose service caps its log (`logging:` json-file, `max-size: "10m"`, `max-file: "3"`; most stacks
+  use an `x-logging` anchor). CI fails a service without it: Docker's default log grows without limit
+  (bazarr wrote 300 MB in 6 days), and the full history is in Loki anyway (see "Logs").

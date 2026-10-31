@@ -1,0 +1,32 @@
+---
+name: log-agent   # pinned: container and volume names must not depend on the checkout folder
+# Grafana Alloy on a machine other than the HP: ships this host's container logs and journal to
+# the HP's Loki through its push gateway (stacks/logging). Jetson: pipeline (compose.prod.yaml adds
+# Caddy's access logs). pc5090: by hand, see CLAUDE.md.
+services:
+  alloy:
+    image: grafana/alloy:v1.21.1
+    container_name: alloy
+    restart: unless-stopped
+    command: run --server.http.listen-addr=127.0.0.1:12345 --storage.path=/var/lib/alloy/data /etc/alloy-agent
+    network_mode: host   # the debug UI stays on 127.0.0.1; nothing is published
+    environment:
+      - LOKI_URL=${LOKI_URL:-http://10.0.0.64:3100/loki/api/v1/push}
+      - LOKI_PASSWORD=${LOKI_PASSWORD:?}
+      - HOST_LABEL=${HOST_LABEL:-unknown}
+    volumes:
+      # own folder: the image's /etc/alloy holds a sample config.alloy that would load as well
+      - ./alloy/common.alloy:/etc/alloy-agent/common.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - alloy_data:/var/lib/alloy/data   # read positions: a restart never re-sends old lines
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  alloy_data:

@@ -899,7 +899,9 @@ def adopt_existing(be, cat, mfile, magnet, nkey, private=False, rule=None, index
     # consume the duplicate.
     if btih:
         for sp, rec in load_records():
-            if (rec.get("torrent_hash") or "").lower() == btih and not rec.get("superseded"):
+            # btih: a hybrid torrent's v1 hash, when the backend's id (torrent_hash) differs
+            ids = {(rec.get("torrent_hash") or "").lower(), (rec.get("btih") or "").lower()}
+            if btih in ids and not rec.get("superseded"):
                 mfile.unlink()
                 ev.emit(rec, "duplicate_dropped", None, drop=mfile.name)
                 be.log(f"    409: already tracked as '{rec.get('title')}' -> dropped duplicate {mfile.name}")

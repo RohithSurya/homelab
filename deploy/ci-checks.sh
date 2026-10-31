@@ -11,6 +11,7 @@ step "shell scripts (shellcheck)"
 run docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0 -x -S warning \
   deploy/*.sh infra/runner/*.sh infra/hosts/*/*.sh stacks/*/post-deploy.sh \
   stacks/exposer/caddy/image/geoip stacks/exposer/caddy/image/geoip-entrypoint \
+  stacks/langfuse/retention/retention.sh \
   stacks/exposer/crowdsec/hub-refresh
 
 step "GitHub workflows (actionlint)"
@@ -35,6 +36,12 @@ for d in stacks/*/; do
     fi
     printf '   %-14s %-8s' "$s" "$env"
     if docker compose "${a[@]}" config -q 2>"$tmp/err"; then echo ok; else echo "FAILED: $(tail -1 "$tmp/err")"; fails=$((fails + 1)); fi
+    # every container caps its log: docker's json-file default grows without limit (bazarr: 300 MB in 6 days)
+    uncapped=$(docker compose "${a[@]}" config --format json 2>/dev/null | python3 -c '
+import json, sys
+svc = json.load(sys.stdin)["services"]
+print(" ".join(n for n, s in svc.items() if not (s.get("logging") or {}).get("options", {}).get("max-size")))')
+    if [ -n "$uncapped" ]; then echo "   $s $env: no logging max-size on: $uncapped"; fails=$((fails + 1)); fi
     rm -rf "$tmp"
   done
 done
@@ -63,6 +70,23 @@ geo_imports() {  # a site file with security_headers (= public) must import geo_
   return "$ok"
 }
 run geo_imports
+
+step "Alloy configs (logging, log-agent, langfuse otel-relay)"
+run cmp stacks/logging/alloy/common.alloy stacks/log-agent/alloy/common.alloy
+alloy_img=$(sed -n 's/^ *image: *\(grafana\/alloy:[^ ]*\).*/\1/p' stacks/log-agent/docker-compose.yml)
+alloy_ok() {  # alloy_ok <file>...: the files as one config dir, as the stack mounts them
+  local tmp rc=0; tmp=$(mktemp -d); cp "$@" "$tmp/"; chmod -R a+rX "$tmp"
+  docker run --rm -e LOKI_URL=http://x/loki/api/v1/push -e LOKI_PASSWORD=x -e HOST_LABEL=ci \
+    -v "$tmp:/etc/alloy:ro" "$alloy_img" validate /etc/alloy || rc=1
+  rm -rf "$tmp"; return "$rc"
+}
+run alloy_ok stacks/logging/alloy/*.alloy
+run alloy_ok stacks/log-agent/alloy/*.alloy
+relay_ok() {
+  docker run --rm -e LANGFUSE_PUBLIC_KEY=x -e LANGFUSE_SECRET_KEY=x \
+    -v "$PWD/stacks/langfuse/otel-relay:/etc/relay:ro" "$alloy_img" validate /etc/relay
+}
+run relay_ok
 
 step "result"
 [ "$fails" = 0 ] && echo "all checks passed" || { echo "$fails check(s) failed"; exit 1; }

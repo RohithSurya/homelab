@@ -1,0 +1,21 @@
+# Loki push gateway: the only way into Loki from other machines. Push needs the agents' password;
+# /ready is open (smoke checks); everything else (queries!) is refused -- reading logs goes through
+# Grafana's login. The nginx entrypoint fills ${LOKI_PUSH_PASSWORD} into agents.htpasswd.
+server {
+    listen 3100;
+    client_max_body_size 16m;
+    resolver 127.0.0.11 valid=10s ipv6=off;   # re-resolve "loki" so a recreated Loki is found
+    set $loki http://loki:3100;
+
+    location = /ready {
+        proxy_pass $loki;
+    }
+    location = /loki/api/v1/push {
+        auth_basic "loki push";
+        auth_basic_user_file /etc/nginx/conf.d/agents.htpasswd;
+        proxy_pass $loki;
+    }
+    location / {
+        return 403;
+    }
+}

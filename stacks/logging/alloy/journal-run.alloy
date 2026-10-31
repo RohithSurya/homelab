@@ -1,0 +1,9 @@
+// HP only: its journald is volatile (/run/log/journal). Uses the relabel rules from common.alloy.
+loki.source.journal "host_volatile" {
+  path          = "/run/log/journal"
+  max_age       = "12h"
+  relabel_rules = loki.relabel.journal.rules
+  labels        = { source = "journal" }
+  forward_to    = [loki.write.central.receiver]
+}
+

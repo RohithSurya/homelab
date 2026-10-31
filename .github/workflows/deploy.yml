@@ -34,6 +34,10 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
+      - name: clear the workspace as root
+        # A `docker compose up` run inside the workspace leaves root-owned bind-mount folders that
+        # checkout (uid 1000) can't delete -- every later run then fails at checkout (2026-10-22..27).
+        run: docker run --rm --network none --entrypoint find -v "${GITHUB_WORKSPACE:?}:/w" homelab-runner:latest /w -mindepth 1 -delete
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
@@ -52,6 +56,10 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.host }}"]
     timeout-minutes: 60
     steps:
+      - name: clear the workspace as root
+        # A `docker compose up` run inside the workspace leaves root-owned bind-mount folders that
+        # checkout (uid 1000) can't delete -- every later run then fails at checkout (2026-10-22..27).
+        run: docker run --rm --network none --entrypoint find -v "${GITHUB_WORKSPACE:?}:/w" homelab-runner:latest /w -mindepth 1 -delete
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0      # rollback needs the previous commit
@@ -64,9 +72,15 @@ jobs:
         run: deploy/rollback.sh "${{ matrix.stack }}"
       - name: notify
         if: always() && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # checkout may be what failed: fetch lib.sh + envvault.py on their own so the alert still goes out
+          [ -f deploy/lib.sh ] || { rm -rf "$RUNNER_TEMP/notify" &&
+            git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$RUNNER_TEMP/notify" &&
+            cd "$RUNNER_TEMP/notify"; }
           . deploy/lib.sh
-          sha=$(git rev-parse --short HEAD)
+          sha=${GITHUB_SHA::7}
           case "${{ job.status }}/${{ steps.rollback.outcome }}" in
             success/*)        notify "deployed ${{ matrix.stack }}" "${{ matrix.stack }} @ $sha is live on ${{ matrix.host }}" ;;
             */success)        notify "ROLLED BACK ${{ matrix.stack }}" "${{ matrix.stack }} @ $sha failed its checks and was rolled back. Pre-deploy backup: $BACKUP_BASE/${{ matrix.stack }}/ . Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" high ;;

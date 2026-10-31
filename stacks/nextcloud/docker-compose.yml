@@ -7,6 +7,11 @@ services:
       - 'wud.tag.include=^10\.11\.\d+$$'
       - 'updater.policy=approve'
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: >-
       --transaction-isolation=READ-COMMITTED
       --log-bin=ROW
@@ -24,11 +29,16 @@ services:
       retries: 10
 
   redis:
-    image: redis:8.10.2-alpine3.23   # pinned
+    image: redis:8.10.3-alpine3.23   # pinned
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+-alpine\d+\.\d+$$'
       - 'updater.policy=approve'
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
 
   app:

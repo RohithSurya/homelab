@@ -1,0 +1,103 @@
+---
+name: logging   # pinned: container and volume names must not depend on the checkout folder
+# Central logs for every machine (HP only). Alloy agents ship container logs + journals into Loki;
+# Grafana (:3020, its own login) is where you read them. See CLAUDE.md.
+#   loki          stores 90 days on the NVMe. Not published: only Grafana and the gateway reach it.
+#   loki-gateway  :3100, the push door for the other machines' agents (basic auth, push only).
+#   grafana       :3020, LAN + Tailscale only (logs hold tracker names and personal data).
+#   alloy         this host's agent + the router's syslog receiver (:1514 tcp/udp).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  loki:
+    image: grafana/loki:3.7.9
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    mem_limit: 1536m
+    logging: *logging
+
+  loki-gateway:
+    image: nginx:1.30.6-alpine
+    container_name: loki-gateway
+    restart: unless-stopped
+    depends_on: [loki]
+    ports:
+      - "3100:3100"
+    environment:
+      - LOKI_PUSH_PASSWORD=${LOKI_PUSH_PASSWORD:?}
+    volumes:
+      - ./gateway/templates:/etc/nginx/templates:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    container_name: grafana
+    restart: unless-stopped
+    depends_on: [loki]
+    ports:
+      - "3020:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+      - GF_NEWS_NEWS_FEED_ENABLED=false
+      - GF_SERVER_ROOT_URL=https://logs.home.rosurya.duckdns.org/   # links in alerts (exposer home.caddy)
+      - NTFY_TOPIC=${NTFY_TOPIC:?}            # alert contact points (provisioning/alerting/ntfy.yaml)
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    mem_limit: 768m
+    logging: *logging
+
+  alloy:
+    image: grafana/alloy:v1.21.1
+    container_name: alloy
+    restart: unless-stopped
+    depends_on: [loki]
+    command: run --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy/data /etc/alloy
+    environment:
+      - LOKI_URL=http://loki:3100/loki/api/v1/push   # same network: no gateway needed
+      - LOKI_PASSWORD=${LOKI_PUSH_PASSWORD:?}
+      - HOST_LABEL=hp
+    ports:
+      - "127.0.0.1:12345:12345"   # Alloy's debug UI, this host only
+      - "1514:1514/tcp"           # router syslog
+      - "1514:1514/udp"
+    volumes:
+      - ./alloy:/etc/alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - alloy_data:/var/lib/alloy/data   # read positions: a restart never re-sends old lines
+    mem_limit: 512m
+    logging: *logging
+
+volumes:
+  loki_data:
+  grafana_data:
+  alloy_data:

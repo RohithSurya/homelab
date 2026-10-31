@@ -1,0 +1,225 @@
+---
+name: langfuse   # pinned: container and volume names must not depend on the checkout folder
+# Langfuse: LLM call tracing (LangSmith-like) for Hermes. Web UI + API on :3040, LAN + Tailscale
+# only (traces hold prompts, replies and personal data). Adapted from Langfuse's reference
+# docker-compose (v4): nothing but the web UI is published, secrets come from Bitwarden.
+# See CLAUDE.md.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3040}
+  DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?}@postgres:5432/postgres
+  SALT: ${SALT:?}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?}
+  TELEMETRY_ENABLED: "false"
+  LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_AUTH:?}
+
+x-depends: &langfuse-depends
+  postgres:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  clickhouse:
+    condition: service_healthy
+
+services:
+  langfuse-web:
+    image: langfuse/langfuse:4.66.0
+    container_name: langfuse-web
+    restart: unless-stopped
+    depends_on: *langfuse-depends
+    ports:
+      - "3040:3000"
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?}
+      HOSTNAME: 0.0.0.0             # Next.js binds to $HOSTNAME; the container's own name skips 127.0.0.1
+      AUTH_DISABLE_SIGNUP: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+      # headless first start: one org, one project with fixed API keys, one login
+      LANGFUSE_INIT_ORG_ID: home
+      LANGFUSE_INIT_ORG_NAME: Home
+      LANGFUSE_INIT_PROJECT_ID: hermes
+      LANGFUSE_INIT_PROJECT_NAME: Hermes
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${INIT_PROJECT_PUBLIC_KEY:?}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${INIT_PROJECT_SECRET_KEY:?}
+      LANGFUSE_INIT_USER_EMAIL: ${INIT_USER_EMAIL:-admin@home.lan}
+      LANGFUSE_INIT_USER_NAME: rosurya
+      LANGFUSE_INIT_USER_PASSWORD: ${INIT_USER_PASSWORD:?}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/public/health | grep -q OK"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    mem_limit: 1536m
+    logging: *logging
+
+  # OTLP relay on :4318 (otel-relay/relay.alloy): Claude Code CLI spans -> token names Langfuse reads.
+  otel-relay:
+    image: grafana/alloy:v1.21.1
+    container_name: langfuse-otel-relay
+    restart: unless-stopped
+    depends_on: [langfuse-web]
+    command: run --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy/data /etc/relay
+    ports:
+      - "4318:4318"
+    environment:
+      LANGFUSE_PUBLIC_KEY: ${INIT_PROJECT_PUBLIC_KEY:?}
+      LANGFUSE_SECRET_KEY: ${INIT_PROJECT_SECRET_KEY:?}
+    volumes:
+      - ./otel-relay:/etc/relay:ro
+    mem_limit: 256m
+    logging: *logging
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4.66.0
+    container_name: langfuse-worker
+    restart: unless-stopped
+    depends_on: *langfuse-depends
+    environment:
+      <<: *langfuse-env
+    mem_limit: 1536m
+    logging: *logging
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12.11.4
+    container_name: langfuse-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/limits.xml:/etc/clickhouse-server/config.d/limits.xml:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    mem_limit: 2g
+    logging: *logging
+
+  # Daily: drop ClickHouse months older than RETENTION_DAYS (retention/retention.sh).
+  retention:
+    image: clickhouse/clickhouse-server:25.12.11.4
+    container_name: langfuse-retention
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/retention.sh"]
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+      RETENTION_DAYS: ${RETENTION_DAYS:-90}
+    volumes:
+      - ./retention/retention.sh:/retention.sh:ro
+    mem_limit: 256m
+    logging: *logging
+
+  minio:
+    # Chainguard publishes only :latest; the digest pins it (Renovate bumps the digest).
+    image: cgr.dev/chainguard/minio:latest@sha256:3b6e40c30ecd5cea627e382ff0b82ca841f58c52294578787043ee80c8ef7c82
+    container_name: langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    # Bucket first; then, once MinIO answers, (re)apply the 90-day expiry to every object in it
+    # (raw ingestion events + media; the traces they became expire in ClickHouse via retention).
+    command:
+      - -c
+      - |
+        mkdir -p /data/langfuse
+        ( for i in $$(seq 1 60); do mc ready local >/dev/null 2>&1 && break; sleep 2; done
+          mc alias set lf http://127.0.0.1:9000 minio "$$MINIO_ROOT_PASSWORD" >/dev/null &&
+          mc ilm import lf/langfuse < /lifecycle.json && echo "lifecycle: 90-day expiry set" ||
+          echo "lifecycle: FAILED to set the expiry rule" ) &
+        exec minio server --address ":9000" --console-address ":9001" /data
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+    volumes:
+      - minio_data:/data
+      - ./minio/lifecycle.json:/lifecycle.json:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    logging: *logging
+
+  redis:
+    image: redis:8.10.3
+    container_name: langfuse-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_AUTH:?}", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    environment:
+      REDISCLI_AUTH: ${REDIS_AUTH:?}   # for the healthcheck's redis-cli
+    logging: *logging
+
+  postgres:
+    image: postgres:17.11
+    container_name: langfuse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: postgres
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  minio_data:
+  redis_data:

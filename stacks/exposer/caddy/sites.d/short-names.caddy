@@ -14,6 +14,10 @@ http://*.home, http://*.lan {
 		downloads  bridge.home.rosurya.duckdns.org
 		bridge     bridge.home.rosurya.duckdns.org
 		youtube    youtube.home.rosurya.duckdns.org
+		logs       logs.home.rosurya.duckdns.org
+		grafana    logs.home.rosurya.duckdns.org
+		langfuse   langfuse.home.rosurya.duckdns.org
+		traces     langfuse.home.rosurya.duckdns.org
 		adguard    adguard.home.rosurya.duckdns.org
 		router     router.home.rosurya.duckdns.org
 		jellyfin   jellyfin.rosurya.duckdns.org

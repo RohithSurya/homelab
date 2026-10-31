@@ -1,0 +1,13 @@
+# Bitwarden homelab-prod, LANGFUSE__*. ENCRYPTION_KEY is 64 hex chars (openssl rand -hex 32).
+# INIT_* create the org, project, API keys and the one login on first start (headless init);
+# changing them later does not change an existing user or key.
+NEXTAUTH_SECRET={{vault:LANGFUSE__NEXTAUTH_SECRET}}
+SALT={{vault:LANGFUSE__SALT}}
+ENCRYPTION_KEY={{vault:LANGFUSE__ENCRYPTION_KEY}}
+POSTGRES_PASSWORD={{vault:LANGFUSE__POSTGRES_PASSWORD}}
+CLICKHOUSE_PASSWORD={{vault:LANGFUSE__CLICKHOUSE_PASSWORD}}
+REDIS_AUTH={{vault:LANGFUSE__REDIS_AUTH}}
+MINIO_ROOT_PASSWORD={{vault:LANGFUSE__MINIO_ROOT_PASSWORD}}
+INIT_USER_PASSWORD={{vault:LANGFUSE__INIT_USER_PASSWORD}}
+INIT_PROJECT_PUBLIC_KEY={{vault:LANGFUSE__INIT_PROJECT_PUBLIC_KEY}}
+INIT_PROJECT_SECRET_KEY={{vault:LANGFUSE__INIT_PROJECT_SECRET_KEY}}

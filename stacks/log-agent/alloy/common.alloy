@@ -1,0 +1,79 @@
+// Shared by every machine's Alloy: stacks/logging/alloy (HP) and stacks/log-agent/alloy (Jetson,
+// pc5090) hold identical copies -- ci-checks.sh fails if they differ. Per-host extras live in their
+// own .alloy files next to this one.
+// Env: LOKI_URL, LOKI_PASSWORD (push gateway, user "agent"), HOST_LABEL.
+
+// Containers: every running container on this host, via the Docker socket.
+discovery.docker "local" { host = "unix:///var/run/docker.sock" }
+
+discovery.relabel "containers" {
+  targets = discovery.docker.local.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "stack"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.containers.output
+  relabel_rules = discovery.relabel.containers.rules
+  labels        = { source = "docker" }
+  forward_to    = [loki.process.recent.receiver]
+}
+
+// A container seen for the first time is read from its first log line; Loki refuses lines older
+// than 7 days (reject_old_samples_max_age), so drop those here instead of logging 400s.
+loki.process "recent" {
+  stage.drop {
+    older_than          = "167h"
+    drop_counter_reason = "too_old"
+  }
+  forward_to = [loki.write.central.receiver]
+}
+
+// Host journal (sshd, kernel/ufw, systemd units). Persistent journals live here; the HP's
+// volatile one is read by journal-run.alloy.
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_syslog_identifier"]
+    target_label  = "ident"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.source.journal "host" {
+  path          = "/var/log/journal"
+  max_age       = "12h"
+  relabel_rules = loki.relabel.journal.rules
+  labels        = { source = "journal" }
+  forward_to    = [loki.write.central.receiver]
+}
+
+loki.write "central" {
+  endpoint {
+    url = sys.env("LOKI_URL")
+    basic_auth {
+      username = "agent"
+      password = sys.env("LOKI_PASSWORD")
+    }
+  }
+  external_labels = { host = sys.env("HOST_LABEL") }
+}

@@ -14,6 +14,10 @@ jobs:
     runs-on: [self-hosted, jetson]
     timeout-minutes: 30
     steps:
+      - name: clear the workspace as root
+        # A `docker compose up` run inside the workspace leaves root-owned bind-mount folders that
+        # checkout (uid 1000) can't delete -- every later run then fails at checkout (2026-10-22..27).
+        run: docker run --rm --network none --entrypoint find -v "${GITHUB_WORKSPACE:?}:/w" homelab-runner:latest /w -mindepth 1 -delete
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: CI checks
         run: deploy/ci-checks.sh
