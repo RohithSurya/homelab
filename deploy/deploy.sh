@@ -43,7 +43,11 @@ mkdir -p "$dir"
 log "$stack @ ${sha:0:7} -> $dir ($T_ENV$([ "$dry" = 1 ] && echo ', DRY RUN'))"
 
 # 1. files. The stack's .gitignore lists its runtime state; rsync neither copies nor deletes it.
-rsync -a --delete --filter=':- .gitignore' \
+# --inplace: a changed file keeps its inode. Without it rsync writes a temp file and renames it
+# over the old one, and a container that bind-mounts that single FILE (exposer's Caddyfile,
+# CrowdSec's parser/AppSec files) keeps seeing the old inode forever -- a reload in post-deploy.sh
+# then re-reads stale config. Found 2026-10-20: CrowdSec ran PR #35's whitelist without its new rule.
+rsync -a --inplace --delete --filter=':- .gitignore' \
   --exclude=/.env --exclude=/.deployed --exclude=/.previous "$src/" "$dir/"
 
 # 2. secrets

@@ -6,6 +6,7 @@
 # Immich has no clean auth log of its own.
 immich.rosurya.duckdns.org {
 	import geo_filter
+	import waf
 	import security_headers
 	import access_log immich
 	reverse_proxy 10.0.0.64:2283   # Immich runs on the HP (homelab pipeline)

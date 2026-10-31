@@ -1,0 +1,22 @@
+# WAF exceptions: rules switched off because they blocked a real request (a false positive).
+# Loaded after crowdsecurity/appsec-default (see ../acquis.d/appsec.yaml), so it only subtracts.
+# Find the rule's name first: `docker exec crowdsec cscli alerts list -s crowdsecurity/appsec-vpatch`
+# or `docker logs crowdsec 2>&1 | grep -i appsec`. Merge to deploy (post-deploy.sh reloads CrowdSec);
+# emergency: edit /srv/homelab/exposer/crowdsec/appsec-configs/waf-exceptions.yaml on the Jetson,
+# then `docker exec crowdsec sh -c 'kill -HUP "$(pidof crowdsec)"'`. See "WAF" in ../../CLAUDE.md.
+name: local/waf-exceptions
+# Whole rule, everywhere:
+#   on_load:
+#     - apply:
+#         - RemoveInBandRuleByName("crowdsecurity/vpatch-env-access")
+# One rule, one site or path only (IsInBand is required; startsWith because the Host can carry
+# ":443" -- some clients send it):
+#   pre_eval:
+#     - filter: IsInBand && req.Host startsWith "immich.rosurya.duckdns.org"
+#       apply:
+#         - RemoveInBandRuleByName("crowdsecurity/vpatch-env-access")
+#     - filter: IsInBand && req.URL.Path startsWith "/api/some/path"
+#       apply:
+#         - RemoveInBandRuleByName("crowdsecurity/vpatch-git-config")
+# (All three forms tested 2026-10-20.)
+on_load: []

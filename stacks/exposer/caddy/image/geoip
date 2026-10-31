@@ -2,7 +2,7 @@
 # geoip — the edge country filter's helper. Run it as `docker exec caddy geoip <command>`.
 #
 #   geoip <ip> [<ip>...]   country of each IP and whether the filter lets it in
-#   geoip blocked [N]      the last N (default 20) requests the filter refused, from Caddy's logs
+#   geoip blocked [N]      the last N (default 20) requests refused by the geo filter or the WAF
 #   geoip audit            every client IP in Caddy's logs: country, allowed or not, request count
 #   geoip info             live database, its month, and the allowed countries
 #   geoip refresh          download this month's database now and reload Caddy
@@ -98,10 +98,10 @@ case "${1:-}" in
   blocked)
     n=${2:-20}
     alllogs \
-      | jq -r 'select(.resp_headers["X-Blocked-By"] == ["geo"])
-               | "\(.ts | if type=="number" then todate else . end)  \(.request.client_ip)  \(.request.host)\(.request.uri)"' \
+      | jq -r '(.resp_headers["X-Blocked-By"] // [])[0] as $by | select($by == "geo" or $by == "waf")
+               | "\(.ts | if type=="number" then todate else . end)  \($by)  \(.request.client_ip)  \(.request.host)\(.request.uri)"' \
       | sort | tail -n "$n" \
-      | while read -r ts ip rest; do echo "$ts  $ip $(country "$ip")  $rest"; done ;;
+      | while read -r ts by ip rest; do echo "$ts  $by  $ip $(country "$ip")  $rest"; done ;;
   audit)
     alllogs | jq -r '.request.client_ip // empty' | sort | uniq -c | sort -rn \
       | while read -r n ip; do printf '%6s  %-40s %s\n' "$n" "$ip" "$(verdict "$ip")"; done ;;

@@ -13,14 +13,15 @@ DIUN + autoheal live in this stack. **Deployed by the homelab pipeline** to `/sr
 the Jetson (Jetson runner; secrets from Bitwarden `homelab-dev`, `EXPOSER__*`, via the `jetson-dev`
 machine account). Image updates come as Renovate PRs. `~/exposer` is the retired hand-run copy. Off-the-shelf
 containers, no custom code — two local builds: `crowdsec-bouncer` only wraps an official
-release binary, and `caddy` is stock Caddy + one plugin for the country filter (see *Geo filter*):
+release binary, and `caddy` is stock Caddy + two plugins, for the country filter and the WAF (see
+*Geo filter* and *WAF*):
 
 | service | role |
 |---|---|
-| `caddy` | TLS termination (Let's Encrypt) + reverse proxy + **US/India-only geo filter**; owns host `:80`/`:443` |
+| `caddy` | TLS termination (Let's Encrypt) + reverse proxy + **US/India-only geo filter** + **WAF** hook; owns host `:80`/`:443` |
 | `duckdns` | keeps `rosurya.duckdns.org` pointed at the dynamic Comcast WAN IP |
 | `fail2ban` | tails the public-facing auth logs and bans brute-forcers via host iptables |
-| `crowdsec` | reads Caddy's access logs for scans/probes/CVE attempts; pulls the community blocklist |
+| `crowdsec` | reads Caddy's access logs for scans/probes/CVE attempts; pulls the community blocklist; **is the WAF** (AppSec, loopback `:7422`) |
 | `crowdsec-bouncer` | drops the IPs crowdsec has decided on, via an ipset rule on host `INPUT` |
 
 It was split out of `../media-server` so that the application stacks are independently
@@ -46,18 +47,21 @@ docker exec crowdsec cscli decisions list     # local bans (add -a to include th
 docker exec crowdsec cscli alerts list        # what triggered them
 docker exec crowdsec cscli decisions delete --ip 1.2.3.4
 docker exec crowdsec cscli metrics show acquisition   # is it actually reading the Caddy logs?
-docker exec caddy geoip blocked 50            # last 50 requests the geo filter refused
+docker exec caddy geoip blocked 50            # last 50 requests the geo filter or the WAF refused
 docker exec caddy geoip 1.2.3.4               # country of an IP + allowed or not
+docker logs crowdsec 2>&1 | grep 'WAF block'  # every WAF block: rule name + client IP
+docker exec crowdsec cscli metrics show appsec   # WAF: requests checked / blocked, hits per rule
 ```
 
 Validate a Caddyfile edit *without* touching the running server:
 
 ```bash
-docker run --rm -e GEO_ALLOW_COUNTRIES="US IN" -v ./caddy:/etc/caddy:ro \
+docker run --rm -e GEO_ALLOW_COUNTRIES="US IN" -e CROWDSEC_CADDY_BOUNCER_KEY=x -v ./caddy:/etc/caddy:ro \
   caddy-geo-local caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 ```
 
-(Stock `caddy:*` images can't validate it any more: they don't know `maxmind_geolocation`.)
+(Stock `caddy:*` images can't validate it any more: they don't know `maxmind_geolocation`, `crowdsec`
+or `appsec`.)
 
 ## Geo filter: public vhosts answer only the US and India
 
@@ -130,6 +134,81 @@ How it works:
    it unless the change is also in git.
 6. **Database looks wrong or stale**: `docker exec caddy geoip refresh` (downloads, verifies,
    reloads). If the downloads keep failing, the baked copy still works; it's just older.
+7. **A 403 that says `[waf]`** instead of `[geo filter]` is the WAF, not the country — see *WAF* below.
+
+## WAF: every public request is checked against known exploits
+
+**Since 2026-10-20 every request to a public vhost passes the geo filter first, then the WAF:**
+CrowdSec's AppSec component checks it (method, URL, headers, first 1 MiB of the body) against its
+blocking rules and answers allow/block in ~4 ms. A block is a plain
+`403 Request blocked by the web application firewall (your IP: x.x.x.x). [waf]` with the response
+header `X-Blocked-By: waf` (in the access log, so `geoip blocked` lists it).
+
+What it blocks — `crowdsecurity/appsec-default` (`crowdsec/acquis.d/appsec.yaml`):
+- **Virtual patches** (`crowdsecurity/vpatch-*`, ~190): one rule per actively exploited CVE
+  (Grafana path traversal, Fortinet, Jira, PHP-CGI, …), plus `.env` / `.git` / `.svn` grabs and
+  Symfony/Laravel debug probes. They are narrow — each matches one exploit's exact request — which
+  is why they almost never hit real traffic.
+- A few generic rules (`crowdsecurity/generic-*`: WordPress uploads, Freemarker SSTI).
+- Report-only (never block): `crowdsecurity/experimental-*` (e.g. "no User-Agent").
+- Honest scope (2026-10-20): **no rule targets Jellyfin, Immich, Nextcloud or Home Assistant yet.**
+  The value today is killing exploit scanners on their first request (instead of after the fact,
+  from the logs) and banning them: two *different* rules hit by one IP within 60 s =
+  `crowdsecurity/appsec-vpatch` ban, enforced by the firewall bouncer. If one of our apps gets a
+  mass-exploited CVE, the hub usually ships a vpatch rule within days — `hub-refresh` picks it up.
+
+How it's wired:
+- `caddy/Caddyfile`: global `crowdsec { … }` block (LAPI `127.0.0.1:8089`, AppSec
+  `127.0.0.1:7422`) + `(waf)` snippet, imported after `geo_filter` in each public site file
+  (**CI fails a public site file without `import waf`**). `order appsec before reverse_proxy` puts
+  it after `respond`, so geo-refused requests never reach CrowdSec.
+- Plugin: `hslatman/caddy-crowdsec-bouncer` (its `appsec` package only), pinned in
+  `caddy/image/Dockerfile`. Only the AppSec handler is used; bans are still enforced by the
+  firewall bouncer, not by Caddy.
+- **Bouncer key**: Caddy has its own (`CROWDSEC_CADDY_BOUNCER_KEY` = the firewall key + `-caddy`,
+  derived in compose; crowdsec registers it as bouncer `caddy` via `BOUNCER_KEY_caddy`). Each bouncer
+  needs its own key — LAPI tracks decision-stream progress per key. Registration only happens
+  if the bouncer doesn't exist yet: after rotating `CROWDSEC_BOUNCER_KEY`, also
+  `docker exec crowdsec cscli bouncers delete caddy firewall` and recreate crowdsec.
+- **Fail-open**: CrowdSec down, or no answer in 500 ms → the request passes unchecked (Caddy logs
+  `appsec component unavailable`). The sites never go down because of the WAF. Because that also
+  hides a broken WAF, `deploy/smoke.sh` requires a `/.env` probe to come back `X-Blocked-By: waf`.
+- **Bodies**: only the first 1 MiB is sent to CrowdSec (`appsec_max_body_bytes`); the rest streams
+  straight through. Without the cap the plugin would buffer whole uploads in RAM.
+- **Rules stay fresh**: the image upgrades hub items only at container start, so compose wraps its
+  entrypoint in `crowdsec/hub-refresh`: daily `cscli hub update` + `upgrade`, and a SIGHUP reload
+  only if something changed (`docker logs crowdsec | grep hub-refresh`). A reload pauses the WAF for
+  ~5 s (fail-open). `post-deploy.sh` also reloads CrowdSec, so edits to `crowdsec/` apply on deploy.
+- LAN/Tailscale requests are checked too (so a false positive shows up at home first), but CrowdSec's
+  default whitelist means a private IP is never banned.
+- Each block also becomes a CrowdSec alert (shared with the community like the log-based ones).
+
+Tested 2026-10-20 before going live (throwaway CrowdSec + Caddy on spare ports):
+- Replayed **all 23,167 distinct requests** in the Caddy logs (Jul–Oct). 659 would have been blocked,
+  every one a scanner probe; **0 real app requests** (Immich answers 200 to any path, so probes
+  there "succeeded" in the logs — that's the SPA fallback, not a hit).
+- Jellyfin playback through it: 93 MB/s vs 94 direct, seek latency unchanged; 300 parallel Immich
+  requests 0.24 s vs 0.15 s; 400 MB uploads (HTTP/1.1, HTTP/2, chunked, multipart) arrive
+  byte-identical with Caddy at ~30 MiB RAM; HA, Immich and Jellyfin WebSockets, Nextcloud WebDAV
+  verbs all pass.
+- CrowdSec stopped / hung / reloading → sites keep working (hung = +0.5 s per request).
+
+### A request is blocked by the WAF (403 `[waf]`) — what to do
+
+1. **Which rule?** `docker logs crowdsec 2>&1 | grep 'WAF block'` → `WAF block: <rule> from <ip>`,
+   and `docker exec caddy geoip blocked 50` for the URL (lines marked `waf`).
+2. **Banned too?** A timeout instead of the 403 page = firewall ban:
+   `docker exec crowdsec cscli decisions list --ip <ip>`; lift it with
+   `docker exec crowdsec cscli decisions delete --ip <ip>`.
+3. **Switch the rule off** in `crowdsec/appsec-configs/waf-exceptions.yaml` (examples inside: the
+   whole rule, or only for one site / path) and merge — the deploy reloads CrowdSec. Emergency:
+   edit `/srv/homelab/exposer/crowdsec/appsec-configs/waf-exceptions.yaml` on the Jetson, then
+   `docker exec crowdsec sh -c 'kill -HUP "$(pidof crowdsec)"'` (and put it in git after).
+4. **Switch the whole WAF off** (emergency): comment out the `appsec` line in `(waf)` in
+   `/srv/homelab/exposer/caddy/Caddyfile`, then
+   `docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile`. The next
+   pipeline deploy turns it back on unless the change is in git (and smoke.sh would fail — so a
+   permanent "off" also means removing the `waf_blocks` smoke check).
 
 ## Exposing a new service
 
@@ -149,6 +228,7 @@ This is the whole point of the repo — it must not require editing shared files
    ```caddy
    <name>.rosurya.duckdns.org {
        import geo_filter             # REQUIRED on a public vhost (CI checks); see "Geo filter"
+       import waf                    # REQUIRED on a public vhost (CI checks); see "WAF"
        import security_headers
        import access_log <name>      # only if something needs the access log
        reverse_proxy 127.0.0.1:<port>
@@ -158,7 +238,7 @@ This is the whole point of the repo — it must not require editing shared files
    cert on first request. No DuckDNS change is needed — the subdomain is covered.
 4. Optionally add a `fail2ban/jail.d/<name>.conf` + `filter.d/<name>.conf` pair.
 
-`caddy/Caddyfile` holds only global options and the `(geo_filter)` / `(security_headers)` / `(access_log)`
+`caddy/Caddyfile` holds only global options and the `(geo_filter)` / `(waf)` / `(security_headers)` / `(access_log)`
 snippets, then `import sites.d/*.caddy`. Don't add vhosts to it directly.
 
 ## Architecture: why host networking
@@ -221,7 +301,9 @@ blocklist. It registers with CrowdSec's central API on first start and shares at
   containers share `CROWDSEC_BOUNCER_KEY` from `.env`.
 - **iptables-legacy.** The bouncer image forces the legacy backend to match the host and
   Docker. (fail2ban's image uses the nf_tables backend; both hook netfilter, so both work.)
-- **A vhost with no `import access_log` is invisible to CrowdSec** — currently `nextcloud`.
+- **A vhost with no `import access_log` is invisible to CrowdSec's log scenarios** (the WAF still
+  checks it). Every public vhost has one now.
+- **The WAF is CrowdSec too** (AppSec on loopback `:7422`) — see *WAF* above.
 - **Whitelists matter.** App clients produce 404 bursts that `http-probing` reads as a scan.
   Jellyfin and Nextcloud use hub whitelists (`PARSERS=` in compose); Immich and Home Assistant
   use `crowdsec/parsers/edge-apps-whitelist.yaml`. Private/LAN IPs are whitelisted by default.

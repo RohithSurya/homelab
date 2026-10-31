@@ -78,6 +78,11 @@ case $stack in
     geo_loaded() { docker exec caddy sh -c 'caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null' \
       | python3 -c 'import json,sys; c=json.dumps(json.load(sys.stdin)); sys.exit(0 if "\"allow_countries\": [\"" in c else 1)'; }
     check "geo filter has an allow list" geo_loaded
+    # WAF: a .env probe must come back as the WAF's 403. Fail-open hides a broken WAF (CrowdSec
+    # down, Caddy's bouncer key refused): every request would pass and nothing else would notice.
+    waf_blocks() { curl -sk -m 10 -o /dev/null -D - --resolve "jellyfin.rosurya.duckdns.org:443:127.0.0.1" \
+      "https://jellyfin.rosurya.duckdns.org/.env" | tr -d '\r' | grep -qi '^x-blocked-by: waf'; }
+    check "waf blocks a .env probe" waf_blocks
     for h in jellyfin immich nextcloud; do
       site_up() { local c; c=$(curl -sk -o /dev/null -w '%{http_code}' -m 10 --resolve "$1.rosurya.duckdns.org:443:127.0.0.1" "https://$1.rosurya.duckdns.org/"); [ "${c:0:1}" != 5 ] && [ "$c" != 000 ]; }
       check "https://$h.rosurya.duckdns.org answers" site_up "$h"

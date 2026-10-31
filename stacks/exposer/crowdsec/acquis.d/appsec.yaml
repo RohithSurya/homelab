@@ -1,0 +1,19 @@
+# The WAF: CrowdSec's AppSec component. Caddy's `appsec` handler (the (waf) snippet in
+# ../../caddy/Caddyfile) sends it every request to a public vhost; it answers allow or block.
+#
+# crowdsecurity/appsec-default = blocking ("in-band") rules: the virtual-patching rules
+# (crowdsecurity/vpatch-*: one rule per exploited CVE, plus .env / .git probes) and a few
+# generic ones (crowdsecurity/generic-*); report-only ("out-of-band") experimental rules.
+# Collections come from COLLECTIONS in docker-compose.yaml; hub-refresh keeps them current.
+# A blocked request gets a 403; two different rules hit by one IP within a minute = a ban
+# (scenario crowdsecurity/appsec-vpatch), which the firewall bouncer then enforces.
+#
+# Listens inside the container; compose publishes it on the Jetson's loopback only (:7422).
+source: appsec
+listen_addr: 0.0.0.0:7422
+routines: 4
+appsec_configs:
+  - crowdsecurity/appsec-default
+  - local/waf-exceptions          # ../appsec-configs/waf-exceptions.yaml: rules switched off (none yet)
+labels:
+  type: appsec

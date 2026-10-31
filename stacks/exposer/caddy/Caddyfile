@@ -6,6 +6,26 @@
 
 {
 	email prsurya1020@gmail.com
+
+	# The WAF (see "WAF" in ../CLAUDE.md). `appsec` runs after `respond`, so the geo filter
+	# answers first and refused countries never reach CrowdSec.
+	order appsec before reverse_proxy
+	crowdsec {
+		api_url http://127.0.0.1:8089 # CrowdSec LAPI (loopback, see compose)
+		api_key {$CROWDSEC_CADDY_BOUNCER_KEY} # Caddy's own bouncer key; compose derives it
+		appsec_url http://127.0.0.1:7422 # CrowdSec AppSec component (loopback)
+		# Only the first 1 MiB of a request body is inspected. Without a cap the plugin buffers
+		# the WHOLE body in memory first -- a 2 GB Immich video upload, all in RAM.
+		appsec_max_body_bytes 1048576
+		# CrowdSec down, or no answer within 500 ms (a check normally takes ~4 ms) = the request
+		# passes unchecked, instead of every request failing with a 500 (or, with the plugin's
+		# 2 s default, every request on every site waiting 2 s while CrowdSec hangs).
+		# The geo filter and the firewall bans keep working either way.
+		appsec_fail_open
+		appsec_timeout 500ms
+		# Blocks become Caddy errors, so (waf)'s handle_errors can say what happened.
+		enable_caddy_error
+	}
 }
 
 # Shared hardening headers. Import into every site block.
@@ -37,6 +57,21 @@
 	}
 	header @geo_blocked X-Blocked-By geo
 	respond @geo_blocked "Not available from your location (your IP: {client_ip}). [geo filter]" 403
+}
+
+# The WAF: CrowdSec AppSec checks every request (headers, URL, first 1 MiB of the body)
+# against its blocking rules -- known-exploit "virtual patches" (one per exploited CVE) and
+# probes for .env/.git files. Import into every PUBLIC vhost, after geo_filter (CI checks it).
+# A blocked request gets a plain 403 saying so, plus the response header X-Blocked-By: waf,
+# which the access log records and `docker exec caddy geoip blocked` lists. Rule hits:
+# `docker exec crowdsec cscli metrics show appsec`. Emergency off switch: comment out the
+# `appsec` line below and reload Caddy (see "WAF" in ../CLAUDE.md).
+(waf) {
+	appsec
+	handle_errors 403 {
+		header X-Blocked-By waf
+		respond "Request blocked by the web application firewall (your IP: {client_ip}). [waf]" 403
+	}
 }
 
 # Rolling JSON access log for a public vhost. Pass the log basename, e.g.

@@ -25,7 +25,7 @@ services:
   # TLS: automatic Let's Encrypt. Port 80 is blocked by Comcast, so issuance
   # happens over TLS-ALPN-01 on :443 (Caddy falls back to it automatically).
   #
-  # Built locally: stock Caddy + the country filter plugin + a baked DB-IP database
+  # Built locally: stock Caddy + the country filter + WAF plugins + a baked DB-IP database
   # (caddy/image/Dockerfile; the Caddy version is the FROM tags there, which Renovate bumps).
   caddy:
     build: ./caddy/image
@@ -38,6 +38,11 @@ services:
       # Read by the Caddyfile's (geo_filter) and by `docker exec caddy geoip`. Abroad and locked
       # out? See "Geo filter" in CLAUDE.md before editing this.
       - GEO_ALLOW_COUNTRIES=US IN
+      # Caddy's own CrowdSec bouncer key, for the WAF (crowdsec registers it as bouncer "caddy").
+      # Derived from the firewall bouncer's key instead of being a second vault secret: each
+      # bouncer needs its OWN key (LAPI tracks decision-stream progress per key, so two bouncers
+      # sharing one would miss each other's updates), and both only ever live in this .env.
+      - CROWDSEC_CADDY_BOUNCER_KEY=${CROWDSEC_BOUNCER_KEY}-caddy
     labels:
       # autoheal lives in the media-server stack but matches by LABEL across all
       # compose projects, so it still restarts this container when it goes unhealthy.
@@ -113,29 +118,39 @@ services:
   # read from each app's own log; CrowdSec reads Caddy's access logs for scans,
   # probes and CVE attempts, and pulls the community blocklist of known-bad IPs.
   # This container only DECIDES. crowdsec-bouncer below is what drops packets.
+  # It is also the WAF's brain: its AppSec component (crowdsec/acquis.d/appsec.yaml) answers
+  # Caddy's per-request "allow or block?" (see "WAF" in CLAUDE.md).
   #
   # On a normal bridge network (it needs no host access). Its API is published on
   # loopback only so the host-net bouncer can reach it — on 8089, not the default
-  # 8080, which zigbee2mqtt already owns.
+  # 8080, which zigbee2mqtt already owns. AppSec likewise, on loopback :7422.
   crowdsec:
     image: crowdsecurity/crowdsec:v1.8.2         # pinned
     container_name: crowdsec
+    # The image's entrypoint, wrapped: hub-refresh upgrades the hub items (the WAF's
+    # virtual-patching rules above all) daily, not just at container start.
+    entrypoint: ["/bin/bash", "/usr/local/bin/hub-refresh"]
+    init: true                                   # reaps hub-refresh's children (sleep, cscli)
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+$$'
       - 'updater.policy=approve'
     ports:
       - "127.0.0.1:8089:8080"
+      - "127.0.0.1:7422:7422"                    # AppSec (WAF) — Caddy only
     environment:
       - TZ=America/New_York
-      - COLLECTIONS=crowdsecurity/caddy
+      - COLLECTIONS=crowdsecurity/caddy crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules
       # Stop normal app traffic (404 bursts, long polls) reading as a scan.
       - PARSERS=crowdsecurity/jellyfin-whitelist crowdsecurity/nextcloud-whitelist
       - BOUNCER_KEY_firewall=${CROWDSEC_BOUNCER_KEY}
+      - BOUNCER_KEY_caddy=${CROWDSEC_BOUNCER_KEY}-caddy   # the WAF's key (see caddy above)
     volumes:
       - ./crowdsec/config:/etc/crowdsec                    # generated config + API credentials (gitignored)
       - ./crowdsec/data:/var/lib/crowdsec/data             # decisions db, hub data (gitignored)
       - ./crowdsec/acquis.d:/etc/crowdsec/acquis.d:ro      # which logs to read (tracked)
       - ./crowdsec/parsers/edge-apps-whitelist.yaml:/etc/crowdsec/parsers/s02-enrich/edge-apps-whitelist.yaml:ro
+      - ./crowdsec/appsec-configs/waf-exceptions.yaml:/etc/crowdsec/appsec-configs/waf-exceptions.yaml:ro   # WAF rules switched off
+      - ./crowdsec/hub-refresh:/usr/local/bin/hub-refresh:ro
       - ./caddy/logs:/var/log/caddy:ro
     healthcheck:
       test: ["CMD", "cscli", "lapi", "status"]
