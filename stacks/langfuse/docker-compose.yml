@@ -154,7 +154,7 @@ services:
 
   minio:
     # Chainguard publishes only :latest; the digest pins it (Renovate bumps the digest).
-    image: cgr.dev/chainguard/minio:latest@sha256:113218d9c3d1030eb74b91facc799365d06b6a427a3b842b168163ddd07113fe
+    image: cgr.dev/chainguard/minio:latest@sha256:3b6e40c30ecd5cea627e382ff0b82ca841f58c52294578787043ee80c8ef7c82
     container_name: langfuse-minio
     restart: unless-stopped
     entrypoint: sh
