@@ -116,7 +116,7 @@ services:
     restart: unless-stopped
 
   radarr:
-    image: lscr.io/linuxserver/radarr:6.4.4.10685-ls324   # pinned
+    image: lscr.io/linuxserver/radarr:6.4.4.10685-ls326   # pinned
     logging: *default-logging
     labels:
       - 'wud.tag.include=^\d+\.\d+\.\d+\.\d+-ls\d+$$'
