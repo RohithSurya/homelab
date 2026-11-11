@@ -8,7 +8,7 @@
 # container swaps in each month's database and reloads Caddy (geoip-entrypoint).
 #
 # To upgrade Caddy: bump both FROM tags together (Renovate does this).
-FROM caddy:2.11.7-builder AS build
+FROM caddy:2.11.9-builder AS build
 # Pinned to a commit: the v1.0.0 tag was moved after release, so Go's checksum database
 # rejects it ("verifying module: checksum mismatch"). Never bypass that check (GONOSUMDB etc.).
 ARG GEO_PLUGIN=github.com/porech/caddy-maxmind-geolocation@9066f91c9696fcf554a0230ea768301259708ff1
@@ -16,7 +16,7 @@ ARG GEO_PLUGIN=github.com/porech/caddy-maxmind-geolocation@9066f91c9696fcf554a02
 ARG WAF_PLUGIN=github.com/hslatman/caddy-crowdsec-bouncer/appsec@v0.14.1
 RUN xcaddy build --with "${GEO_PLUGIN}" --with "${WAF_PLUGIN}"
 
-FROM caddy:2.11.7
+FROM caddy:2.11.9
 # libmaxminddb = mmdblookup (used to check a database before it goes live, and by `geoip`)
 RUN apk add --no-cache libmaxminddb jq
 COPY --from=build /usr/bin/caddy /usr/bin/caddy
