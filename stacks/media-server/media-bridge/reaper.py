@@ -11,6 +11,10 @@ Policy (env-tunable):
   * eligible        = movie has Played=true for ALL quorum users
   * grace           = delete only GRACE_DAYS after the MOST RECENT watch across users
                       (a re-watch updates LastPlayedDate, so it resets the clock)
+  * current file    = the watch must be AFTER Radarr imported the current file. Jellyfin
+                      keeps Played/LastPlayedDate by provider id, so a movie deleted and
+                      grabbed again inherits the old watch; without this it was deleted
+                      at the next run (Spider-Man: Brand New Day, twice, 2026-11-03/08)
   * match           = Jellyfin item ProviderIds.Tmdb  <->  Radarr movie tmdbId
   * scope           = all movies in the library (no opt-in tag); TV untouched
 
@@ -172,6 +176,11 @@ def reap():
             log(f"  skip '{movie.get('title')}' -> missing LastPlayedDate for a user")
             continue
         last_played = max(dates)
+        file_added = parse_jf_date((movie.get("movieFile") or {}).get("dateAdded"))
+        if file_added and file_added > last_played:
+            log(f"  skip '{movie.get('title')}' -> file added {file_added:%Y-%m-%d}, "
+                f"after the last watch ({last_played:%Y-%m-%d})")
+            continue
         age = now - last_played
         if age >= cutoff:
             candidates.append((last_played, movie))

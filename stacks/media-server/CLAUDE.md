@@ -451,6 +451,10 @@ file, folder, Bazarr `.srt` sidecars, and DB entry go together — never `rm` on
 Safety guards (keep intact): `DRY_RUN` defaults **true** (flip to false in compose only after verifying
 the dry-run list); any Jellyfin/user API failure or zero users **aborts the whole run** (never assume
 "watched"); `MAX_DELETES_PER_RUN` caps blast radius; only movies with `hasFile` are considered.
+**Only a watch of the current file counts**: a movie whose Radarr `movieFile.dateAdded` is after the
+last watch is skipped. Jellyfin keeps Played/LastPlayedDate by provider id, so a movie deleted and grabbed
+again inherits the old watch — Spider-Man: Brand New Day (watched 2026-10-11) was re-downloaded on 11-03 and
+11-07 and deleted by the next run both times. It becomes eligible again after it is re-watched.
 
 **The quorum is pinned via `JELLYFIN_USERS=rosurya`** — do not drop it back to the default (all enabled
 users). Jellyfin also has a passwordless, login-screen-visible `guest` account; since the quorum is the
