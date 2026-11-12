@@ -234,6 +234,20 @@ services:
       - MAX_DELETES_PER_RUN=5                      # blast-radius cap
       - DRY_RUN=false                              # LIVE: reaper actually deletes watched movies
       - JELLYFIN_USERS=rosurya                     # quorum excludes the passwordless guest user
+      # --- Latest Releases (fresh.py): new Indian movies picked daily by Hermes' LLM (Claude Sonnet +
+      #     web search, Muse fallback), downloaded via the bridge's own `fresh` blackhole (Radarr never
+      #     grabs or re-searches), placed unmonitored in movies-new, shown in Jellyfin's "Latest Releases"
+      #     collection and deleted after FRESH_KEEP_DAYS unless ANY user (guest too) favourited or is
+      #     part-way through it. User rules 2026-11-11; see CLAUDE.md "fresh".
+      - FRESH_MODE=approval                        # first weeks: Rohith okays each pick (Hermes digest Tue/Fri)
+      - FRESH_WEEKLY=15                            # movies per calendar week (a two-language movie is one)
+      - FRESH_OVERFLOW=5                           # extra room for films the LLM flags big
+      - FRESH_SIZE_CAP_GB=5                        # 1080p within this (multi-audio: 2x); bigger only if nothing fits
+      - FRESH_KEEP_DAYS=30
+      - FRESH_EXPIRE_DRY_RUN=false                 # LIVE: expiry deletes (guards: favourites, part-watched, keep)
+      - FRESH_EXPIRE_MAX=5                         # deletions per 6-hour check
+      - PROWLARR_URL=http://gluetun:9696           # fallback source when the scraper feeds have no usable rip
+      - PROWLARR_API_KEY=${PROWLARR_API_KEY:-}
       # --- movierulz scraper -> Torznab feed ---
       - MOVIERULZ_BASE=${MOVIERULZ_BASE}          # real site URL kept in .env, out of source
       - FLARESOLVERR_URL=http://gluetun:8191       # crawl CF-protected site via FlareSolverr

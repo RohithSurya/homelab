@@ -19,6 +19,7 @@ Two supervised threads (see main.py): serve() (HTTP form on :8003) and run_worke
 """
 
 import html
+import json
 import os
 import re
 import sqlite3
@@ -498,6 +499,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0] in ("/", "/youtube"):
             self._send(200, _page())
+        elif self.path.startswith("/fresh"):
+            self._fresh("GET")
         elif self.path.startswith("/bridge"):
             # the download bridge's status page shares this LAN-only server (see bridgeweb.py)
             csp = "default-src 'none'"
@@ -512,7 +515,35 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "not found")
 
+    def _fresh(self, method):
+        """Latest Releases API (fresh.py): JSON for Hermes/mediaops, an HTML status page at /fresh."""
+        body = None
+        if method == "POST":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n > 512 * 1024:
+                self._send(413, '{"error":"body too large"}', "application/json")
+                return
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("body must be a JSON object")
+            except ValueError as e:
+                self._send(400, json.dumps({"error": f"bad JSON: {e}"}), "application/json")
+                return
+        try:
+            import fresh
+            code, ctype, out = fresh.handle(method, self.path, body)
+        except (ValueError, KeyError, TypeError) as e:
+            code, ctype, out = 400, "application/json", json.dumps({"error": str(e)})
+        except Exception as e:
+            code, ctype, out = 500, "application/json", json.dumps({"error": repr(e)})
+        self._send(code, out, ctype, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+                                      "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
     def do_POST(self):
+        if self.path.startswith("/fresh/"):
+            self._fresh("POST")
+            return
         if self.path not in ("/submit", "/retry"):
             self._send(404, "not found")
             return

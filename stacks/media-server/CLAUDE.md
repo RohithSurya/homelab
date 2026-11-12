@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on the
 **HP Pro Mini 400 G9 (x86-64, `10.0.0.64`)** since 2026-10-20 (Jetson Orin Nano Super before). Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
-`media-bridge/` (five responsibilities in one container: blackhole bridge (Seedr/seedbox backends) + jellyfin-reaper + movierulz
+`media-bridge/` (six responsibilities in one container: blackhole bridge (Seedr/seedbox backends) + jellyfin-reaper + Latest Releases (`fresh`) + movierulz
 scraper/Torznab feed + tamilmv scraper/Torznab feed + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
 (`prowlarr/`, `radarr/`, `sonarr/`, `bazarr/`, `jellyfin/`, `data/`, `media-bridge/config/`) are
 runtime data and are gitignored — only the compose file and the custom service code are version-controlled.
@@ -50,7 +50,7 @@ docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun
 ```
 
 There is no build/lint tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its components as 11 supervised threads; 2 are pull workers). To
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 12 supervised threads; 2 are pull workers). To
 exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
 `unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
 blocks the user for it):
@@ -169,7 +169,7 @@ put the image back to `lscr.io/linuxserver/jellyfin:latest` with the four env va
 
 ## media-bridge (`media-bridge/`)
 
-One container running five components as supervised daemon threads (`main.py` → each in a try/except
+One container running six components as supervised daemon threads (`main.py` → each in a try/except
 wrapper that logs + ntfy-alerts + restarts, so one crash can't take the others down). It is **off the
 VPN** on the default bridge net; it reaches the *arr apps and FlareSolverr via `http://gluetun:<port>`
 and host-net Jellyfin via `host.docker.internal`. Shared helpers live in `common.py` (`clog`, `norm`,
@@ -752,6 +752,80 @@ Prowlarr.
   enabled on this indexer is cheap — the CF cost is entirely in the background crawler.
 - **Search behaviour is movierulz's**: `query_releases` calls the shared `search_terms`/`match_rank`,
   so the alias expansion and the "never match everything" guard described above apply here too.
+
+### Latest Releases (`media-bridge/fresh.py`, log tag `[fresh]`)
+
+New Indian movies, picked by an LLM, downloaded automatically and kept for a month. User rules from
+2026-11-11, which are settled (don't re-ask). The LLM part runs in **Hermes** on the Jetson
+(`~/hermes`: skill `fresh-movies`, `scripts/fresh/`, three cron jobs). This module has no LLM:
+- **Candidates** (`build_candidates`, hourly): movie releases from `movierulz.db` and `tamilmv.db`, grouped
+  by title + year. A movie counts if it is from this year or last and its first rip appeared within
+  `FRESH_WINDOW_DAYS` (21). Each one gets a TMDB lookup through Radarr (original language, cinema and
+  digital dates, IMDb votes) and, where movierulz has a post, its "Movie Information" block (country,
+  language, cast) fetched through FlareSolverr (at most 20 per build).
+  Rules, applied in code:
+  - **Theatre prints are rejected**: CAM/TS/TC/DVDScr/PreDVD, and an `HQ Clean` HDRip (a theatre
+    print). Radarr can't do this: it grades `PreDVD` as HDTV-1080p.
+  - **Foreign films are rejected**: the movierulz Country is not India, or TMDB's original language
+    is not Indian and the only rips are dub packs (`[Tel + Tam + Hin + Eng]`). TMDB's title search
+    can pick the wrong film, so a plain single-language Indian rip overrides TMDB.
+  - **Duplicate titles merge**: rows with the same TMDB id are one film (Mahasakthi = Mookuthi Amman 2).
+- **Picking files** (`plan_versions`), applied in this order:
+  1. **Quality**: 1080p within `FRESH_SIZE_CAP_GB` (5; multi-audio files get twice that), else the
+     smallest bigger 1080p, else 720p, else SD; 4K only if nothing else exists. Prefer TRUE WEB-DL >
+     WEB-DL/BluRay > HDRip, no hardcoded subs, AVC.
+  2. **Language**: one multi-audio file holding the original language and Telugu; otherwise a Telugu
+     file plus an original-language file.
+  3. **Third-language dubs**: if the only rip is a dub into a third language, the movie waits
+     (`waiting_lang`) for its original language or Telugu.
+  4. **Second file later**: if the second-language file shows up later, it is added then.
+- **Flow**: Hermes reads `GET /fresh/candidates` and posts `POST /fresh/decisions` with a verdict per
+  movie (download/skip/watchlist), a score, a `big` flag, and a corrected TMDB id / original language.
+  - **Approval mode** (`FRESH_MODE`, also stored in `fresh.db` meta and switchable): `download` →
+    `proposed`. The Tue/Fri digest texts the list, and Rohith's "ok 12" →
+    `POST /fresh/approve`.
+  - **Auto mode**: straight to `approved`. Picks scored below 6 start only from Friday.
+  - **Weekly cap**: `FRESH_WEEKLY` (15) per calendar week, plus `FRESH_OVERFLOW` (5) for big films.
+  - **Watchlist** films start by themselves once an HD rip appears.
+- **Downloads go through the bridge's third category, `fresh`**, not through Radarr.
+  - **Drop and pickup**: `data/blackhole/fresh/<release>.magnet`; the bridge delivers to
+    `data/downloads/fresh/<release>`, which no *arr watches.
+  - **Failures**: there is no Radarr history, so `arr_mark_failed` is a no-op and **no Radarr
+    re-search can happen**. A drop the bridge fails or drops (seen in `bridge.db` events), or one
+    still undelivered after 48h, is retried with the next-best release, up to 3 times. After that,
+    a **Prowlarr search** is the fallback: public indexers first, private last.
+  - **Supersede** stays Radarr-only, so a Telugu and a Tamil download of one film don't cancel each other.
+- **Placement** (`place`):
+  1. **Radarr movie**: added if missing, **unmonitored, no search**, root `movies-new`.
+  2. **File names**: the Telugu file, or the only file, gets the **bare name** `<Folder>.mkv`. The other
+     language gets `<Folder> - Tamil.mkv`.
+  3. **Default audio**: in a multi-audio .mkv the Telugu track is flagged default with `mkvpropedit`
+     (mkvtoolnix is baked into the image).
+  4. **Notify**: Radarr `RescanMovie` + Jellyfin `Library/Media/Updated`.
+  - **Tested 2026-11-11 on the live stack**:
+    - Jellyfin 12.4 lists the bare-named file as the first version, which is the one that plays, even
+      when it is 720p and the other is 1080p. With two labelled files it sorts by label (Tamil
+      before Telugu), which is why the Telugu file takes the bare name.
+    - A Radarr rescan of a folder with a second file only adds a file record. It never deletes, even
+      when the second file looks like an upgrade (named Remux-2160p).
+    - Radarr `DELETE movie?deleteFiles=true` removes the whole folder.
+- **Jellyfin**: the collection **"Latest Releases"** (`FRESH_COLLECTION`) holds every placed, unexpired
+  pick, synced every pass (`sync_collection`). It shows on the home screen through the Home Screen
+  Sections + Collection Sections plugins (iamparadox.dev manifest; both have 12.4 builds).
+- **Expiry** (`expire`, every 6h): `FRESH_KEEP_DAYS` (30) after placement, deleted **through Radarr**
+  (files + folder), at most 5 per run, with an ntfy notice. It deletes only movies fresh added itself.
+  It skips any movie that **any** enabled Jellyfin user (**guest included**) has favourited or is
+  part-way through, and any movie kept with `media fresh keep`. Any Jellyfin error aborts the run.
+  The reaper's own rule (watched by rosurya + 15 days) still applies to these movies.
+- **State**: `config/fresh.db`: `movies` (one row per film; status `new` → `proposed`/`approved` →
+  `active` → `done` → `expired`, or `skipped`/`foreign`/`in_library`/`duplicate`/`watchlist`/
+  `waiting_lang`/`blocked`/`rejected`/`lapsed`), `versions` (one row per file), `blocks`, `meta`.
+- **API** on the :8003 server (LAN-only; mediaops proxies it for Hermes):
+  - **Page**: `/fresh` (HTML status).
+  - **Reads**: `/fresh/status.json`, `/fresh/candidates`, `/fresh/digest`, `/fresh/movie/<id>`.
+  - **Writes** (POST JSON): `/fresh/decisions`, `approve`, `reject`, `block` (ids or titles),
+    `unblock`, `keep`, `notified`, `mode`, `run`.
+  - **CLI**: `docker exec media-bridge python -m fresh status`.
 
 ### youtube component (`media-bridge/youtube.py`)
 
