@@ -5,7 +5,7 @@ name: dashboard   # pinned: container names must not depend on the checkout fold
 # Bitwarden as HOMEPAGE_VAR_* (env.tpl). No Docker socket: it only calls the apps' APIs.
 services:
   homepage:
-    image: ghcr.io/gethomepage/homepage:v2.7.0
+    image: ghcr.io/gethomepage/homepage:v2.8.0
     container_name: homepage
     restart: unless-stopped
     ports:
