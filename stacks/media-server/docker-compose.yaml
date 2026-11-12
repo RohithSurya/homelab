@@ -242,6 +242,7 @@ services:
       - FRESH_MODE=approval                        # first weeks: Rohith okays each pick (Hermes digest Tue/Fri)
       - FRESH_WEEKLY=15                            # movies per calendar week (a two-language movie is one)
       - FRESH_OVERFLOW=5                           # extra room for films the LLM flags big
+      - FRESH_FRIDAY_EXTRA=5                       # new releases land on Fridays: Fri-Sun the cap is 15+5
       - FRESH_SIZE_CAP_GB=5                        # 1080p within this (multi-audio: 2x); bigger only if nothing fits
       - FRESH_KEEP_DAYS=30
       - FRESH_EXPIRE_DRY_RUN=false                 # LIVE: expiry deletes (guards: favourites, part-watched, keep)

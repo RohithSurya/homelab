@@ -63,6 +63,10 @@ PROFILE = os.environ.get("FRESH_PROFILE", "Any")
 
 WEEKLY = int(os.environ.get("FRESH_WEEKLY", "15"))
 OVERFLOW = int(os.environ.get("FRESH_OVERFLOW", "5"))
+# New releases land on Fridays (user, 2026-11-12): from FRIDAY_FROM (0=Mon) to Sunday the week's
+# cap grows by FRIDAY_EXTRA, so Friday's releases still find room after the week's first 15.
+FRIDAY_EXTRA = int(os.environ.get("FRESH_FRIDAY_EXTRA", "5"))
+FRIDAY_FROM = int(os.environ.get("FRESH_FRIDAY_FROM", "4"))
 WINDOW_DAYS = int(os.environ.get("FRESH_WINDOW_DAYS", "21"))      # first good rip seen within
 SIZE_CAP = float(os.environ.get("FRESH_SIZE_CAP_GB", "5")) * 1e9
 GOOD_SCORE = float(os.environ.get("FRESH_GOOD_SCORE", "6"))      # below: a "fill" pick
@@ -712,9 +716,15 @@ def week_counts(wk):
     return len(rows), sum(1 for r in rows if r["big"])
 
 
-def slots(wk, big):
+def cap(now, big=False):
+    """The week's movie cap at `now`: WEEKLY, +FRIDAY_EXTRA from Friday on, +OVERFLOW for big films."""
+    friday = datetime.date.fromtimestamp(now).weekday() >= FRIDAY_FROM
+    return WEEKLY + (FRIDAY_EXTRA if friday else 0) + (OVERFLOW if big else 0)
+
+
+def slots(wk, big, now=None):
     n, _ = week_counts(wk)
-    return (WEEKLY + (OVERFLOW if big else 0)) - n
+    return cap(now if now is not None else time.time(), big) - n
 
 
 def start_approved(now=None):
@@ -736,7 +746,7 @@ def start_approved(now=None):
     rows = q("SELECT * FROM movies WHERE status='approved' ORDER BY big DESC, score DESC, approved_at")
     started = []
     for m in rows:
-        if slots(wk, bool(m["big"])) <= 0:
+        if slots(wk, bool(m["big"]), now) <= 0:
             continue
         fill = (m["score"] or 0) < GOOD_SCORE or "unconfirmed" in (m["flags"] or "")
         if mode() == "auto" and fill and not m["big"] and weekday < FILL_WEEKDAY:
@@ -1168,7 +1178,7 @@ def digest(only_new=False):
     props = q("SELECT * FROM movies WHERE status='proposed' ORDER BY score DESC")
     if only_new:
         props = [p for p in props if not p["notified_at"]]
-    lines = [f"🎬 Latest Releases — {mode()} mode, {n}/{WEEKLY} this week"]
+    lines = [f"🎬 Latest Releases — {mode()} mode, {n}/{cap(time.time())} this week"]
     if props:
         lines.append("Proposed (reply e.g. \"ok 12 14\", \"no 13\", \"block 15\"):")
         for p in props:
@@ -1195,7 +1205,7 @@ def mark_notified(ids):
 def status_json():
     rows = q("SELECT id, title, year, status, status_why, verdict, score, big, reason, week, placed_at, keep "
              "FROM movies ORDER BY updated DESC LIMIT 300")
-    return {"mode": mode(), "week": week_id(), "week_count": week_counts(week_id())[0], "weekly": WEEKLY,
+    return {"mode": mode(), "week": week_id(), "week_count": week_counts(week_id())[0], "weekly": cap(time.time()),
             "movies": [dict(r) for r in rows],
             "versions": [dict(r) for r in q("SELECT movie_id, role, lang, title, state, tries, error, path "
                                               "FROM versions ORDER BY updated DESC LIMIT 300")]}
@@ -1239,7 +1249,7 @@ def handle(method, path, body=None):
         if p == "/fresh/status.json":
             return 200, j, json.dumps(status_json(), default=str)
         if p == "/fresh/candidates":
-            return 200, j, json.dumps({"week": week_id(), "week_count": week_counts(week_id())[0], "weekly": WEEKLY,
+            return 200, j, json.dumps({"week": week_id(), "week_count": week_counts(week_id())[0], "weekly": cap(time.time()),
                                        "mode": mode(), "last_decision": json.loads(meta_get("last_decision", "null")),
                                        "candidates": candidates_for_llm()}, default=str)
         if p == "/fresh/digest":
@@ -1305,7 +1315,7 @@ def run_once(force_build=False):
 
 
 def run_forever():
-    log(f"starting: {mode()} mode, {WEEKLY}/week (+{OVERFLOW} big), keep {KEEP_DAYS:g}d"
+    log(f"starting: {mode()} mode, {WEEKLY}/week (+{FRIDAY_EXTRA} from Friday, +{OVERFLOW} big), keep {KEEP_DAYS:g}d"
         f"{' (expiry DRY-RUN)' if EXPIRE_DRY_RUN else ''}, collection '{COLLECTION}'")
     while True:
         try:
