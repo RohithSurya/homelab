@@ -639,7 +639,12 @@ def keep_private_partial(be, cat, rec, sp, why):
     if not rec.get("private"):
         return False
     got = be.partial_bytes(rec)
-    if not got or got < PARTIAL_MIN_BYTES:
+    if got is None:
+        # unknown. A backend that reports partials can't see it right now (restarting, or an id
+        # it no longer lists): never judge that "nothing downloaded" -- keep it.
+        if not be.reports_partials:
+            return False
+    elif got < PARTIAL_MIN_BYTES:
         return False
     release = rec.get("release_name", rec["title"])
     record_failure(be, cat, rec, why)
@@ -647,8 +652,9 @@ def keep_private_partial(be, cat, rec, sp, why):
     rec.update(held=True, no_deliver=True, hold_max_until=time.time() + PARTIAL_HOLD, partial_reason=why)
     sp.write_text(json.dumps(rec))
     ev.emit(rec, "partial_kept", "seeding_undelivered", reason=why, downloaded=got)
+    have = "an unknown amount (not visible right now)" if got is None else f"{got / 2**20:.0f} MiB"
     be.log(
-        f"[{cat}] '{rec['title']}' {why}, but it is private with {got / 2**20:.0f} MiB downloaded -> "
+        f"[{cat}] '{rec['title']}' {why}, but it is private with {have} downloaded -> "
         f"failed in the *arr, torrent KEPT seeding (max {PARTIAL_HOLD // 86400}d) to avoid a hit-and-run"
     )
     return True
@@ -1119,7 +1125,7 @@ def check_completions():
             by_backend.setdefault(be.name, (be, []))[1].append((sp, rec))
     for name, (be, recs) in by_backend.items():
         try:
-            be.begin_loop(recs)
+            rekeyed = be.begin_loop(recs) or ()
         except Exception as e:
             # one backend being unreachable must not stall the others
             be.log(f"loop error: {e}")
@@ -1130,6 +1136,11 @@ def check_completions():
         if not BACKEND_UP.get(be.name, True):
             ev.emit({"tid": f"backend:{be.name}", "backend": be.name}, "backend_up", None)
         BACKEND_UP[be.name] = True
+        for sp, rec, old_id in rekeyed:  # the backend now lists it under another id: remember that
+            save(sp, rec)
+            ev.emit(rec, "rekeyed", None, old=old_id, new=rec.get("torrent_hash"))
+            be.log(f"[{rec.get('category')}] '{rec.get('title')}' is now {rec.get('torrent_hash')} on "
+                   f"{be.label} (was {old_id}: hybrid torrent re-keyed after its metadata loaded)")
         freeze_clocks(be, recs)
         for sp, rec in recs:
             check_one(be, sp, rec)

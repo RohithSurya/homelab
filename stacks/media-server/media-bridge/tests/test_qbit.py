@@ -300,6 +300,83 @@ class QbitTest(unittest.TestCase):
         self.loop(r)
         self.assertEqual(self.be.status(r)[0], DONE)
 
+    # --- hybrid torrent re-keyed after its metadata loads -----------------------------------------
+
+    def rekey(self, v1, v2, **kw):
+        """What libtorrent 2 does once a v1-only magnet's metadata shows a hybrid torrent."""
+        t = self.qb.torrents.pop(v1)
+        t.update(hash=v2[:40], infohash_v2=v2, **kw)
+        self.qb.torrents[v2[:40]] = t
+
+    def test_hybrid_magnet_rekeyed_after_metadata_is_followed(self):
+        v1, v2 = "c7" * 20, "3d" * 32
+        keys = self.be.add(*self.drop("J", magnet(v1, GiB)))
+        self.assertEqual((keys["torrent_hash"], keys["btih"]), (v1, v1), "listed by v1 while metadata loads")
+        self.rekey(v1, v2, state="downloading", progress=0.3)
+        r = self.rec(keys["torrent_hash"], btih=keys["btih"])
+        self.assertEqual(self.be.begin_loop([("SP", r)]), [("SP", r, v1)])
+        self.assertEqual((r["torrent_hash"], r["btih"]), (v2[:40], v1), "new id, v1 kept for duplicate checks")
+        self.assertEqual(self.be.status(r), (DOWNLOADING, 30.0))
+        self.assertEqual(self.be.begin_loop([("SP", r)]), [], "nothing to re-key once the id is current")
+        self.be.cancel(r)
+        self.assertEqual(self.qb.deleted, [v2[:40]], "the delete reaches the torrent")
+
+    def test_rekey_without_stored_btih_keeps_the_old_id_as_btih(self):
+        v1, v2 = "c8" * 20, "3e" * 32
+        self.qb.torrents[v2[:40]] = dict(hash=v2[:40], infohash_v1=v1, infohash_v2=v2, state="downloading", progress=0.5)
+        r = self.rec(v1)
+        self.loop(r)
+        self.assertEqual((r["torrent_hash"], r["btih"]), (v2[:40], v1))
+
+    def test_rekeyed_hold_ends_on_the_new_id(self):
+        v1, v2 = "c9" * 20, "3f" * 32
+        self.qb.torrents[v2[:40]] = dict(hash=v2[:40], infohash_v1=v1, infohash_v2=v2, state="stalledUP",
+                                         seeding_time=(48 + 3) * 3600 + 1, ratio=0.1)
+        r = self.rec(v1, btih=v1, held=True, seed_rule={"hours": 48, "ratio": None})
+        self.loop(r)
+        self.assertTrue(self.be.hold_over(r))
+        self.be.end_hold(r)
+        self.assertEqual(self.qb.deleted, [v2[:40]])
+
+    def test_several_rekeyed_torrents_are_not_a_restart(self):
+        pairs = [("d1" * 20, "4a" * 32), ("d2" * 20, "4b" * 32)]
+        for v1, v2 in pairs:
+            self.qb.torrents[v2[:40]] = dict(hash=v2[:40], infohash_v1=v1, infohash_v2=v2, state="downloading", progress=0.1)
+        recs = [self.rec(v1, btih=v1) for v1, _ in pairs]
+        self.loop(*recs)  # raised "lists none of 2 tracked torrents (restarting?)" before
+        self.assertEqual([r["torrent_hash"] for r in recs], [v2[:40] for _, v2 in pairs])
+
+    def test_missing_torrent_is_never_rekeyed_to_another(self):
+        self.qb.torrents["4c" * 20] = dict(hash="4c" * 20, infohash_v1="d3" * 20, infohash_v2="4c" * 32,
+                                          state="downloading", progress=0.1)
+        self.qb.torrents["5" * 40] = dict(hash="5" * 40, infohash_v1="5" * 40, state="downloading", progress=0.2)
+        gone, seen = self.rec("d4" * 20, btih="d4" * 20), self.rec("5" * 40)
+        self.assertEqual(self.be.begin_loop([(None, gone), (None, seen)]), [])
+        self.assertEqual(gone["torrent_hash"], "d4" * 20)
+        self.assertEqual(self.be.status(gone)[0], UNAVAILABLE)
+        with self.assertRaises(RuntimeError):  # a restarting client lists nothing, full listing too
+            self.qb.torrents.clear()
+            self.loop(self.rec("d5" * 20), self.rec("d6" * 20))
+
+    def test_rekeyed_tombstone_never_reaps_the_live_regrab(self):
+        v1, v2 = "d7" * 20, "4d" * 32
+        self.qb.torrents[v2[:40]] = dict(hash=v2[:40], infohash_v1=v1, infohash_v2=v2, state="downloading", progress=0.1)
+        dead, live = self.rec(v1, btih=v1, superseded=True), self.rec(v1, btih=v1)
+        self.loop(dead, live)
+        self.assertEqual((dead["torrent_hash"], live["torrent_hash"]), (v2[:40], v2[:40]))
+        self.be.reap(dead)
+        self.assertEqual(self.qb.deleted, [], "the live record owns it")
+        self.loop(dead)
+        self.be.reap(dead)
+        self.assertEqual(self.qb.deleted, [v2[:40]], "the tombstone's torrent is reaped once nothing live owns it")
+
+    def test_two_live_records_never_claim_one_torrent(self):
+        v1, v2 = "d8" * 20, "4e" * 32
+        self.qb.torrents[v2[:40]] = dict(hash=v2[:40], infohash_v1=v1, infohash_v2=v2, state="downloading", progress=0.1)
+        a, b = self.rec(v2[:40], btih=v1), self.rec(v1, btih=v1)
+        self.assertEqual(self.be.begin_loop([(None, a), (None, b)]), [])
+        self.assertEqual(b["torrent_hash"], v1)
+
     # --- status / holds --------------------------------------------------------------------------
 
     def rec(self, h, **kw):

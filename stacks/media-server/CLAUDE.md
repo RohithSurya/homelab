@@ -232,6 +232,14 @@ Split since 2026-09-25 into a backend-agnostic engine and pluggable **download b
 - **Private partials** (`keep_private_partial`): a private torrent that downloaded > 50 MiB is never
   cancelled on stall/supersede — it's failed in the *arr (re-grab) but kept seeding as an undelivered
   hold (`no_deliver`), capped at `PARTIAL_HOLD` (7d). Trackers count partial snatches as H&R.
+  On a backend with `reports_partials` (seedbox), "can't see it right now" (`partial_bytes` None)
+  is kept too, never read as "nothing downloaded"; Seedr never reports partials, so it is unchanged.
+- **Hybrid re-key** (`QbitBackend._rekey`, 2026-11-11, Jailer 2): a v1-only magnet is listed under its v1
+  hash while metadata loads; once it turns out hybrid v1+v2, qBittorrent (libtorrent 2) re-keys it to the
+  v2 hash cut to 40 hex chars. `begin_loop` then matches any stored id it no longer lists by
+  `infohash_v1` (exact, never by name; one full listing, only while an id is missing), switches the
+  record's `torrent_hash` in place (`btih` keeps the v1 hash for duplicate checks), and returns it;
+  the engine saves it (event `rekeyed`). `live_hashes` is built afterwards from both ids.
 
 - **Pull workers** (`puller.py`, threads `bridge-puller-N`): on `DONE` the bridge calls `be.prepare_fetch`
   (API calls stay on the bridge thread) and queues a job; the worker runs `be.pull` with connections of

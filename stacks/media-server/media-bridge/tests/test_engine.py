@@ -34,6 +34,7 @@ class Fake(Backend):
         self.calls = []
         self.next_add = None
         self.fetch_error = None
+        self.rekey = {}
 
     def add(self, drop, magnet):
         self.calls.append(("add", drop.stem))
@@ -50,6 +51,13 @@ class Fake(Backend):
 
     def begin_loop(self, records):
         self.calls.append(("loop", len(records)))
+        out = []  # like qBittorrent re-keying a hybrid torrent: the backend changes the id in place
+        for sp, r in records:
+            new = self.rekey.get(r.get("torrent_hash"))
+            if new:
+                out.append((sp, r, r["torrent_hash"]))
+                r["torrent_hash"] = new
+        return out
 
     def status(self, rec):
         t = self.t.get(rec["torrent_hash"])
@@ -144,6 +152,8 @@ class EngineTest(unittest.TestCase):
         FAKE.calls.clear()
         FAKE.next_add = None
         FAKE.fetch_error = None
+        FAKE.rekey = {}
+        FAKE.reports_partials = False
         self.bh = self.tmp / "blackhole" / "radarr"
         self.bh.mkdir(parents=True)
         (self.tmp / "blackhole" / "sonarr").mkdir(parents=True)
@@ -327,6 +337,51 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(r.get("held") and r.get("no_deliver"))
         self.assertFalse(r.get("superseded"))
         self.assertNotIn(("cancel", "Dune 2021 720p WEB"), FAKE.calls)
+
+    def test_private_supersede_of_an_invisible_torrent_is_kept(self):
+        # a backend that reports partials but can't see the torrent right now (a stale id, a
+        # restarting client): "unknown" must never be judged "nothing downloaded"
+        FAKE.reports_partials = True
+        self.drop("Dune 2021 720p WEB", h="c" * 40)
+        self.loop()
+        self.save("Dune 2021 720p WEB", private=True)
+        del FAKE.t["h-Dune 2021 720p WEB"]
+        self.drop("Dune 2021 2160p REMUX", h="d" * 40)
+        bridge.process_new_magnets()
+        r = self.rec("Dune 2021 720p WEB")
+        self.assertTrue(r.get("held") and r.get("no_deliver"))
+        self.assertNotIn(("cancel", "Dune 2021 720p WEB"), FAKE.calls)
+
+    def test_private_supersede_unknown_partial_without_reporting_still_cancels(self):
+        # Seedr never reports partials (always None): unchanged, it is cancelled as before
+        self.drop("Dune 2021 720p WEB", h="c" * 40)
+        self.loop()
+        self.save("Dune 2021 720p WEB", private=True)
+        del FAKE.t["h-Dune 2021 720p WEB"]
+        self.drop("Dune 2021 2160p REMUX", h="d" * 40)
+        bridge.process_new_magnets()
+        self.assertTrue(self.rec("Dune 2021 720p WEB").get("superseded"))
+        self.assertIn(("cancel", "Dune 2021 720p WEB"), FAKE.calls)
+
+    # --- re-keyed transfers ------------------------------------------------------------------------
+
+    def test_rekeyed_transfer_is_saved_and_followed(self):
+        self.drop("Jailer 2 2026 1080p WEB")
+        self.loop()
+        old, new = "h-Jailer 2 2026 1080p WEB", "v2-id"
+        FAKE.t[new] = FAKE.t.pop(old)
+        FAKE.t[new]["progress"] = 30.0
+        FAKE.rekey = {old: new}
+        self.loop()
+        FAKE.rekey = {}
+        sp, r = self.recs()["Jailer 2 2026 1080p WEB"]
+        self.assertEqual(json.loads(sp.read_text())["torrent_hash"], new, "the new id is on disk")
+        self.assertFalse(r.get("unavailable_since"), "never judged missing")
+        self.assertIn("rekeyed", [e[0] for e in bridgelog._db().execute("SELECT type FROM events")])
+        FAKE.t[new]["done"] = True
+        self.loop()
+        self.loop()
+        self.assertTrue((self.tmp / "downloads/radarr/Jailer 2 2026 1080p WEB/movie.mkv").exists())
 
     def test_public_supersede_still_cancels(self):
         self.drop("Dune 2021 720p WEB", h="c" * 40)
