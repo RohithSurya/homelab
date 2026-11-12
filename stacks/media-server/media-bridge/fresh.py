@@ -520,7 +520,12 @@ def build_candidates(now=None):
         if not row:
             # a new movie: only if it surfaced recently (a good rip, or a theatre print to watch)
             first = min(r["added"] for r in rels)
-            if (first_good or first) < now - WINDOW_DAYS * 86400:
+            # Recent = its LATEST usable rip is recent (or, theatre-only, its latest print). An early
+            # pre-OTT HDRip must not hide the real OTT release weeks later: Meesaya Murukku 2's first
+            # rip was a Tamil HDRip on Oct 15, its TRUE WEB-DL multi-audio on Nov 5 -- keyed on the
+            # first rip, it was never a candidate (2026-11-12).
+            latest = max(r["added"] for r in (good or rels))
+            if latest < now - WINDOW_DAYS * 86400:
                 continue
             best, alts = lookup(name, yr)
             info = {}
@@ -550,7 +555,7 @@ def build_candidates(now=None):
             why = foreign_reason(json.loads(m["info"] or "{}"), m["orig"], rels)
             if why:
                 set_status(m["id"], "foreign", why)
-        slim = [{k: r[k] for k in ("title", "size", "source", "res", "langs", "hc", "reject", "site", "btih")}
+        slim = [{k: r[k] for k in ("title", "size", "source", "res", "langs", "hc", "reject", "site", "btih", "added")}
                 for r in rels]
         x("UPDATE movies SET releases=?, first_good=COALESCE(first_good, ?) WHERE id=?",
           (json.dumps(slim), first_good, m["id"]))
@@ -601,7 +606,9 @@ def candidates_for_llm():
         out.append({"id": m["id"], "title": m["title"], "year": m["year"], "tmdb_match": facts.get("match"),
                     "tmdb_alternatives": facts.get("alternatives"), "movierulz_info": json.loads(m["info"] or "{}"),
                     "available": avail, "rejected_releases": rejected, "plan": plan,
-                    "first_good_rip": _day(m["first_good"]), "first_seen": _day(m["first_seen"])})
+                    "first_good_rip": _day(m["first_good"]),
+                    "latest_good_rip": _day(max((r.get("added") or 0 for r in rels if not r["reject"]), default=0) or None),
+                    "first_seen": _day(m["first_seen"])})
     return out
 
 

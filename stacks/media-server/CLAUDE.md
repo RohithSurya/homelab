@@ -759,8 +759,9 @@ New Indian movies, picked by an LLM, downloaded automatically and kept for a mon
 2026-11-11, which are settled (don't re-ask). The LLM part runs in **Hermes** on the Jetson
 (`~/hermes`: skill `fresh-movies`, `scripts/fresh/`, three cron jobs). This module has no LLM:
 - **Candidates** (`build_candidates`, hourly): movie releases from `movierulz.db` and `tamilmv.db`, grouped
-  by title + year. A movie counts if it is from this year or last and its first rip appeared within
-  `FRESH_WINDOW_DAYS` (21). Each one gets a TMDB lookup through Radarr (original language, cinema and
+  by title + year. A movie counts if it is from this year or last and its **latest** usable rip appeared
+  within `FRESH_WINDOW_DAYS` (21). An early pre-OTT HDRip must not hide the OTT release weeks later:
+  keyed on the first rip, Meesaya Murukku 2 (HDRip Oct 15, TRUE WEB-DL Nov 5) was never a candidate. Each one gets a TMDB lookup through Radarr (original language, cinema and
   digital dates, IMDb votes) and, where movierulz has a post, its "Movie Information" block (country,
   language, cast) fetched through FlareSolverr (at most 20 per build).
   Rules, applied in code:
