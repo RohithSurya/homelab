@@ -786,7 +786,9 @@ New Indian movies, picked by an LLM, downloaded automatically and kept for a mon
     `proposed`. The Tue/Fri digest texts the list, and Rohith's "ok 12" →
     `POST /fresh/approve`.
   - **Auto mode**: straight to `approved`. Picks scored below 6 start only from Friday.
-  - **Weekly cap**: `FRESH_WEEKLY` (15) per calendar week, plus `FRESH_OVERFLOW` (5) for big films.
+  - **Weekly cap**: `FRESH_WEEKLY` (15) per calendar week. From Friday to Sunday it is 15 +
+    `FRESH_FRIDAY_EXTRA` (5), because new releases land on Fridays (Rohith, 2026-11-12). Big films get
+    `FRESH_OVERFLOW` (5) on top. The cap counts every movie started that week.
   - **Watchlist** films start by themselves once an HD rip appears.
 - **Downloads go through the bridge's third category, `fresh`**, not through Radarr.
   - **Drop and pickup**: `data/blackhole/fresh/<release>.magnet`; the bridge delivers to

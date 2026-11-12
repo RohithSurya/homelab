@@ -203,6 +203,20 @@ class Flow(unittest.TestCase):
         fresh.approve([big])
         self.assertEqual(fresh.start_approved(), ["Ramayana Big"])
 
+    def test_friday_extra_slots(self):
+        import datetime as dt
+        thu = dt.datetime(2026, 11, 12, 12).timestamp()   # Thursday
+        fri = dt.datetime(2026, 11, 13, 17).timestamp()   # Friday
+        self.assertEqual(fresh.cap(thu), fresh.WEEKLY)
+        self.assertEqual(fresh.cap(fri), fresh.WEEKLY + fresh.FRIDAY_EXTRA)
+        self.assertEqual(fresh.cap(fri, big=True), fresh.WEEKLY + fresh.FRIDAY_EXTRA + fresh.OVERFLOW)
+        ids = [self.add_movie(f"Week Movie {i}") for i in range(22)]
+        fresh.apply_decisions([{"id": i, "verdict": "download", "score": 7} for i in ids])
+        fresh.approve(ids)
+        self.assertEqual(len(fresh.start_approved(thu)), fresh.WEEKLY)          # Thursday: 15
+        self.assertEqual(len(fresh.start_approved(fri)), fresh.FRIDAY_EXTRA)    # Friday: 5 more
+        self.assertEqual(fresh.start_approved(fri), [])                         # then full
+
     def test_waiting_lang_and_watchlist(self):
         mid = self.add_movie("Seven Boys", orig="mal")
         fresh._RELS[mid] = [rel("Seven Boys (2026) Tamil TRUE WEB-DL - 1080p - 2GB", 2, "only-tam")]
