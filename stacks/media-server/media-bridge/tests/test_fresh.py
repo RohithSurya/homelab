@@ -81,6 +81,15 @@ class Plan(unittest.TestCase):
         p = fresh.plan_versions(rs, "tam")
         self.assertEqual([v["rel"]["btih"] for v in p["versions"]], ["m"])
 
+    def test_telugu_original_avoids_big_multi_pack(self):
+        rs = [rel("Comrade Kalyan (2026) 1080p TRUE WEB-DL - AVC - [Tel + Tam + Hin + Mal + Kan] - 9GB", 9, "pack"),
+              rel("Comrade Kalyan (2026) Telugu TRUE WEB-DL - 1080p - AVC - 2.9GB - ESub", 2.9, "tel")]
+        self.assertEqual([v["rel"]["btih"] for v in fresh.plan_versions(rs, "tel")["versions"]], ["tel"])
+        # Hindi original, only Telugu files: the 5-language pack is NOT preferred over a 3 GB Telugu rip
+        rs2 = [rel("X (2026) TRUE WEB-DL - 1080p - [Tel + Tam + Mal + Kan] - 9GB", 9, "pack"),
+               rel("X (2026) Telugu TRUE WEB-DL - 1080p - 3GB", 3, "tel")]
+        self.assertEqual([v["rel"]["btih"] for v in fresh.plan_versions(rs2, "hin")["versions"]], ["tel"])
+
     def test_multi_not_taken_when_only_4k(self):
         rs = [rel("X (2026) TRUE WEB-DL - 4K SDR - HEVC - [Tam + Tel] - 9GB", 9, "k"),
               rel("X (2026) Tamil TRUE WEB-DL - 1080p - 2GB", 2, "t"),

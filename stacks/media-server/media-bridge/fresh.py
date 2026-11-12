@@ -203,17 +203,20 @@ def parse_release(title, size, language=None):
     return rel
 
 
-def tier(rel):
-    """Lower is better: 1080p within the cap, bigger 1080p, 720p, SD, then 4K (only if alone)."""
-    cap = SIZE_CAP * (2 if len(rel["langs"]) > 1 else 1)
+def tier(rel, multi=False):
+    """Lower is better: 1080p within the cap, bigger 1080p, 720p, SD, then 4K (only if alone).
+    multi=True: this file is to cover two languages at once, so it may be twice the size. A
+    multi-audio file used for ONE language is judged like any single file (a 9 GB five-language
+    pack must not beat a 3 GB Telugu rip for a Telugu original)."""
+    cap = SIZE_CAP * (2 if multi else 1)
     if rel["res"] == 1080:
         return 0 if rel["size"] <= cap * 1.05 else 1
     return {720: 2, 480: 3, 2160: 4}.get(rel["res"], 5)
 
 
-def rank_key(rel):
+def rank_key(rel, multi=False):
     """Sort key within the usable releases of one language option (min = best)."""
-    t = tier(rel)
+    t = tier(rel, multi)
     size_pref = rel["size"] if t == 1 else -rel["size"]  # above the cap: smallest; within: biggest
     return (t, -rel["src_rank"], rel["hc"], rel["hevc"], rel.get("private", False), size_pref)
 
@@ -227,8 +230,8 @@ def plan_versions(releases, orig):
         return {"status": "no_release", "versions": [], "why": "no usable HD release yet"}
     want = {"tel", orig} if orig else {"tel"}
 
-    def best(cands):
-        return min(cands, key=rank_key) if cands else None
+    def best(cands, multi=False):
+        return min(cands, key=lambda r: rank_key(r, multi)) if cands else None
 
     if orig == "tel" or not orig:
         tel = best([r for r in good if "tel" in r["langs"]])
@@ -236,10 +239,10 @@ def plan_versions(releases, orig):
             return {"status": "ok", "versions": [{"role": "primary", "lang": "tel", "rel": tel}],
                     "why": "Telugu original" if orig == "tel" else "Telugu (original unknown)"}
         return {"status": "waiting_lang", "versions": [], "why": "no Telugu release yet"}
-    multi = best([r for r in good if want <= set(r["langs"])])
+    multi = best([r for r in good if want <= set(r["langs"])], multi=True)
     tel = best([r for r in good if "tel" in r["langs"]])
     org = best([r for r in good if orig in r["langs"]])
-    if multi and (tel is None or org is None or tier(multi) <= max(tier(tel), tier(org))):
+    if multi and (tel is None or org is None or tier(multi, True) <= max(tier(tel), tier(org))):
         return {"status": "ok", "versions": [{"role": "primary", "lang": "tel", "rel": multi}],
                 "why": f"one multi-audio file ({'+'.join(multi['langs'])})"}
     out = []
