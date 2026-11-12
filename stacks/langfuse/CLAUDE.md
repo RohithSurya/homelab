@@ -56,3 +56,8 @@ and its Claude CLI spans (see `~/hermes/docker-compose.yaml`). Hermes's image pi
   it behind a public Caddy vhost.
 - The ClickHouse traces are not backed up (re-creatable only by re-running things; acceptable).
   Postgres is (`backup.sh`).
+- Postgres stays on **17** (Renovate `allowedVersions: ^17\.`). `postgres:18+` refuses this volume: the data is
+  17-format and mounted at `/var/lib/postgresql/data`, while 18 wants one mount at `/var/lib/postgresql` and
+  exits with "there appears to be PostgreSQL data in: /var/lib/postgresql/data (unused mount/volume)".
+  PR #64 (18.6) made every deploy roll langfuse back 2026-10-31..11-11. Moving to 18 = stop, back up,
+  `pg_upgrade` (or dump/restore) into the new layout, change the mount — a planned migration.

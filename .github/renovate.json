@@ -112,6 +112,16 @@
       "allowedVersions": "/^10\\.11\\./"
     },
     {
+      "description": "Langfuse's postgres stays on 17: a major needs a pg_upgrade + the 18+ volume layout (PR #64 rolled back on every deploy 2026-10-31..11-11)",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "allowedVersions": "/^17\\./"
+    },
+    {
       "description": "Immich: server + ML + its postgres together, never a major without reading the notes",
       "matchPackageNames": [
         "ghcr.io/immich-app/**"
