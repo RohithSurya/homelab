@@ -20,6 +20,9 @@ NTFY_TOPIC_DIUN={{vault:MEDIA__NTFY_TOPIC_DIUN}}
 # Mint this in the Jellyfin UI: Dashboard -> API Keys -> '+' (name it "reaper").
 JELLYFIN_API_KEY={{vault:MEDIA__JELLYFIN_API_KEY}}
 
+# Prowlarr API key: media-bridge's Latest Releases (fresh.py) searches it as a fallback source.
+PROWLARR_API_KEY={{vault:MEDIA__PROWLARR_API_KEY}}
+
 # movierulz Torznab feed apikey (also entered in Prowlarr)
 MOVIERULZ_APIKEY={{vault:MEDIA__MOVIERULZ_APIKEY}}
 # Base URL of the movierulz site to crawl (no trailing slash)

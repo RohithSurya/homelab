@@ -10,6 +10,7 @@ one container (all off-VPN, on the default bridge network):
   * reaper   -- Jellyfin "watched movie" -> Radarr reaper   (6h)
   * movierulz-- 5movierulz crawler + Torznab feed for Prowlarr (crawl ~1h, HTTP server)
   * tamilmv  -- tamilmv forum crawler + Torznab feed :8005
+  * fresh    -- Latest Releases: LLM-picked new Indian movies, kept a month (fresh.py; API /fresh on :8003)
   * youtube  -- web form (:8003) + worker: pull a YouTube full-movie into a Radarr movie
                folder via a disposable yt-dlp+ffmpeg container (no-torrent fallback)
 
@@ -27,6 +28,7 @@ import reaper
 import movierulz
 import tamilmv
 import youtube
+import fresh
 from common import clog, ntfy
 from components import COMPONENTS, enabled_components
 
@@ -68,6 +70,8 @@ def main():
     if "youtube" in parts:
         supervise("youtube-worker", youtube.run_worker)
         supervise("youtube-server", youtube.serve)
+    if "fresh" in parts:
+        supervise("fresh", fresh.run_forever)  # Latest Releases; its API is served on the :8003 server
     while True:
         time.sleep(3600)
 
