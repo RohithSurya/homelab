@@ -594,11 +594,56 @@ class QbitBackend(Backend):
         live = [r for _, r in records if r.get("torrent_hash")]
         hashes = [r["torrent_hash"].lower() for r in live]
         self.torrents = {t["hash"].lower(): t for t in self._info(hashes)}
-        self.live_hashes = {r["torrent_hash"].lower() for r in live if not r.get("superseded")}
+        rekeyed = self._rekey([(sp, r) for sp, r in records if r.get("torrent_hash")])
+        # after the re-key, and both ids: a tombstone and a live re-grab of one torrent must agree
+        self.live_hashes = set()
+        for r in live:
+            if not r.get("superseded"):
+                self.live_hashes |= {r["torrent_hash"].lower(), (r.get("btih") or "").lower()} - {""}
         # qBittorrent listing none of several tracked torrents = it is restarting / reloading its
-        # session, not that they all vanished: fail the loop so nothing is judged on it.
+        # session, not that they all vanished: fail the loop so nothing is judged on it. (Checked
+        # after the re-key, so several re-keyed torrents don't look like a restart.)
         if len(hashes) >= 2 and not self.torrents:
             raise RuntimeError(f"qBittorrent lists none of {len(hashes)} tracked torrents (restarting?)")
+        return rekeyed
+
+    def _rekey(self, records):
+        """Records whose stored id qBittorrent no longer lists, matched to a hybrid torrent by v1
+        hash and switched to its current id IN PLACE. Returns [(state_path, rec, old_id)] for
+        the bridge to persist. A v1-only magnet is listed under its v1 hash while its metadata
+        loads; once the metadata shows a hybrid v1+v2 torrent, libtorrent 2 re-keys it to the v2
+        hash cut to 40 hex chars, and the stored id finds nothing ever again (2026-11-11: Jailer
+        2 downloaded on the box while the bridge waited on "not in qBittorrent's list"). Exact
+        v1-hash match only, never by name: a torrent that is really gone stays unavailable.
+        Costs one full listing per loop, only while some stored id is missing."""
+        lost = [(sp, r) for sp, r in records if r["torrent_hash"].lower() not in self.torrents]
+        if not lost:
+            return []
+        by_v1 = {}
+        for t in self._info():
+            v1, h = (t.get("infohash_v1") or "").lower(), t["hash"].lower()
+            if v1 and v1 != h:
+                by_v1[v1] = t
+        owned_live = {r["torrent_hash"].lower() for _, r in records if not r.get("superseded")}
+        out = []
+        for sp, r in lost:
+            old = r["torrent_hash"].lower()
+            t = by_v1.get((r.get("btih") or old).lower()) or by_v1.get(old)
+            if t is None:
+                continue
+            new = t["hash"].lower()
+            if new in owned_live and not r.get("superseded"):
+                log(f"    (warning) '{r.get('title')}': {old} is now {new}, which another live record "
+                    "already owns; not re-keyed")
+                continue
+            r["torrent_hash"] = new
+            if not r.get("btih"):
+                r["btih"] = old  # the v1 hash: the bridge's duplicate check still matches the magnet
+            self.torrents[new] = t
+            if not r.get("superseded"):
+                owned_live.add(new)
+            out.append((sp, r, old))
+        return out
 
     def _torrent(self, rec):
         return self.torrents.get((rec.get("torrent_hash") or "").lower())
@@ -669,6 +714,7 @@ class QbitBackend(Backend):
     # --- follow mode (see backends/follow.py) ----------------------------------------------------
 
     follows = True
+    reports_partials = True
 
     def _follow_layout(self, h):
         """(layout, piece hashes) from the torrent itself, or None if it can't be followed."""

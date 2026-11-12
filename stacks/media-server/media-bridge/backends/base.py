@@ -66,6 +66,10 @@ class Backend:
     # Follow mode (pull finished pieces while the torrent still downloads): backends that can
     # say which pieces are done and read byte ranges set this and implement prepare_follow.
     follows = False
+    # partial_bytes() returns None only when the backend can't see the transfer right now (vs.
+    # never reporting partials at all, like Seedr): the bridge then keeps a private torrent
+    # instead of judging it "nothing downloaded".
+    reports_partials = False
     fetch_fail_log = "fetch failing"
     fetch_fail_note = "reported it complete but its files could not be fetched"
 
@@ -86,7 +90,9 @@ class Backend:
         raise NotImplementedError
 
     def begin_loop(self, records):
-        """records: [(state_path, rec)] of this backend's live transfers, incl. held/tombstoned."""
+        """records: [(state_path, rec)] of this backend's live transfers, incl. held/tombstoned.
+        May return [(state_path, rec, old_id)] for records whose torrent_hash it changed in place
+        (the backend re-keyed the transfer); the bridge saves those. None = nothing changed."""
 
     def status(self, rec):
         """(DOWNLOADING, progress%) | (DONE, result) | (NOT_VISIBLE, None) | (UNAVAILABLE, why).
