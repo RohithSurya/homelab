@@ -302,6 +302,36 @@ class Flow(unittest.TestCase):
         plan = fresh.current_plan(fresh.q("SELECT * FROM movies WHERE id=?", (a,))[0])
         self.assertEqual([(v["role"], v["lang"]) for v in plan["versions"]], [("primary", "tel"), ("secondary", "tam")])
 
+    def test_window_uses_latest_good_rip(self):
+        """Meesaya Murukku 2: an early HDRip 28 days ago, the OTT WEB-DL 7 days ago -> a candidate."""
+        import sqlite3
+        db = os.path.join(TMP, "mr.db")
+        if os.path.exists(db):
+            os.remove(db)
+        c = sqlite3.connect(db)
+        c.executescript("CREATE TABLE posts(post_id INTEGER PRIMARY KEY, url TEXT, scraped_at REAL, magnets INTEGER);"
+                        "CREATE TABLE releases(btih TEXT PRIMARY KEY, post_id INTEGER, title TEXT, kind TEXT, season INTEGER,"
+                        " language TEXT, year INTEGER, quality TEXT, size INTEGER, magnet TEXT, added_at REAL);")
+        now = time.time()
+        rows = [("old", "Meesaya Murukku 2 (2026) Tamil HDRip - 1080p - x264 - AAC - 2.8GB - HC-ESub", 2.8, now - 28 * 86400),
+                ("new", "Meesaya Murukku 2 (2026) TRUE WEB-DL - 1080p - AVC - [Tel + Tam + Hin + Mal + Kan] - 5.5GB - ESub",
+                 5.5, now - 7 * 86400),
+                ("stale", "Old Film (2026) Telugu TRUE WEB-DL - 1080p - 2GB", 2, now - 40 * 86400)]
+        for b, t, gb, ts in rows:
+            c.execute("INSERT INTO releases VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                      (b, 1, t, "movie", None, "tamil", 2026, "", int(gb * GB), f"magnet:?xt=urn:btih:{b}", ts))
+        c.commit()
+        c.close()
+        match = {"tmdb": 1538457, "orig": "tam", "has_file": False, "radarr_id": None, "monitored": False}
+        with mock.patch.object(fresh, "MOVIERULZ_DB", db), mock.patch.object(fresh, "TAMILMV_DB", "/nonexistent"), \
+             mock.patch.object(fresh, "lookup", return_value=(match, [])):
+            fresh.build_candidates(now)
+        titles = {r["title"]: r["status"] for r in fresh.q("SELECT title, status FROM movies")}
+        self.assertEqual(titles, {"Meesaya Murukku 2": "new"})  # the 40-day-old film stays out
+        cand = fresh.candidates_for_llm()[0]
+        self.assertEqual(cand["plan"]["versions"][0]["lang"], "tel")  # the multi-audio Tel+Tam file
+        self.assertGreater(cand["latest_good_rip"], cand["first_good_rip"])
+
     def test_digest_lists_proposals(self):
         mid = self.add_movie("Digest Me")
         fresh.apply_decisions([{"id": mid, "verdict": "download", "score": 7.5, "reason": "Good reviews"}])
