@@ -851,6 +851,11 @@ def materialize(rel):
     """A private-tracker release always goes to the bridge as its .torrent, never a magnet: the
     bridge learns 'private' (seed rules, no extra public trackers) only from the torrent's own
     private flag -- a `fresh` drop has no *arr history to name its indexer. Raises on failure."""
+    if rel.get("magnet") and not str(rel["magnet"]).startswith("magnet:"):
+        # Prowlarr's `magnetUrl` is often its own http download link (Uindex, 2026-11-16), which
+        # redirects to the magnet; written into a .magnet drop as-is, the bridge never picks it up.
+        rel["url"] = rel.get("url") or rel["magnet"]
+        rel["magnet"] = None
     if rel.get("torrent") or not (rel.get("private") or not rel.get("magnet")):
         return
     rr = requests.get(rel["url"], timeout=60, allow_redirects=False)

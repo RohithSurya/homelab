@@ -271,6 +271,22 @@ class Flow(unittest.TestCase):
         self.assertEqual(list(folder.iterdir()), [folder / "Musk (2026).mkv"])
 
 
+class Materialize(unittest.TestCase):
+    def test_an_http_magnet_url_is_resolved_to_the_real_magnet(self):
+        rel = {"magnet": "http://gluetun:9696/8/download?apikey=k&link=x", "url": None, "private": False}
+        redir = mock.Mock(is_redirect=True, headers={"Location": "magnet:?xt=urn:btih:abc"})
+        with mock.patch.object(fresh.requests, "get", return_value=redir) as g:
+            fresh.materialize(rel)
+        g.assert_called_once()
+        self.assertEqual(rel["magnet"], "magnet:?xt=urn:btih:abc")
+
+    def test_a_real_public_magnet_is_used_as_is(self):
+        rel = {"magnet": "magnet:?xt=urn:btih:abc", "url": "http://p/1", "private": False}
+        with mock.patch.object(fresh.requests, "get") as g:
+            fresh.materialize(rel)
+        g.assert_not_called()
+
+
 class IndianFallbackFixes(unittest.TestCase):
     def test_privacy_comes_from_the_indexer_list(self):
         with mock.patch.object(fresh, "indexer_privacy", return_value={36: True, 2: False}):
