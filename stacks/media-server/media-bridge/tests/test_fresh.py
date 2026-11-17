@@ -296,6 +296,28 @@ class Flow(unittest.TestCase):
         self.assertEqual(len(deleted), 1)
         self.assertTrue(deleted[0].endswith(f"/movie/{mid}"))
 
+    def test_collection_sync_adds_and_removes_via_user_scope(self):
+        mid = self.add_movie("Kept One")
+        fresh.x("UPDATE movies SET placed_at=?, radarr_id=7 WHERE id=?", (time.time(), mid))
+        calls = []
+
+        def fake_jf(method, path, **kw):
+            calls.append((method, path, (kw.get("params") or {}).get("Ids")))
+            if path == "Items" and (kw.get("params") or {}).get("IncludeItemTypes") == "Movie":
+                return {"Items": [{"Id": "jkeep", "Path": "/data/media/movies-new/Kept One (2026)/Kept One (2026).mkv"}]}
+            if path == "Items":  # BoxSet lookup
+                return {"Items": [{"Id": "col", "Name": fresh.COLLECTION}]}
+            if path == "Users":
+                return [{"Id": "u1", "Name": "rosurya"}]
+            if path == "Users/u1/Items":
+                return {"Items": [{"Id": "jkeep"}, {"Id": "jgone"}]}  # jgone expired
+            return None
+        with mock.patch.object(fresh, "jellyfin", side_effect=fake_jf), \
+             mock.patch.object(fresh, "radarr", return_value={"path": "/data/media/movies-new/Kept One (2026)"}):
+            fresh.sync_collection()
+        self.assertIn(("DELETE", "Collections/col/Items", "jgone"), calls)
+        self.assertFalse(any(m == "POST" and p == "Collections/col/Items" for m, p, _ in calls))  # already there
+
     def test_expiry_aborts_on_jellyfin_error(self):
         mid = self.add_movie("Old Two")
         fresh.x("UPDATE movies SET status='done', placed_at=?, radarr_added=1, radarr_id=1, jf_id='j' WHERE id=?",

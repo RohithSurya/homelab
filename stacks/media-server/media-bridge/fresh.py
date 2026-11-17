@@ -1087,7 +1087,10 @@ def sync_collection():
     cid = collection_id(create_with=list(want.values()) if want else None)
     if not cid:
         return
-    have = {it["Id"] for it in jellyfin("GET", "Items", params={"ParentId": cid}).get("Items", [])}
+    # A collection's members are listed only in a user's context: the unscoped /Items?ParentId=
+    # always returns 0, so nothing was ever removed (2026-11-12). Any enabled user sees them all.
+    user = next(u for u in jellyfin("GET", "Users") if not (u.get("Policy") or {}).get("IsDisabled"))
+    have = {it["Id"] for it in jellyfin("GET", f"Users/{user['Id']}/Items", params={"ParentId": cid}).get("Items", [])}
     add = set(want.values()) - have
     drop = have - set(want.values())
     if add:
