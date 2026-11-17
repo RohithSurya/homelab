@@ -499,7 +499,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0] in ("/", "/youtube"):
             self._send(200, _page())
-        elif self.path.startswith("/fresh"):
+        elif self.path.startswith("/fresh"):  # /fresh/* and /fresh-en/*
             self._fresh("GET")
         elif self.path.startswith("/bridge"):
             # the download bridge's status page shares this LAN-only server (see bridgeweb.py)
@@ -531,7 +531,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"error": f"bad JSON: {e}"}), "application/json")
                 return
         try:
-            import fresh
+            if self.path.split("?")[0] == "/fresh-en" or self.path.startswith("/fresh-en/"):
+                import fresh_en as fresh  # Latest Hollywood (fresh_en.py); checked first: "/fresh" is its prefix too
+            else:
+                import fresh
             code, ctype, out = fresh.handle(method, self.path, body)
         except (ValueError, KeyError, TypeError) as e:
             code, ctype, out = 400, "application/json", json.dumps({"error": str(e)})
@@ -541,7 +544,7 @@ class Handler(BaseHTTPRequestHandler):
                                       "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
     def do_POST(self):
-        if self.path.startswith("/fresh/"):
+        if self.path.startswith("/fresh/") or self.path.startswith("/fresh-en/"):
             self._fresh("POST")
             return
         if self.path not in ("/submit", "/retry"):

@@ -3,7 +3,7 @@ imports nothing that needs the services' env."""
 
 from common import clog
 
-COMPONENTS = ["bridge", "reaper", "movierulz", "tamilmv", "youtube", "fresh"]
+COMPONENTS = ["bridge", "reaper", "movierulz", "tamilmv", "youtube", "fresh", "fresh-en"]
 
 
 def enabled_components(spec):

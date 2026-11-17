@@ -29,6 +29,7 @@ import movierulz
 import tamilmv
 import youtube
 import fresh
+import fresh_en
 from common import clog, ntfy
 from components import COMPONENTS, enabled_components
 
@@ -72,6 +73,8 @@ def main():
         supervise("youtube-server", youtube.serve)
     if "fresh" in parts:
         supervise("fresh", fresh.run_forever)  # Latest Releases; its API is served on the :8003 server
+    if "fresh-en" in parts:
+        supervise("fresh-en", fresh_en.run_forever)  # Latest Hollywood; API at /fresh-en on :8003
     while True:
         time.sleep(3600)
 

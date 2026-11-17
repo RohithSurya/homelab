@@ -69,7 +69,8 @@ STATE_DIR = DATA / "blackhole" / ".bridge-state"
 # the watch folder itself let a slow or retrying fetch be imported half-done. It sits beside
 # the category folders (never inside one), on the same filesystem, so the final rename is atomic.
 INCOMING = DATA / "downloads" / ".incoming"
-CATEGORIES = ["sonarr", "radarr", "fresh"]  # fresh: Latest Releases (fresh.py) -- no *arr; fresh.py places the files
+CATEGORIES = ["sonarr", "radarr", "fresh", "fresh-en"]  # fresh / fresh-en: Latest Releases / Latest Hollywood
+# (fresh.py, fresh_en.py) -- no *arr; those modules place the files
 ROUTE_SPEC = os.environ.get("BRIDGE_ROUTE", "*:seedr")
 DEFAULT_BACKEND = "seedr"  # state files written before backends existed carry no "backend" key
 

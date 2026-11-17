@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A self-hosted media automation stack defined by a single `docker-compose.yaml`, running on the
 **HP Pro Mini 400 G9 (x86-64, `10.0.0.64`)** since 2026-10-20 (Jetson Orin Nano Super before). Pipeline: **search** (Prowlarr) → **automate** (Sonarr TV / Radarr
 movies) → **cloud download** (Seedr) → **stream** (Jellyfin). The custom Python code is one service,
-`media-bridge/` (six responsibilities in one container: blackhole bridge (Seedr/seedbox backends) + jellyfin-reaper + Latest Releases (`fresh`) + movierulz
+`media-bridge/` (six responsibilities in one container: blackhole bridge (Seedr/seedbox backends) + jellyfin-reaper + Latest Releases (`fresh`) + Latest Hollywood (`fresh-en`) + movierulz
 scraper/Torznab feed + tamilmv scraper/Torznab feed + youtube grabber); everything else is an off-the-shelf image. Service config/state directories
 (`prowlarr/`, `radarr/`, `sonarr/`, `bazarr/`, `jellyfin/`, `data/`, `media-bridge/config/`) are
 runtime data and are gitignored — only the compose file and the custom service code are version-controlled.
@@ -50,7 +50,7 @@ docker restart prowlarr flaresolverr sonarr radarr  # REQUIRED after any gluetun
 ```
 
 There is no build/lint tooling — `media-bridge` is a small Python package run directly
-(`CMD ["python", "-u", "main.py"]`, which starts its components as 12 supervised threads; 2 are pull workers). To
+(`CMD ["python", "-u", "main.py"]`, which starts its components as 13 supervised threads; 2 are pull workers). To
 exercise a change, rebuild the service and watch its logs. The bridge has offline tests (stdlib
 `unittest`, fakes only — **never run a BitTorrent client on the Jetson, not even for tests**; the ISP
 blocks the user for it):
@@ -706,7 +706,9 @@ Prowlarr.
   (`#l<lid>` highlights the link): the direct links, the live tamilmv link (current domain from meta
   `base:<site>`), the topic's torrents, and the **saved copy** of the posts. `TAMILMV_PUBLIC_URL` is the
   **Tailscale address** of the host (`http://100.110.179.59:8005`, the HP; `TAMILMV_PUBLIC_URL` in `env/prod.env`) (Radarr/Sonarr are used the same way at home and
-  away; the Jetson does not advertise `10.0.0.0/24`, so a LAN-IP link would break away from home). The
+  away). The Jetson does advertise `10.0.0.0/24` as a Tailscale subnet route (seen 2026-11-16), but a client only
+  uses it with "Use Tailscale subnets" / `--accept-routes` on, so keep links on the Tailscale address. The
+  `*.home.rosurya.duckdns.org` names (Caddy on the Jetson, `10.0.0.179`) need that setting away from home. The
   page is scraped content: `sanitize` strips scripts/iframes/handlers/`javascript:` and a strict CSP
   (`default-src 'none'`, no images — they'd tell image hosts who is looking) makes script impossible.
 - **DVD Remux rewrite** (`served_title`): Radarr reads "DVD9"/"DVD5" as a raw disc image (quality DVD-R)
@@ -829,6 +831,74 @@ New Indian movies, picked by an LLM, downloaded automatically and kept for a mon
   - **Writes** (POST JSON): `/fresh/decisions`, `approve`, `reject`, `block` (ids or titles),
     `unblock`, `keep`, `notified`, `mode`, `run`.
   - **CLI**: `docker exec media-bridge python -m fresh status`.
+
+### Latest Hollywood (`media-bridge/fresh_en.py`, log tag `[fresh-en]`)
+
+New English-language movies once they are out on digital/OTT (or disc), downloaded automatically and
+kept a month. User rules from 2026-11-16, settled (don't re-ask): English file is the main one; a Telugu
+file is added as a second one whenever it exists (never waited for); **4K first** -- 1080p now, swapped
+for 4K in place when one appears; REMUX / full disc only for films the LLM flags big; auto mode; own
+cap 7/week (+3 big); own collection **"Latest Hollywood"**.
+
+- **Same engine, second instance.** `fresh_en.py` loads `fresh.py` a second time as its own module
+  (`VARIANT=fresh-en`, `ENV_PREFIX=FRESH_EN_`, own `DEFAULTS`), then swaps the hooks it needs:
+  `scraped_releases`, `parse_release`, `tier`/`rank_key`, `plan_for`, `foreign_reason`,
+  `stale_reason`, `orig_allowed`, `display_title`, `place`, `add_missing_versions`, `retry_version`,
+  `page_extra`. Everything else (state machine, caps, retries, placement, collection, expiry, HTTP)
+  is the shared code -- **fix bugs in `fresh.py` once**. Own DB `config/fresh_en.db`, own bridge
+  category `fresh-en` (`blackhole/fresh-en`, `downloads/fresh-en`), API `:8003/fresh-en/*`
+  (`youtube.py` routes `/fresh-en` before `/fresh`), component `fresh-en`.
+- **Sources** (checked live 2026-11-16 -- see the plan `~/.claude/plans/parsed-waddling-kettle.md`):
+  - **Prowlarr RSS harvest** (`harvest`, every 2h) of the public indexers `FRESH_EN_RSS_INDEXERS`
+    (YTS, 1337x, TPB, Knaben, Uindex, TorrentDownload, LimeTorrents) -> table `feed`. P2P groups post
+    WEB-DLs the day a film streams (31 of 36 whentostream Nov titles already had rips, mostly same day).
+  - **Calendars -> targeted searches** (table `calendar`, searched every 6h for 14 days, public; private
+    at most daily while public finds nothing): TMDB discover (US, `with_release_type=4` digital only --
+    type 5 pulled in old films' new disc editions), **srrDB** scene pres (each carries `imdbId` +
+    `isForeign`), **whentostream.com RSS** headlines ("X Sets Digital Streaming Release Date": the film is
+    the run of CAPITAL words; date from the post). JustWatch is deliberately not used (no dates on its
+    pages, it missed The Odyssey, and its API is unofficial).
+  - Every candidate (`new`/`approved`/`watchlist`) gets its own search every 12h -- the RSS feed often
+    holds only one stray release of a film.
+  - Telugu dub packs come from the movierulz/tamilmv DBs (only for films the feed already has) + a
+    12-hourly "<title> <year> Telugu" search for placed films (`TELUGU_DAYS` 30).
+  - TMDB keys live in Bitwarden (`TMDB_READ_API_KEY` as a Bearer header, `TMDB_API_KEY` fallback),
+    read through `vault.py`; no key -> feed-only.
+- **Candidate rules**: English original by TMDB (no TMDB match -> not picked); this year or last;
+  **new = out on digital (else disc) within `WINDOW_DAYS` (60 since 2026-11-16, user; default 30)** -- `stale_reason` (status `old`, re-checked every build, so widening the window brings films back);
+  new 4K re-uploads keep old films' latest rip recent (Frankenstein, KPop Demon Hunters showed up).
+- **Rejects** (`parse_release_en`): CAM/TS/TC; HDRip and "HQ" on a non-BluRay source (pre-OTT
+  prints); TV episodes; 3D; AI upscales / `60fps`; multi-resolution packs; **non-English dubs** (`dual
+  lat`, `MULTi`, `TRUEFRENCH`, `ITA`, `MVO`, `DUAL`... -- unless the pack also carries Telugu); hardcoded
+  subs; unknown source; 1080p < 1 GB / 4K < 3 GB; < 3 seeders. An explicit `1080p` beats a `UHD` tag;
+  `AMZN`/`NF`/... without "WEB" is a WEB-DL.
+- **Ladder** (`tier_en`, `rank_key_en`): A+ = 4K REMUX / full disc <= 100 GB (**big films only**); A = 4K
+  8-30 GB not from an LQ group; B = 1080p 2-12 GB; C = LQ/low-bitrate 4K (YTS); then small 1080p,
+  oversize 1080p, 720p. Within a tier: group (TRaSH tier 1 > 2 > unknown > LQ), HDR (DV+HDR10 > HDR10+
+  > HDR10 > SDR > DV-only), WEB-DL > BluRay > WEBRip, service tag, Atmos/TrueHD > 5.1 > 2.0, PROPER,
+  bigger, seeders. **Public first: a private release ranks `PRIVATE_PENALTY` (2) tiers lower** -- a good
+  public 1080p beats a private 4K (private picks seed for days on the 230 GB seedbox; unknown trackers
+  get `private-default` 336h), a private 4K still beats a tiny public YTS file.
+- **Private-tracker detection**: Prowlarr search results carry only `indexerId` (no privacy field --
+  every private hit looked public until 2026-11-16). `fresh.is_private_hit` maps it through
+  `/api/v1/indexer` (unknown -> private), and `fresh.materialize` sends every private pick to the bridge
+  as its **`.torrent`** (never a magnet), so the bridge sees the private flag (seed rules, no public
+  trackers appended). Both fixes apply to the Indian feature's Prowlarr fallback too.
+- **4K upgrade**: a placed main file below tier A is watched for `UPGRADE_DAYS` (30): 12-hourly
+  "<title> <year> 2160p" search; when the plan's best is tier A, it is queued as role `primary_upgrade`,
+  placed under the **same bare name** (Jellyfin keeps the item + watch state), the old file deleted and
+  its version marked `replaced`. A failed upgrade is not retried with the next-best (could be another
+  1080p) -- the check picks the next 4K by itself. Upgrades don't count against the cap; expiry runs
+  from the first placement.
+- **Full discs** (`prepare_disc`): a delivered BDMV folder (or `.iso`, opened with 7zip) becomes one
+  lossless `.mkv` of the main title (the `.mpls` with the most bytes, `mkvmerge`), disc files deleted;
+  on failure the release is retried with the next one.
+- **Disk guard**: `FRESH_EN_MIN_FREE_GB` (300) -- no new start or upgrade below that free in `ROOT`.
+- **Start now, over the cap**: `POST /fresh-en/start {ids}` (`media fresh-en start <id>…`; same for `/fresh`)
+  starts picks immediately; they still count toward the week. Waits for a running pass.
+- **Status / CLI**: `http://10.0.0.64:8003/fresh-en` (plus "out but no rip yet" calendar table),
+  `/fresh-en/calendar.json`; `docker exec media-bridge python -m fresh_en status|build|watch|calendar`.
+- **Hermes**: skill `fresh-hollywood`, cron "Latest Hollywood: decide" (auto mode, no digest).
 
 ### youtube component (`media-bridge/youtube.py`)
 
