@@ -874,6 +874,42 @@ def materialize(rel):
     rel["torrent"] = rr.content
 
 
+def start_now(ids, now=None):
+    """Start these movies right away, over the weekly cap -- the user's call ("start the other 11").
+    They still count toward this week. Waits for a running pass so the loop can't start them twice."""
+    now = now or time.time()
+    if not _run_lock.acquire(timeout=90):
+        raise RuntimeError("a pass is running; try again in a minute")
+    try:
+        if not disk_ok():
+            raise RuntimeError(f"less than {MIN_FREE_GB:g} GB free in {ROOT}")
+        out = []
+        for mid in ids:
+            r = q("SELECT * FROM movies WHERE id=?", (int(mid),))
+            if not r or r[0]["status"] not in ("approved", "proposed", "new", "watchlist", "waiting_lang", "rejected"):
+                continue
+            m = r[0]
+            plan = current_plan(m)
+            if not plan or plan["status"] != "ok":
+                continue
+            try:
+                for v in plan["versions"]:
+                    materialize(v["rel"])
+            except Exception as e:
+                log(f"  {m['title']}: fetching the torrent failed ({e})")
+                continue
+            for v in plan["versions"]:
+                queue_version(m, v)
+            set_status(m["id"], "active", "started by you (over the weekly cap)", started_at=now, week=week_id(now),
+                       approved_at=m["approved_at"] or now)
+            out.append(m["title"])
+        if out:
+            log(f"started now (over the cap) {len(out)}: {', '.join(out)}")
+        return out
+    finally:
+        _run_lock.release()
+
+
 def queue_version(m, v, row=None):
     """Drop one version into the bridge's blackhole (category CATEGORY)."""
     rel = v["rel"]
@@ -1436,6 +1472,8 @@ def handle(method, path, body=None):
         return 200, j, json.dumps({"stored": apply_decisions(body.get("decisions", []), body.get("model"))})
     if p == "/fresh/approve":
         return 200, j, json.dumps({"approved": approve(ids, True)})
+    if p == "/fresh/start":
+        return 200, j, json.dumps({"started": start_now(ids)})
     if p == "/fresh/reject":
         return 200, j, json.dumps({"rejected": approve(ids, False)})
     if p == "/fresh/block":

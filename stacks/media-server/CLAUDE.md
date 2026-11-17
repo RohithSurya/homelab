@@ -706,7 +706,9 @@ Prowlarr.
   (`#l<lid>` highlights the link): the direct links, the live tamilmv link (current domain from meta
   `base:<site>`), the topic's torrents, and the **saved copy** of the posts. `TAMILMV_PUBLIC_URL` is the
   **Tailscale address** of the host (`http://100.110.179.59:8005`, the HP; `TAMILMV_PUBLIC_URL` in `env/prod.env`) (Radarr/Sonarr are used the same way at home and
-  away; the Jetson does not advertise `10.0.0.0/24`, so a LAN-IP link would break away from home). The
+  away). The Jetson does advertise `10.0.0.0/24` as a Tailscale subnet route (seen 2026-11-16), but a client only
+  uses it with "Use Tailscale subnets" / `--accept-routes` on, so keep links on the Tailscale address. The
+  `*.home.rosurya.duckdns.org` names (Caddy on the Jetson, `10.0.0.179`) need that setting away from home. The
   page is scraped content: `sanitize` strips scripts/iframes/handlers/`javascript:` and a strict CSP
   (`default-src 'none'`, no images — they'd tell image hosts who is looking) makes script impossible.
 - **DVD Remux rewrite** (`served_title`): Radarr reads "DVD9"/"DVD5" as a raw disc image (quality DVD-R)
@@ -892,6 +894,8 @@ cap 7/week (+3 big); own collection **"Latest Hollywood"**.
   lossless `.mkv` of the main title (the `.mpls` with the most bytes, `mkvmerge`), disc files deleted;
   on failure the release is retried with the next one.
 - **Disk guard**: `FRESH_EN_MIN_FREE_GB` (300) -- no new start or upgrade below that free in `ROOT`.
+- **Start now, over the cap**: `POST /fresh-en/start {ids}` (`media fresh-en start <id>…`; same for `/fresh`)
+  starts picks immediately; they still count toward the week. Waits for a running pass.
 - **Status / CLI**: `http://10.0.0.64:8003/fresh-en` (plus "out but no rip yet" calendar table),
   `/fresh-en/calendar.json`; `docker exec media-bridge python -m fresh_en status|build|watch|calendar`.
 - **Hermes**: skill `fresh-hollywood`, cron "Latest Hollywood: decide" (auto mode, no digest).

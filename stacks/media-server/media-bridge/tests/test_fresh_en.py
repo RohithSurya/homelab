@@ -233,6 +233,25 @@ class Flow(unittest.TestCase):
         drops = sorted(p.name for p in E.BLACKHOLE.iterdir())
         self.assertEqual(drops, ["Heart.of.the.Beast.2026.2160p.AMZN.WEB-DL.DDP5.1.DV.HDR.H.265-FLUX.torrent"])
 
+    def test_start_now_goes_over_the_weekly_cap(self):
+        match = {"tmdb": 1, "orig": "eng", "has_file": False, "radarr_id": None, "monitored": None}
+        titles = [f"Film{i}.2026.1080p.WEB-DL.H.264-FLUX" for i in range(9)]
+        for t in titles:
+            self.feed(t, 6)
+        with mock.patch.object(E, "lookup", return_value=(match, [])), \
+             mock.patch.object(fresh_en, "_scraper_releases", return_value={}):
+            E.build_candidates()
+        ids = [m["id"] for m in E.q("SELECT id FROM movies ORDER BY id")]
+        E.apply_decisions([{"id": i, "verdict": "download", "score": 7, "tmdb_id": 100 + i} for i in ids])
+        monday = time.mktime((2026, 11, 16, 12, 0, 0, 0, 0, -1))
+        E.start_approved(now=monday)
+        self.assertEqual(E.week_counts(E.week_id(monday))[0], 7)   # the cap
+        left = [m["id"] for m in E.q("SELECT id FROM movies WHERE status='approved'")]
+        self.assertEqual(len(left), 2)
+        code, _, body = fresh_en.handle("POST", "/fresh-en/start", {"ids": left})
+        self.assertEqual((code, len(json.loads(body)["started"])), (200, 2))
+        self.assertEqual(E.q("SELECT count(*) n FROM movies WHERE status='active'")[0]["n"], 9)
+
     def test_old_movie_comes_back_when_the_window_widens(self):
         self.feed("Runner.2026.2160p.AMZN.WEB-DL.DDP5.1.H.265-KyoGo", 11)
         match = {"tmdb": 1377237, "orig": "eng", "has_file": False, "radarr_id": None, "monitored": None,
