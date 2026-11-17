@@ -40,10 +40,29 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 
 import requests
 
 from common import clog, norm, ntfy
+
+# One engine, two instances (2026-11-16). This module is the Indian "Latest Releases" as imported
+# (`import fresh`). fresh_en.py loads a SECOND copy of this file as its own module (own globals: DB
+# connection, release cache, run lock) after injecting VARIANT / ENV_PREFIX / DEFAULTS, then swaps
+# the source / parsing / planning hooks for Hollywood ones. Everything else -- state machine, caps,
+# retries, placement, collection, expiry, HTTP -- is shared code, so a fix lands in both.
+VARIANT = globals().get("VARIANT", "fresh")             # log tag, bridge category, URL prefix
+ENV_PREFIX = globals().get("ENV_PREFIX", "FRESH_")
+DEFAULTS = globals().get("DEFAULTS", {})                # variant defaults, overridable by env
+
+
+def _env(name, default):
+    return os.environ.get(ENV_PREFIX + name, DEFAULTS.get(name, default))
+
+
+TITLE = _env("TITLE", "Latest Releases")                # digest / ntfy / page wording
+PREFIX = "/" + VARIANT                                  # /fresh, /fresh-en
+CATEGORY = VARIANT                                      # bridge blackhole category
 
 RADARR_URL = os.environ.get("RADARR_URL", "").rstrip("/")
 RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
@@ -52,38 +71,39 @@ JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.environ.get("PROWLARR_API_KEY", "")
 
-DB_PATH = os.environ.get("FRESH_DB", "/config/fresh.db")
+DB_PATH = _env("DB", "/config/fresh.db")
 MOVIERULZ_DB = os.environ.get("MOVIERULZ_DB", "/config/movierulz.db")
 TAMILMV_DB = os.environ.get("TAMILMV_DB", "/config/tamilmv.db")
-DATA = pathlib.Path(os.environ.get("FRESH_DATA", "/data"))
-BLACKHOLE = DATA / "blackhole" / "fresh"
-DELIVERED = DATA / "downloads" / "fresh"
-ROOT = os.environ.get("FRESH_ROOT", "/data/media/movies-new")
-PROFILE = os.environ.get("FRESH_PROFILE", "Any")
+DATA = pathlib.Path(_env("DATA", "/data"))
+BLACKHOLE = DATA / "blackhole" / CATEGORY
+DELIVERED = DATA / "downloads" / CATEGORY
+ROOT = _env("ROOT", "/data/media/movies-new")
+PROFILE = _env("PROFILE", "Any")
 
-WEEKLY = int(os.environ.get("FRESH_WEEKLY", "15"))
-OVERFLOW = int(os.environ.get("FRESH_OVERFLOW", "5"))
+WEEKLY = int(_env("WEEKLY", "15"))
+OVERFLOW = int(_env("OVERFLOW", "5"))
 # New releases land on Fridays (user, 2026-11-12): from FRIDAY_FROM (0=Mon) to Sunday the week's
 # cap grows by FRIDAY_EXTRA, so Friday's releases still find room after the week's first 15.
-FRIDAY_EXTRA = int(os.environ.get("FRESH_FRIDAY_EXTRA", "5"))
-FRIDAY_FROM = int(os.environ.get("FRESH_FRIDAY_FROM", "4"))
-WINDOW_DAYS = int(os.environ.get("FRESH_WINDOW_DAYS", "21"))      # first good rip seen within
-SIZE_CAP = float(os.environ.get("FRESH_SIZE_CAP_GB", "5")) * 1e9
-GOOD_SCORE = float(os.environ.get("FRESH_GOOD_SCORE", "6"))      # below: a "fill" pick
-FILL_WEEKDAY = int(os.environ.get("FRESH_FILL_WEEKDAY", "4"))    # auto mode: fills start Fri (0=Mon)
-KEEP_DAYS = float(os.environ.get("FRESH_KEEP_DAYS", "30"))
-EXPIRE_MAX = int(os.environ.get("FRESH_EXPIRE_MAX", "5"))
-EXPIRE_DRY_RUN = os.environ.get("FRESH_EXPIRE_DRY_RUN", "true").lower() not in ("false", "0", "no")
-MODE_DEFAULT = os.environ.get("FRESH_MODE", "approval")          # approval | auto (stored in meta)
-COLLECTION = os.environ.get("FRESH_COLLECTION", "Latest Releases")
-POLL = int(os.environ.get("FRESH_POLL", "300"))
-BUILD_EVERY = int(os.environ.get("FRESH_BUILD_EVERY", "3600"))
-MAX_TRIES = int(os.environ.get("FRESH_MAX_TRIES", "3"))           # failed downloads per version
-DROP_TIMEOUT = float(os.environ.get("FRESH_DROP_TIMEOUT_H", "48")) * 3600
-INFO_FETCH_MAX = int(os.environ.get("FRESH_INFO_FETCH_MAX", "20"))  # movierulz pages per build
-WAIT_DAYS = int(os.environ.get("FRESH_WAIT_DAYS", "60"))          # waiting_lang / watchlist give up
-PROPOSAL_DAYS = int(os.environ.get("FRESH_PROPOSAL_DAYS", "14"))  # unanswered proposals drop
-VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts")
+FRIDAY_EXTRA = int(_env("FRIDAY_EXTRA", "5"))
+FRIDAY_FROM = int(_env("FRIDAY_FROM", "4"))
+WINDOW_DAYS = int(_env("WINDOW_DAYS", "21"))      # first good rip seen within
+SIZE_CAP = float(_env("SIZE_CAP_GB", "5")) * 1e9
+GOOD_SCORE = float(_env("GOOD_SCORE", "6"))      # below: a "fill" pick
+FILL_WEEKDAY = int(_env("FILL_WEEKDAY", "4"))    # auto mode: fills start Fri (0=Mon)
+KEEP_DAYS = float(_env("KEEP_DAYS", "30"))
+EXPIRE_MAX = int(_env("EXPIRE_MAX", "5"))
+EXPIRE_DRY_RUN = _env("EXPIRE_DRY_RUN", "true").lower() not in ("false", "0", "no")
+MODE_DEFAULT = _env("MODE", "approval")          # approval | auto (stored in meta)
+COLLECTION = _env("COLLECTION", TITLE)
+POLL = int(_env("POLL", "300"))
+BUILD_EVERY = int(_env("BUILD_EVERY", "3600"))
+MAX_TRIES = int(_env("MAX_TRIES", "3"))           # failed downloads per version
+DROP_TIMEOUT = float(_env("DROP_TIMEOUT_H", "48")) * 3600
+INFO_FETCH_MAX = int(_env("INFO_FETCH_MAX", "20"))  # movierulz pages per build
+WAIT_DAYS = int(_env("WAIT_DAYS", "60"))          # waiting_lang / watchlist give up
+PROPOSAL_DAYS = int(_env("PROPOSAL_DAYS", "14"))  # unanswered proposals drop
+MIN_FREE_GB = float(_env("MIN_FREE_GB", "0"))    # no new start while ROOT has less free (0 = off)
+VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".m2ts")
 
 RA = {"X-Api-Key": RADARR_API_KEY}
 JF = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'}
@@ -92,7 +112,7 @@ _conn = None
 
 
 def log(msg):
-    clog("fresh", msg)
+    clog(VARIANT, msg)
 
 
 # ----------------------------------------------------------------------------- release parsing
@@ -110,7 +130,7 @@ _TOKEN_LANG = {"tel": "tel", "telugu": "tel", "tam": "tam", "tamil": "tam", "mal
                "malayalam": "mal", "hin": "hin", "hindi": "hin", "kan": "kan", "kannada": "kan",
                "eng": "eng", "english": "eng", "ben": "ben", "bengali": "ben", "mar": "mar",
                "marathi": "mar", "pun": "pan", "punjabi": "pan", "guj": "guj", "gujarati": "guj",
-               "bhojpuri": "bho", "tulu": "tul", "odia": "ori", "oriya": "ori"}
+               "bhojpuri": "bho", "tulu": "tul", "odia": "ori", "oriya": "ori", "en": "eng"}
 _WORD_LANG = re.compile(r"\b(telugu|tamil|malayalam|hindi|kannada|bengali|marathi|punjabi|gujarati|"
                         r"bhojpuri|odia|tulu|english)\b", re.I)
 THEATRE = re.compile(r"\b(cam|camrip|hdcam|hd-?ts|ts|telesync|tc|hd-?tc|telecine|pre-?dvd|pdvd|"
@@ -356,6 +376,11 @@ def jellyfin(method, path, **kw):
     return r.json() if r.text.strip() else None
 
 
+def anorm(s):
+    """norm() that folds accents first: TMDB's 'Beware Boiúna' == a release's 'Beware Boiuna'."""
+    return norm(unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode())
+
+
 def lookup(title, year):
     """TMDB facts via Radarr for 'title year'. Returns (best match or None, alternatives)."""
     try:
@@ -370,7 +395,13 @@ def lookup(title, year):
                 "orig": orig_code(m),
                 "in_cinemas": (m.get("inCinemas") or "")[:10] or None,
                 "digital": (m.get("digitalRelease") or "")[:10] or None,
+                "physical": (m.get("physicalRelease") or "")[:10] or None,
                 "imdb": im.get("value"), "imdb_votes": im.get("votes"),
+                "imdb_id": m.get("imdbId"),
+                "metacritic": ((m.get("ratings") or {}).get("metacritic") or {}).get("value"),
+                "rotten_tomatoes": ((m.get("ratings") or {}).get("rottenTomatoes") or {}).get("value"),
+                "tmdb_rating": ((m.get("ratings") or {}).get("tmdb") or {}).get("value"),
+                "studio": m.get("studio"),
                 "popularity": round(m.get("popularity") or 0, 1), "genres": m.get("genres") or [],
                 "runtime": m.get("runtime"), "certification": m.get("certification"),
                 "overview": (m.get("overview") or "")[:240], "radarr_id": m.get("id") or None,
@@ -379,9 +410,9 @@ def lookup(title, year):
         name = (m.get("originalLanguage") or {}).get("name")
         return RADARR_LANG.get(name, (name or "").lower() or None)
     near = [m for m in res if m.get("year") and abs(m["year"] - year) <= 1]
-    nt = norm(title)
-    exact = [m for m in near if norm(m.get("title")) == nt or norm(m.get("originalTitle")) == nt
-             or any(norm(a.get("title")) == nt for a in m.get("alternateTitles") or [])]
+    nt = anorm(title)
+    exact = [m for m in near if anorm(m.get("title")) == nt or anorm(m.get("originalTitle")) == nt
+             or any(anorm(a.get("title")) == nt for a in m.get("alternateTitles") or [])]
     best = (exact or [])[:1]
     alts = [facts(m) for m in (exact[1:] + [m for m in near if m not in exact])][:3]
     return (facts(best[0]) if best else None), alts
@@ -471,6 +502,27 @@ def foreign_reason(info, orig, rels):
     return None
 
 
+def stale_reason(best, rels, now):
+    """Hook: why a new-looking movie is not actually new (status 'old'), or None. Indian: the
+    latest-rip window above is the whole rule."""
+    return None
+
+
+def display_title(name, best):
+    """Hook: the title a new movie row gets (the release's spelling, or the TMDB match's)."""
+    return name
+
+
+def orig_allowed(orig):
+    """Hook: may a film with this (LLM-corrected) original language be picked at all?"""
+    return orig in INDIAN
+
+
+def plan_for(releases, m):
+    """Hook: the download plan for movie row `m` from its usable releases."""
+    return plan_versions(releases, m["orig"])
+
+
 def merge_duplicates():
     """Two titles for one film (Telugu title vs Tamil title, 'SI' vs 'Sub Inspector'): rows with
     the same TMDB id are one movie. The oldest row keeps the decision; the others become
@@ -548,9 +600,11 @@ def build_candidates(now=None):
                 status, why = "in_library", "already requested in Radarr"
             elif foreign_reason(info, orig, rels):
                 status, why = "foreign", foreign_reason(info, orig, rels)
+            elif stale_reason(best, rels, now):
+                status, why = "old", stale_reason(best, rels, now)
             mid = x("INSERT INTO movies(mkey, title, year, tmdb, orig, facts, info, first_seen, first_good, "
                     "status, status_why, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (mkey, name, yr, (best or {}).get("tmdb"), orig, json.dumps(facts), json.dumps(info),
+                    (mkey, display_title(name, best), yr, (best or {}).get("tmdb"), orig, json.dumps(facts), json.dumps(info),
                      first, first_good, status, why, now))
             made += 1
             row = q("SELECT * FROM movies WHERE id=?", (mid,))
@@ -594,7 +648,7 @@ def current_plan(m):
     for v in q("SELECT bad FROM versions WHERE movie_id=?", (m["id"],)):
         bad |= set(json.loads(v["bad"] or "[]"))
     good = [r for r in rels if not r["reject"] and r["btih"] not in bad]
-    return plan_versions(good, m["orig"])
+    return plan_for(good, m)
 
 
 # ----------------------------------------------------------------------------- decisions/approval
@@ -640,7 +694,7 @@ def apply_decisions(decisions, model=None):
         x("UPDATE movies SET verdict=?, score=?, big=?, reason=?, flags=?, model=?, decided_at=?, tmdb=?, orig=? "
           "WHERE id=?", (verdict, float(d.get("score") or 0), 1 if d.get("big") else 0,
                          (d.get("reason") or "")[:400], json.dumps(flags), model, time.time(), tmdb, orig, mid))
-        if orig and orig not in INDIAN:
+        if orig and not orig_allowed(orig):
             set_status(mid, "foreign", f"original language {orig}")
         elif verdict == "skip":
             set_status(mid, "skipped", (d.get("reason") or "")[:200])
@@ -745,6 +799,8 @@ def start_approved(now=None):
                 set_status(m["id"], "proposed", plan["why"])
     rows = q("SELECT * FROM movies WHERE status='approved' ORDER BY big DESC, score DESC, approved_at")
     started = []
+    if rows and not disk_ok():
+        return started
     for m in rows:
         if slots(wk, bool(m["big"]), now) <= 0:
             continue
@@ -757,6 +813,12 @@ def start_approved(now=None):
         if plan["status"] != "ok":
             set_status(m["id"], "waiting_lang" if plan["status"] == "waiting_lang" else "approved", plan["why"])
             continue
+        try:
+            for v in plan["versions"]:
+                materialize(v["rel"])  # every .torrent fetched before anything is dropped
+        except Exception as e:
+            log(f"  {m['title']}: fetching the torrent failed ({e}); next pass")
+            continue
         for v in plan["versions"]:
             queue_version(m, v)
         set_status(m["id"], "active", plan["why"], started_at=now, week=wk)
@@ -766,9 +828,48 @@ def start_approved(now=None):
     return started
 
 
+def disk_ok():
+    """MIN_FREE_GB guard: no new download starts while ROOT has less free space (logged hourly)."""
+    if MIN_FREE_GB <= 0:
+        return True
+    try:
+        free = shutil.disk_usage(ROOT).free / 1e9
+    except OSError:
+        return True  # ROOT not created yet: nothing placed, nothing to protect
+    if free >= MIN_FREE_GB:
+        return True
+    if time.time() - _DISK_WARNED[0] > 3600:
+        _DISK_WARNED[0] = time.time()
+        log(f"only {free:.0f} GB free in {ROOT} (< {MIN_FREE_GB:g}): not starting downloads")
+    return False
+
+
+_DISK_WARNED = [0.0]
+
+
+def materialize(rel):
+    """A private-tracker release always goes to the bridge as its .torrent, never a magnet: the
+    bridge learns 'private' (seed rules, no extra public trackers) only from the torrent's own
+    private flag -- a `fresh` drop has no *arr history to name its indexer. Raises on failure."""
+    if rel.get("torrent") or not (rel.get("private") or not rel.get("magnet")):
+        return
+    rr = requests.get(rel["url"], timeout=60, allow_redirects=False)
+    loc = rr.headers.get("Location", "") if rr.is_redirect else ""
+    if loc.startswith("magnet:"):
+        if rel.get("private"):
+            raise RuntimeError("private indexer answered with a magnet, not a .torrent")
+        rel["magnet"] = loc
+        return
+    rr.raise_for_status()
+    if not rr.content.startswith(b"d"):
+        raise RuntimeError("download is not a .torrent")
+    rel["torrent"] = rr.content
+
+
 def queue_version(m, v, row=None):
-    """Drop one version into the bridge's `fresh` blackhole."""
+    """Drop one version into the bridge's blackhole (category CATEGORY)."""
     rel = v["rel"]
+    materialize(rel)
     stem = safe_stem(rel["title"])
     BLACKHOLE.mkdir(parents=True, exist_ok=True)
     if rel.get("torrent"):
@@ -792,7 +893,8 @@ def bridge_failed(stem, since):
     try:
         c = sqlite3.connect(f"file:{os.environ.get('BRIDGE_DB', '/config/bridge.db')}?mode=ro", uri=True, timeout=5)
         r = c.execute("SELECT type, detail FROM events WHERE release=? AND ts>=? AND type IN ('failed','dropped') "
-                      "ORDER BY ts DESC LIMIT 1", (stem, since - 60)).fetchone()
+                      "AND (category=? OR category IS NULL) ORDER BY ts DESC LIMIT 1",
+                      (stem, since - 60, CATEGORY)).fetchone()
         c.close()
         return (r[0] + (f": {r[1]}" if r[1] else "")) if r else None
     except Exception:
@@ -809,7 +911,7 @@ def bridge_tracks(stem):
             continue
         try:
             rec = json.loads(p.read_text())
-            if rec.get("category") == "fresh" and rec.get("release_name") == stem and not rec.get("superseded"):
+            if rec.get("category") == CATEGORY and rec.get("release_name") == stem and not rec.get("superseded"):
                 return True
         except Exception:
             continue
@@ -835,12 +937,12 @@ def check_versions(now=None):
     # movies whose versions are all settled
     for m in q("SELECT * FROM movies WHERE status='active'"):
         vs = q("SELECT state FROM versions WHERE movie_id=?", (m["id"],))
-        if vs and all(s["state"] in ("placed", "failed") for s in vs):
+        if vs and all(s["state"] in ("placed", "failed", "replaced") for s in vs):
             if any(s["state"] == "placed" for s in vs):
                 set_status(m["id"], "done", None, placed_at=m["placed_at"] or now)
             else:
                 set_status(m["id"], "failed", "every download failed")
-                ntfy(f"Latest Releases: {m['title']} failed", "Every release tried failed to download.",
+                ntfy(f"{TITLE}: {m['title']} failed", "Every release tried failed to download.",
                      priority="default", tags="warning")
     add_missing_versions()
 
@@ -863,7 +965,11 @@ def retry_version(v, why):
         x("UPDATE versions SET state='failed' WHERE id=?", (v["id"],))
         return
     nxt["role"] = v["role"]
-    queue_version(m, nxt, row=q("SELECT * FROM versions WHERE id=?", (v["id"],))[0])
+    try:
+        queue_version(m, nxt, row=q("SELECT * FROM versions WHERE id=?", (v["id"],))[0])
+    except Exception as e:
+        log(f"  queueing the next pick for '{v['stem']}' failed: {e}")
+        x("UPDATE versions SET state='failed', error=? WHERE id=?", (f"queue: {e}"[:300], v["id"]))
 
 
 def add_missing_versions():
@@ -878,7 +984,11 @@ def add_missing_versions():
             if v["lang"] in have or _has_multi(m["id"], v["lang"]):
                 continue
             log(f"  {m['title']}: adding the {LANGS.get(v['lang'], v['lang'])} version that appeared")
-            queue_version(m, v)
+            try:
+                queue_version(m, v)
+            except Exception as e:
+                log(f"  queueing it failed ({e}); next pass")
+                continue
             if m["status"] == "done":
                 set_status(m["id"], "active", "adding a version")
 
@@ -889,6 +999,41 @@ def _has_multi(mid, lang):
         if lang in langs:
             return True
     return False
+
+
+GOOD_TIER = 2  # Indian ladder: 1080p within/above the cap, or 720p
+_PRIVACY = {"at": 0, "map": {}}
+
+
+def indexer_privacy():
+    """{Prowlarr indexer id: is private}, cached 6h. Search results carry only `indexerId` -- no
+    privacy field (checked live 2026-11-16: every private hit used to look public)."""
+    if time.time() - _PRIVACY["at"] > 6 * 3600 or not _PRIVACY["map"]:
+        r = requests.get(f"{PROWLARR_URL}/api/v1/indexer", headers={"X-Api-Key": PROWLARR_API_KEY}, timeout=60)
+        r.raise_for_status()
+        _PRIVACY.update(at=time.time(), map={i["id"]: i.get("privacy") == "private" for i in r.json()})
+    return _PRIVACY["map"]
+
+
+def is_private_hit(it):
+    """A Prowlarr search result from a private tracker? Unknown indexer -> private (the safe side:
+    a private torrent treated as public gets public trackers added, which can ban the account)."""
+    if (it.get("indexerPrivacy") or it.get("privacy")) == "private":
+        return True
+    try:
+        return indexer_privacy().get(it.get("indexerId"), True)
+    except Exception:
+        return True
+
+
+def pick_public_first(cands, key=None):
+    """Public trackers first, private only as the last resort (user rule): the best public
+    release, unless no public one reaches GOOD_TIER -- then the best of all."""
+    key = key or rank_key
+    pub = [c for c in cands if not c.get("private")]
+    if pub and key(min(pub, key=key))[0] <= GOOD_TIER:
+        return min(pub, key=key)
+    return min(cands, key=key)
 
 
 def prowlarr_version(m, lang, bad):
@@ -914,28 +1059,24 @@ def prowlarr_version(m, lang, bad):
         if not name or norm(name) != norm(m["title"]) or yr != m["year"]:
             continue
         rel = parse_release(t, it.get("size") or 0, None)
-        if rel["reject"] or lang not in rel["langs"] or (it.get("seeders") or 0) < 1:
+        # an untagged name (scene style: 'Title.2026.1080p.WEB-DL...') is the film's own language
+        has_lang = lang in rel["langs"] or (not rel["langs"] and lang == m["orig"])
+        if rel["reject"] or not has_lang or (it.get("seeders") or 0) < 1:
             continue
         rel.update(btih=(it.get("infoHash") or it.get("guid") or t).lower(), magnet=it.get("magnetUrl"),
-                   url=it.get("downloadUrl"), private=(it.get("indexerPrivacy") or it.get("privacy")) == "private",
+                   url=it.get("downloadUrl"), private=is_private_hit(it),
                    site=it.get("indexer"))
         if rel["btih"] in bad:
             continue
         cands.append(rel)
     if not cands:
         return None
-    best = min(cands, key=rank_key)  # private sorts after public within a tier
-    if not best.get("magnet"):
-        try:
-            rr = requests.get(best["url"], timeout=60, allow_redirects=False)
-            if rr.is_redirect and rr.headers.get("Location", "").startswith("magnet:"):
-                best["magnet"] = rr.headers["Location"]
-            else:
-                rr.raise_for_status()
-                best["torrent"] = rr.content
-        except Exception as e:
-            log(f"  prowlarr download of '{best['title']}' failed: {e}")
-            return None
+    best = pick_public_first(cands)
+    try:
+        materialize(best)
+    except Exception as e:
+        log(f"  prowlarr download of '{best['title']}' failed: {e}")
+        return None
     log(f"  prowlarr fallback for {m['title']} [{lang}]: {best['title']} ({'private' if best.get('private') else 'public'})")
     return {"role": "primary", "lang": lang, "rel": best}
 
@@ -1181,7 +1322,7 @@ def digest(only_new=False):
     props = q("SELECT * FROM movies WHERE status='proposed' ORDER BY score DESC")
     if only_new:
         props = [p for p in props if not p["notified_at"]]
-    lines = [f"🎬 Latest Releases — {mode()} mode, {n}/{cap(time.time())} this week"]
+    lines = [f"🎬 {TITLE} — {mode()} mode, {n}/{cap(time.time())} this week"]
     if props:
         lines.append("Proposed (reply e.g. \"ok 12 14\", \"no 13\", \"block 15\"):")
         for p in props:
@@ -1234,16 +1375,25 @@ def page():
         f"<tr><td>{m['id']}</td><td>{e(m['title'])} ({m['year']})</td><td>{e(m['status'])}</td>"
         f"<td>{score(m)}</td><td>{e(m['status_why'] or m['reason'] or '')}</td></tr>"
         for m in s["movies"])
-    return (f"<!doctype html><title>Latest Releases</title><meta name=viewport content='width=device-width'>"
+    return (f"<!doctype html><title>{e(TITLE)}</title><meta name=viewport content='width=device-width'>"
             f"<style>body{{font:14px system-ui;margin:16px}}td{{padding:3px 8px;border-bottom:1px solid #ddd;vertical-align:top}}</style>"
-            f"<h1>Latest Releases</h1><p>{e(s['mode'])} mode · week {e(s['week'])}: {s['week_count']}/{s['weekly']}</p>"
-            f"<table><tr><th>#</th><th>movie</th><th>status</th><th>score</th><th>why</th></tr>{rows}</table>")
+            f"<h1>{e(TITLE)}</h1><p>{e(s['mode'])} mode · week {e(s['week'])}: {s['week_count']}/{s['weekly']}</p>"
+            f"<table><tr><th>#</th><th>movie</th><th>status</th><th>score</th><th>why</th></tr>{rows}</table>"
+            + page_extra())
+
+
+def page_extra():
+    """Hook: more HTML for the status page (already escaped)."""
+    return ""
 
 
 # ----------------------------------------------------------------------------- HTTP (via youtube.py's server)
 def handle(method, path, body=None):
-    """(code, content-type, payload) for /fresh/*. body = parsed JSON for POST."""
-    p = path.split("?")[0].rstrip("/")
+    """(code, content-type, payload) for PREFIX/* (/fresh/*, /fresh-en/*). body = parsed JSON for POST."""
+    full = path.split("?")[0].rstrip("/")
+    if full != PREFIX and not full.startswith(PREFIX + "/"):
+        return 404, "application/json", '{"error":"not found"}'
+    p = "/fresh" + full[len(PREFIX):]  # routes below are written for /fresh
     qs = dict(kv.split("=", 1) for kv in path.split("?", 1)[1].split("&") if "=" in kv) if "?" in path else {}
     j = "application/json"
     if method == "GET":
