@@ -1189,10 +1189,18 @@ def place(v, dest):
 
 
 # ----------------------------------------------------------------------------- Jellyfin collection
+def jf_user():
+    """Any enabled Jellyfin user: library and collection listings only fill in a user's context
+    (Jellyfin 12: the unscoped /Items returns 0 items for an API key)."""
+    return next(u for u in jellyfin("GET", "Users") if not (u.get("Policy") or {}).get("IsDisabled"))
+
+
 def jf_movie_ids(paths):
-    """Jellyfin item ids for movie folders -> {folder: item id}."""
-    items = jellyfin("GET", "Items", params={"Recursive": "true", "IncludeItemTypes": "Movie",
-                                             "Fields": "Path"}).get("Items", [])
+    """Jellyfin item ids for movie folders -> {folder: item id}. Read in a user's context: unscoped,
+    it came back empty, and with the collection's members read as a user every member looked
+    unwanted -- the 2026-11-16 deploy emptied 'Latest Releases' (-27) that way."""
+    items = jellyfin("GET", f"Users/{jf_user()['Id']}/Items",
+                     params={"Recursive": "true", "IncludeItemTypes": "Movie", "Fields": "Path"}).get("Items", [])
     out = {}
     for it in items:
         p = it.get("Path") or ""
@@ -1225,13 +1233,15 @@ def sync_collection():
             if e.response is not None and e.response.status_code == 404:
                 set_status(r["id"], "removed", "deleted from Radarr", expired_at=time.time())
     want = jf_movie_ids(list(folders))
+    if folders and not want:
+        log("collection sync skipped: none of the placed movies is visible in Jellyfin (listing failed?)")
+        return  # never empty the collection on an empty listing
     cid = collection_id(create_with=list(want.values()) if want else None)
     if not cid:
         return
     # A collection's members are listed only in a user's context: the unscoped /Items?ParentId=
     # always returns 0, so nothing was ever removed (2026-11-12). Any enabled user sees them all.
-    user = next(u for u in jellyfin("GET", "Users") if not (u.get("Policy") or {}).get("IsDisabled"))
-    have = {it["Id"] for it in jellyfin("GET", f"Users/{user['Id']}/Items", params={"ParentId": cid}).get("Items", [])}
+    have = {it["Id"] for it in jellyfin("GET", f"Users/{jf_user()['Id']}/Items", params={"ParentId": cid}).get("Items", [])}
     add = set(want.values()) - have
     drop = have - set(want.values())
     if add:

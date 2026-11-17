@@ -303,7 +303,7 @@ class Flow(unittest.TestCase):
 
         def fake_jf(method, path, **kw):
             calls.append((method, path, (kw.get("params") or {}).get("Ids")))
-            if path == "Items" and (kw.get("params") or {}).get("IncludeItemTypes") == "Movie":
+            if path == "Users/u1/Items" and (kw.get("params") or {}).get("IncludeItemTypes") == "Movie":
                 return {"Items": [{"Id": "jkeep", "Path": "/data/media/movies-new/Kept One (2026)/Kept One (2026).mkv"}]}
             if path == "Items":  # BoxSet lookup
                 return {"Items": [{"Id": "col", "Name": fresh.COLLECTION}]}
@@ -317,6 +317,25 @@ class Flow(unittest.TestCase):
             fresh.sync_collection()
         self.assertIn(("DELETE", "Collections/col/Items", "jgone"), calls)
         self.assertFalse(any(m == "POST" and p == "Collections/col/Items" for m, p, _ in calls))  # already there
+
+    def test_collection_sync_never_empties_on_an_empty_listing(self):
+        mid = self.add_movie("Kept Two")
+        fresh.x("UPDATE movies SET placed_at=?, radarr_id=8 WHERE id=?", (time.time(), mid))
+        calls = []
+
+        def fake_jf(method, path, **kw):
+            calls.append((method, path))
+            if path == "Users":
+                return [{"Id": "u1", "Name": "rosurya"}]
+            if path == "Users/u1/Items" and (kw.get("params") or {}).get("IncludeItemTypes") == "Movie":
+                return {"Items": []}  # Jellyfin listed nothing (busy right after a restart, 2026-11-16)
+            if path == "Items":
+                return {"Items": [{"Id": "col", "Name": fresh.COLLECTION}]}
+            return {"Items": [{"Id": "jkeep"}]}
+        with mock.patch.object(fresh, "jellyfin", side_effect=fake_jf), \
+             mock.patch.object(fresh, "radarr", return_value={"path": "/data/media/movies-new/Kept Two (2026)"}):
+            fresh.sync_collection()
+        self.assertFalse(any(m == "DELETE" for m, _ in calls))
 
     def test_expiry_aborts_on_jellyfin_error(self):
         mid = self.add_movie("Old Two")
