@@ -613,6 +613,9 @@ def build_candidates(now=None):
             why = foreign_reason(json.loads(m["info"] or "{}"), m["orig"], rels)
             if why:
                 set_status(m["id"], "foreign", why)
+        elif m["status"] == "old":  # the window may have been widened since (FRESH_EN_WINDOW_DAYS)
+            if not stale_reason((json.loads(m["facts"] or "{}") or {}).get("match"), rels, now):
+                set_status(m["id"], "new", "inside the window now")
         slim = [{k: r[k] for k in ("title", "size", "source", "res", "langs", "hc", "reject", "site", "btih", "added")}
                 for r in rels]
         x("UPDATE movies SET releases=?, first_good=COALESCE(first_good, ?) WHERE id=?",

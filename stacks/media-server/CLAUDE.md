@@ -863,7 +863,7 @@ cap 7/week (+3 big); own collection **"Latest Hollywood"**.
   - TMDB keys live in Bitwarden (`TMDB_READ_API_KEY` as a Bearer header, `TMDB_API_KEY` fallback),
     read through `vault.py`; no key -> feed-only.
 - **Candidate rules**: English original by TMDB (no TMDB match -> not picked); this year or last;
-  **new = out on digital (else disc) within `WINDOW_DAYS` (30)** -- `stale_reason` (status `old`);
+  **new = out on digital (else disc) within `WINDOW_DAYS` (60 since 2026-11-16, user; default 30)** -- `stale_reason` (status `old`, re-checked every build, so widening the window brings films back);
   new 4K re-uploads keep old films' latest rip recent (Frankenstein, KPop Demon Hunters showed up).
 - **Rejects** (`parse_release_en`): CAM/TS/TC; HDRip and "HQ" on a non-BluRay source (pre-OTT
   prints); TV episodes; 3D; AI upscales / `60fps`; multi-resolution packs; **non-English dubs** (`dual

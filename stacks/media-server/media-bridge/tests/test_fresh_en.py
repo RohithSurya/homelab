@@ -233,6 +233,20 @@ class Flow(unittest.TestCase):
         drops = sorted(p.name for p in E.BLACKHOLE.iterdir())
         self.assertEqual(drops, ["Heart.of.the.Beast.2026.2160p.AMZN.WEB-DL.DDP5.1.DV.HDR.H.265-FLUX.torrent"])
 
+    def test_old_movie_comes_back_when_the_window_widens(self):
+        self.feed("Runner.2026.2160p.AMZN.WEB-DL.DDP5.1.H.265-KyoGo", 11)
+        match = {"tmdb": 1377237, "orig": "eng", "has_file": False, "radarr_id": None, "monitored": None,
+                 "digital": "2026-10-13"}
+        now = time.mktime((2026, 11, 16, 12, 0, 0, 0, 0, -1))
+        with mock.patch.object(E, "lookup", return_value=(match, [])), \
+             mock.patch.object(fresh_en, "_scraper_releases", return_value={}):
+            with mock.patch.object(E, "WINDOW_DAYS", 30):
+                E.build_candidates(now)
+            self.assertEqual(E.q("SELECT status FROM movies")[0]["status"], "old")
+            with mock.patch.object(E, "WINDOW_DAYS", 60):
+                E.build_candidates(now)
+        self.assertEqual(E.q("SELECT status FROM movies")[0]["status"], "new")
+
     def test_upgrade_swaps_the_main_file(self):
         self.feed("Musk.2026.1080p.WEB-DL.HEVC.x265.5.1-BONE", 3)
         match = {"tmdb": 1096228, "orig": "eng", "has_file": False, "radarr_id": None, "monitored": None}

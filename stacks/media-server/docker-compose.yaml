@@ -252,6 +252,7 @@ services:
       #   for 4K later), Telugu as a second file when it exists; REMUX/full disc only for big films.
       #   Own DB/category/collection ("Latest Hollywood"), API at :8003/fresh-en. TMDB keys: Bitwarden.
       - FRESH_EN_MODE=auto                         # no approval: Hermes' picks start within the cap
+      - FRESH_EN_WINDOW_DAYS=60                    # "new" = out on digital within 60 days (user, 2026-11-16: Runner, Oct 13)
       - FRESH_EN_WEEKLY=7
       - FRESH_EN_OVERFLOW=3                        # big films
       - FRESH_EN_KEEP_DAYS=30
