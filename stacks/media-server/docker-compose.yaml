@@ -346,7 +346,7 @@ services:
     restart: unless-stopped
 
   bazarr:
-    image: lscr.io/linuxserver/bazarr:v1.6.2-ls372   # pinned
+    image: lscr.io/linuxserver/bazarr:v1.6.2-ls373   # pinned
     logging: *default-logging
     labels:
       - 'wud.tag.include=^v\d+\.\d+\.\d+-ls\d+$$'
