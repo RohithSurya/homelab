@@ -5,7 +5,7 @@ name: log-agent   # pinned: container and volume names must not depend on the ch
 # Caddy's access logs). pc5090: by hand, see CLAUDE.md.
 services:
   alloy:
-    image: grafana/alloy:v1.21.3
+    image: grafana/alloy:v1.22.0
     container_name: alloy
     restart: unless-stopped
     command: run --server.http.listen-addr=127.0.0.1:12345 --storage.path=/var/lib/alloy/data /etc/alloy-agent
