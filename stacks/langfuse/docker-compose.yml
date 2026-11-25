@@ -112,7 +112,7 @@ services:
     logging: *logging
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.10.11.12
+    image: clickhouse/clickhouse-server:26.11.1.2942
     container_name: langfuse-clickhouse
     restart: unless-stopped
     user: "101:101"
@@ -136,7 +136,7 @@ services:
 
   # Daily: drop ClickHouse months older than RETENTION_DAYS (retention/retention.sh).
   retention:
-    image: clickhouse/clickhouse-server:26.10.11.12
+    image: clickhouse/clickhouse-server:26.11.1.2942
     container_name: langfuse-retention
     restart: unless-stopped
     depends_on:
