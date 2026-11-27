@@ -202,7 +202,7 @@ services:
   postgres:
     # Stays on 17: postgres:18+ refuses this volume (17-format data mounted at .../data; 18 wants one mount at
     # /var/lib/postgresql + a pg_upgrade). A major move is a deliberate migration (see CLAUDE.md), not a Renovate PR.
-    image: postgres:17.11
+    image: postgres:17.12
     container_name: langfuse-postgres
     restart: unless-stopped
     environment:
